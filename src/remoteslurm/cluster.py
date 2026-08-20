@@ -200,8 +200,8 @@ class Cluster(SlurmOps):
                     action="add it to run_allowlist, or use a permitted executable; "
                     f"allowed: {', '.join(sorted(allow))}",
                 )
-            # A shell with -c/-lc is arbitrary execution — it defeats the allow-list even though
-            # the shell itself is listed (so `bash script.sh` stays allowed, `bash -c '…'` does not).
+            # A shell with -c/-lc is arbitrary execution: it defeats the allow-list even
+            # though the shell is listed (so `bash script.sh` is allowed, `bash -c '…'` is not).
             if exe in ("bash", "sh", "zsh", "dash", "ksh") and any(
                 a in ("-c", "-lc", "-ic", "-lic") or (a.startswith("-") and "c" in a[1:])
                 for a in cmd[1:]
