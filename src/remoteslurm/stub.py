@@ -902,7 +902,10 @@ def op_sacct(args):
         argv += ["-S", str(args["since"])]
     if args.get("user"):
         argv += ["-u", str(args["user"])]
-    if args.get("all_steps") is False:
+    # `-X`/--allocations suppresses the per-step (.batch/.extern) rows. Default to allocations
+    # only (cheap: one row per job/array task) and include steps only when the caller asks —
+    # steps are needed just for MaxRSS folding on a single job / diagnose.
+    if not args.get("all_steps"):
         argv += ["-X"]
     return _slurm(argv, timeout=120)
 

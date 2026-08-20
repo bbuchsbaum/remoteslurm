@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import fcntl
+import itertools
 import json
 import os
+import re
+import shlex
 import threading
 import time
 from collections.abc import Iterator
@@ -15,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import slurm
 from .config import Template, state_dir
-from .errors import InvalidArgument, RemoteTimeout, SlurmError
+from .errors import InvalidArgument, RemoteSlurmError, RemoteTimeout, SlurmError
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -98,6 +101,110 @@ def compose_templated_script(
             template.epilogue if template.epilogue.endswith("\n") else template.epilogue + "\n"
         )
     return "".join(chunks)
+
+
+# --------------------------------------------------------------------------- parameter sweeps
+_PARAM_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def sweep_rows(
+    params: dict[str, list[Any]] | list[dict[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Turn ``params`` into ``(names, rows)`` — the columns and per-task parameter dicts.
+
+    A ``dict`` of ``{name: [values]}`` becomes the Cartesian product (column order preserved);
+    a ``list`` of dicts is taken as explicit rows (all must share the same keys in the same
+    order). Parameter names must be valid shell identifiers (they become ``RS_PARAM_<NAME>``).
+    """
+    if isinstance(params, dict):
+        names = list(params.keys())
+        for n in names:
+            if not isinstance(params[n], (list, tuple)) or not params[n]:
+                raise InvalidArgument(f"sweep values for {n!r} must be a non-empty list")
+        rows = [
+            dict(zip(names, combo, strict=False))
+            for combo in itertools.product(*(params[n] for n in names))
+        ]
+    elif isinstance(params, list):
+        if not params:
+            raise InvalidArgument("sweep params list is empty")
+        names = list(params[0].keys())
+        rows = []
+        for r in params:
+            if list(r.keys()) != names:
+                raise InvalidArgument(
+                    "every sweep row must have the same keys in the same order",
+                    first=names,
+                    offending=list(r.keys()),
+                )
+            rows.append(dict(r))
+    else:
+        raise InvalidArgument("sweep params must be a dict of lists or a list of dicts")
+    if not names:
+        raise InvalidArgument("sweep has no parameters")
+    for n in names:
+        if not _PARAM_NAME_RE.match(n):
+            raise InvalidArgument(
+                f"invalid sweep parameter name {n!r}",
+                action="parameter names become RS_PARAM_<NAME>: use letters, digits, underscore",
+            )
+    if not rows:
+        raise InvalidArgument("sweep produced no parameter combinations")
+    for r in rows:  # values go into a TSV; tabs/newlines would corrupt it
+        for n in names:
+            v = str(r[n])
+            if "\t" in v or "\n" in v:
+                raise InvalidArgument(f"sweep value for {n!r} may not contain a tab or newline")
+    return names, rows
+
+
+def params_tsv(names: list[str], rows: list[dict[str, Any]]) -> str:
+    """Render the ``params.tsv`` table (header row + one data row per task)."""
+    lines = ["\t".join(names)]
+    lines.extend("\t".join(str(r[n]) for n in names) for r in rows)
+    return "\n".join(lines) + "\n"
+
+
+_SWEEP_WRAPPER_TMPL = r"""#!/bin/bash
+# remoteslurm sweep wrapper (name=__NAME__); reads params.tsv by $SLURM_ARRAY_TASK_ID and
+# exports RS_PARAM_<NAME> for each column plus RS_PARAMS_JSON for the whole row.
+RS_PARAMS_TSV=__PARAMS_Q__
+RS_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+IFS=$'\t' read -r -a __rs_names < <(sed -n '1p' "$RS_PARAMS_TSV")
+IFS=$'\t' read -r -a __rs_vals < <(sed -n "$((RS_TASK_ID + 2))p" "$RS_PARAMS_TSV")
+__i=0
+while [ "$__i" -lt "${#__rs_names[@]}" ]; do
+  export "RS_PARAM_${__rs_names[$__i]}=${__rs_vals[$__i]}"
+  __i=$((__i + 1))
+done
+export RS_PARAMS_JSON="$(python3 -c 'import sys,json,csv
+tsv=sys.argv[1]
+idx=int(sys.argv[2])
+with open(tsv) as f:
+    rows=list(csv.reader(f,delimiter="\t"))
+print(json.dumps(dict(zip(rows[0],rows[idx+1]))))' "$RS_PARAMS_TSV" "$RS_TASK_ID")"
+# ---- user body ----
+__BODY__
+"""
+
+
+def sweep_wrapper(
+    params_path: str, name: str, *, body: str | None = None, remote_path: str | None = None
+) -> str:
+    """Build the sweep wrapper script embedding the (absolute) ``params_path``.
+
+    Exactly one of ``body`` (inline user script content, appended) or ``remote_path`` (an
+    existing remote script, run via ``exec bash``) is used.
+    """
+    if (body is None) == (remote_path is None):
+        raise InvalidArgument("provide exactly one of body= or remote_path=")
+    user = body if body is not None else f"exec bash {shlex.quote(remote_path or '')}"
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:64] or "sweep"
+    return (
+        _SWEEP_WRAPPER_TMPL.replace("__NAME__", safe_name)
+        .replace("__PARAMS_Q__", shlex.quote(params_path))
+        .replace("__BODY__", user)
+    )
 
 
 @dataclass
@@ -222,6 +329,7 @@ class SlurmOps:
     _squeue_cache: tuple[float, list[dict[str, str]]] | None = None
     _squeue_lock = threading.Lock()
     _registry: JobRegistry | None = None
+    _sweep_params_cache: dict[str, list[dict[str, Any]]] | None = None
 
     def call(
         self, op: str, *, _timeout: float | None = 60.0, **args: Any
@@ -236,6 +344,17 @@ class SlurmOps:
         offset: int = 0,
         head: int | None = None,
         tail: int | None = None,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def write(  # pragma: no cover
+        self,
+        path: str,
+        content: str | bytes,
+        *,
+        append: bool = False,
+        mkdirs: bool = True,
+        mode: int | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -256,6 +375,8 @@ class SlurmOps:
         args: list[str] | None = None,
         template: str | None = None,
         force_preamble: bool = False,
+        array: str | None = None,
+        dependency: str | None = None,
         **options: Any,
     ) -> Job:
         """Submit a batch job.
@@ -270,6 +391,10 @@ class SlurmOps:
         its preamble/epilogue wrap the body. A template with a non-empty preamble refuses a
         ``path=`` submission (existing remote script) unless ``force_preamble=True``, in which
         case only the options are applied.
+
+        ``array`` (e.g. ``"0-9%4"``) submits a job array (``--array=`` flag) and marks the
+        registry record so :meth:`job_status` rolls the tasks up; ``dependency`` (e.g.
+        ``"afterok:123"``) becomes ``--dependency=``.
         """
         if (script is None) == (path is None):
             raise InvalidArgument("provide exactly one of script= or path=")
@@ -283,6 +408,10 @@ class SlurmOps:
             tmpl = self.host.resolve_template(template)  # ConfigError if unknown/cyclic
             opts.update(tmpl.options)
         opts.update(options)
+        if array is not None:
+            opts["array"] = array
+        if dependency is not None:
+            opts["dependency"] = dependency
         if name:
             opts.setdefault("job_name", name)
         if tmpl is not None and path is not None and tmpl.preamble and not force_preamble:
@@ -321,7 +450,12 @@ class SlurmOps:
             last_state="PENDING",
             last_seen=time.time(),
             sbatch_args=flags,
-            meta={"template": template, "options": dict(opts)},
+            meta={
+                "template": template,
+                "options": dict(opts),
+                "array": array,
+                "dependency": dependency,
+            },
         )
         # Fill in stdout/stderr/workdir from scontrol (best effort; job may be gone already).
         try:
@@ -367,11 +501,27 @@ class SlurmOps:
         return slurm.parse_squeue(res["stdout"])
 
     def sacct(
-        self, job_ids: list[str] | None = None, *, since: str | None = None
+        self,
+        job_ids: list[str] | None = None,
+        *,
+        since: str | None = None,
+        all_steps: bool = False,
     ) -> dict[str, dict[str, Any]]:
+        """Accounting records keyed by job id (array tasks keyed ``<base>_<task>``).
+
+        ``all_steps=True`` includes the per-step ``.batch``/``.extern`` rows, needed only to
+        fold MaxRSS for a single job / ``diagnose``; the default (allocations only) is cheaper.
+        """
         if not job_ids and not since:
             since = "now-7days"
-        res = self.call("sacct", _timeout=180, fields=slurm.SACCT_FIELDS, jobs=job_ids, since=since)
+        res = self.call(
+            "sacct",
+            _timeout=180,
+            fields=slurm.SACCT_FIELDS,
+            jobs=job_ids,
+            since=since,
+            all_steps=all_steps,
+        )
         if res["rc"] != 0:
             raise SlurmError("sacct failed: " + res["stderr"].strip(), rc=res["rc"])
         return slurm.parse_sacct(res["stdout"])
@@ -393,12 +543,20 @@ class SlurmOps:
 
     # -- status -------------------------------------------------------------------------------
     def job_status(self, job_id: str, *, refresh: bool = False) -> slurm.JobStatus:
-        """Merge squeue -> scontrol -> sacct -> registry into one status record."""
-        slurm.parse_job_id(job_id)
+        """Merge squeue -> scontrol -> sacct -> registry into one status record.
+
+        A bare array id (``123``) is rolled up across its tasks (see :meth:`_array_status`);
+        a task id (``123_4``) is reported on its own.
+        """
+        base, task = slurm.parse_job_id(job_id)
         rec = self.registry.get(job_id)
         st: slurm.JobStatus | None = None
 
-        rows = [r for r in self.squeue(refresh=refresh) if r["job_id"] == job_id]
+        all_rows = self.squeue(refresh=refresh)
+        if task is None and self._is_array(base, all_rows, rec):
+            return self._array_status(base, all_rows)
+
+        rows = [r for r in all_rows if r["job_id"] == job_id]
         if not rows and refresh:
             rows = self.squeue_jobs([job_id])
         if rows:
@@ -421,7 +579,7 @@ class SlurmOps:
                 workdir=r["workdir"] or None,
             )
         if st is None:
-            found = self.sacct([job_id])
+            found = self.sacct([job_id], all_steps=True)
             acct = found.get(job_id.split("_")[0]) or found.get(job_id)
             if acct:
                 st = slurm.JobStatus(
@@ -488,16 +646,112 @@ class SlurmOps:
             st.name = st.name or rec.name
             if st.source != "registry":
                 self.registry.update(job_id, last_state=st.state, last_seen=time.time())
+        # An array task inherits the parent's registered paths (the ``%A_%a`` output template,
+        # script, workdir) and, for sweeps, surfaces its row of parameters.
+        if task is not None and task.isdigit():
+            parent = self.registry.get(base)
+            if parent is not None:
+                st.stdout_path = st.stdout_path or parent.stdout_path
+                st.stderr_path = st.stderr_path or parent.stderr_path
+                st.script_path = st.script_path or parent.script_path
+                st.workdir = st.workdir or parent.workdir
+                st.name = st.name or parent.name
+                if parent.meta.get("sweep"):
+                    params = self._sweep_params_for(base, int(task))
+                    if params is not None:
+                        st.extra["params"] = params
         st.terminal = slurm.is_terminal(st.state) and not st.accounting_pending
         return st
+
+    # -- arrays -------------------------------------------------------------------------------
+    def _is_array(
+        self,
+        base: str,
+        squeue_rows: list[dict[str, str]],
+        rec: JobRecord | None = None,
+    ) -> bool:
+        """Is ``base`` a job array? True if the registry marked it, or squeue shows tasks."""
+        if rec is not None and rec.meta.get("array"):
+            return True
+        if any(r.get("array_base") == base for r in squeue_rows):
+            return True
+        return False
+
+    def _array_status(self, base: str, squeue_rows: list[dict[str, str]]) -> slurm.JobStatus:
+        """Roll an array's tasks up into one :class:`slurm.JobStatus` (state + ``extra``)."""
+        sacct_jobs = self.sacct([base])  # per-task allocations (states); steps not needed
+        agg = slurm.aggregate_array(base, squeue_rows, sacct_jobs)
+        st = slurm.JobStatus(
+            job_id=base,
+            state=agg["state"],
+            source="array",
+            terminal=agg["terminal"],
+            extra={
+                "array": True,
+                "n_tasks": len(agg["task_states"]),
+                "tasks": agg["tasks"],
+                "failed_tasks": agg["failed_tasks"],
+                "task_states": agg["task_states"],
+            },
+        )
+        rec = self.registry.get(base)
+        if rec:
+            st.name = rec.name
+            st.stdout_path = rec.stdout_path
+            st.stderr_path = rec.stderr_path
+            st.script_path = rec.script_path
+            st.workdir = rec.workdir
+            if rec.meta.get("sweep"):
+                st.extra["sweep"] = rec.meta["sweep"]
+                failed_params: dict[int, dict[str, Any]] = {}
+                for t in agg["failed_tasks"]:
+                    p = self._sweep_params_for(base, t)
+                    if p is not None:
+                        failed_params[t] = p
+                if failed_params:
+                    st.extra["failed_task_params"] = failed_params
+            self.registry.update(base, last_state=agg["state"], last_seen=time.time())
+        return st
+
+    def _sweep_params_for(self, base: str, task: int) -> dict[str, Any] | None:
+        """Return the sweep parameters for array ``base`` task ``task`` (cached read of the TSV)."""
+        rec = self.registry.get(base)
+        sweep = rec.meta.get("sweep") if rec else None
+        if not sweep:
+            return None
+        path = sweep.get("params_path")
+        if not path:
+            return None
+        if self._sweep_params_cache is None:
+            self._sweep_params_cache = {}
+        rowlist = self._sweep_params_cache.get(path)
+        if rowlist is None:
+            try:
+                text = self.read(path, max_bytes=1_000_000).get("content", "")
+            except SlurmError:
+                return None
+            lines = [ln for ln in str(text).splitlines() if ln != ""]
+            if not lines:
+                return None
+            header = lines[0].split("\t")
+            rowlist = [dict(zip(header, ln.split("\t"), strict=False)) for ln in lines[1:]]
+            self._sweep_params_cache[path] = rowlist
+        if 0 <= task < len(rowlist):
+            return rowlist[task]
+        return None
 
     def jobs(
         self, *, include_finished: bool = True, refresh: bool = False
     ) -> list[slurm.JobStatus]:
-        """All jobs: my live queue plus registry-known jobs (with their last/terminal state)."""
+        """All jobs: my live queue plus registry-known jobs (with their last/terminal state).
+
+        A job array shows up as one row keyed by its base id (rolled up across tasks).
+        """
         out: dict[str, slurm.JobStatus] = {}
-        for jid in [r["job_id"] for r in self.squeue(refresh=refresh)]:
-            out[jid] = self.job_status(jid)
+        for r in self.squeue(refresh=refresh):
+            jid = r["array_base"] or r["job_id"]  # arrays roll up under the base id
+            if jid not in out:
+                out[jid] = self.job_status(jid)
         if include_finished:
             known = [r.job_id for r in self.registry.all() if r.job_id not in out]
             if known:
@@ -576,15 +830,121 @@ class SlurmOps:
     def job_output(
         self, job_id: str, *, tail: int | None = 100, max_bytes: int = 65536, stream: str = "stdout"
     ) -> dict[str, Any]:
-        """Read the job's stdout (or stderr) file, resolving its path via status/registry."""
+        """Read the job's stdout (or stderr) file, resolving its path via status/registry.
+
+        Slurm output patterns are expanded (``%A`` array job id, ``%a`` task id, ``%j``/``%J``
+        job id, ``%x`` name, ``%u`` user, ``%N`` node). For a bare array id the output is read
+        from a representative task (the first failed one, else the lowest task id).
+        """
+        base, task = slurm.parse_job_id(job_id)
         st = self.job_status(job_id)
+        # A bare array parent: pick a representative task to read.
+        if task is None and st.extra.get("array"):
+            failed = st.extra.get("failed_tasks") or []
+            states = st.extra.get("task_states") or {}
+            pick = failed[0] if failed else (min(states) if states else 0)
+            task = str(pick)
         path = st.stdout_path if stream == "stdout" else (st.stderr_path or st.stdout_path)
+        # Fall back to scontrol for a task file when the merged status has no resolved path.
+        if (not path or "%a" in path) and task is not None:
+            try:
+                sc = self.scontrol_job(f"{base}_{task}")
+                p = (
+                    sc.get("StdOut")
+                    if stream == "stdout"
+                    else (sc.get("StdErr") or sc.get("StdOut"))
+                )
+                if p:
+                    path = p
+            except SlurmError:
+                pass
         if not path:
             raise SlurmError(
                 f"no {stream} path known for job {job_id}", job_id=job_id, state=st.state
             )
-        path = path.replace("%j", job_id.split("_")[0]).replace("%J", job_id)
+        path = self._expand_output_path(path, base, task, st)
+        if "%a" in path:  # an array file we could not pin to a task
+            raise SlurmError(
+                f"job {job_id} is an array; specify a task id (e.g. {base}_0)",
+                job_id=job_id,
+                state=st.state,
+            )
         r = self.read(path, tail=tail, max_bytes=max_bytes)
         r["job_id"] = job_id
         r["state"] = st.state
         return r
+
+    def _expand_output_path(
+        self, path: str, base: str, task: str | None, st: slurm.JobStatus
+    ) -> str:
+        """Expand Slurm output specifiers in ``path`` (``%A %a %j %J %x %u %N``)."""
+        node = (st.nodelist or "").split(",")[0]
+        try:
+            user = str(self.user)  # type: ignore[attr-defined]
+        except (RemoteSlurmError, AttributeError):
+            user = ""
+        repl = [
+            ("%A", base),
+            ("%J", f"{base}_{task}" if task is not None else base),
+            ("%j", base),
+            ("%x", st.name or ""),
+            ("%u", user),
+            ("%N", node),
+        ]
+        if task is not None:
+            repl.append(("%a", task))
+        for k, v in repl:
+            path = path.replace(k, v)
+        return path
+
+    # -- sweeps -------------------------------------------------------------------------------
+    def sweep(
+        self,
+        params: dict[str, list[Any]] | list[dict[str, Any]],
+        *,
+        script: str | None = None,
+        path: str | None = None,
+        template: str | None = None,
+        name: str = "sweep",
+        max_concurrent: int | None = None,
+        cwd: str | None = None,
+        **options: Any,
+    ) -> Job:
+        """Submit a parameter sweep as one job array.
+
+        ``params`` is a dict ``{name: [values]}`` (Cartesian product) or a list of explicit
+        row dicts. A ``params.tsv`` and a wrapper script are written remotely; the wrapper
+        reads its ``$SLURM_ARRAY_TASK_ID`` row, exports ``RS_PARAM_<NAME>`` for each column and
+        ``RS_PARAMS_JSON`` for the whole row, then runs ``script`` (content) or ``path`` (an
+        existing remote script, via ``exec bash``). Submitted as ``--array=0-(n-1)[%N]``; the
+        registry records ``meta["sweep"]`` so ``status``/``diagnose`` surface each task's params.
+        """
+        if (script is None) == (path is None):
+            raise InvalidArgument("provide exactly one of script= or path=")
+        names, rows = sweep_rows(params)
+        n = len(rows)
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:48] or "sweep"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base_dir = (self.host.script_dir or "~/.remoteslurm/sweeps").rstrip("/")
+        sweep_dir = f"{base_dir}/{safe}-{stamp}-{os.getpid()}"
+        w = self.write(f"{sweep_dir}/params.tsv", params_tsv(names, rows))
+        params_path = w["path"]
+        wrapper = sweep_wrapper(params_path, name, body=script, remote_path=path)
+        spec = f"0-{n - 1}"
+        if max_concurrent:
+            spec += f"%{int(max_concurrent)}"
+        job = self.submit(
+            script=wrapper,
+            name=name,
+            cwd=cwd,
+            template=template,
+            array=spec,
+            **options,
+        )
+        rec = self.registry.get(job.job_id)
+        if rec is not None:
+            meta = dict(rec.meta)
+            meta["sweep"] = {"params_path": params_path, "n": n, "names": names}
+            self.registry.update(job.job_id, meta=meta)
+        self.registry.audit("sweep", job_id=job.job_id, n=n, params_path=params_path, names=names)
+        return job

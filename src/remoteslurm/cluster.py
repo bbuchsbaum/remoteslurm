@@ -337,7 +337,7 @@ class Cluster(SlurmOps):
         max_rss = st.max_rss
         state_raw: str | None = None
         try:
-            acct = self.sacct([job_id])
+            acct = self.sacct([job_id], all_steps=True)  # steps carry MaxRSS for the OOM rule
             a = acct.get(job_id.split("_")[0]) or acct.get(job_id)
             if a:
                 steps = a.get("steps", []) or []

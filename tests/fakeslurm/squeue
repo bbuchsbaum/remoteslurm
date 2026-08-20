@@ -8,10 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _fakeslurm as fs  # noqa: E402
 
 
-def field(code, job):
+def field(code, job, id_override=None):
     pending = job["state"] == "PENDING"
     if code == "i":
-        return str(job["id"])
+        return id_override if id_override is not None else fs.job_label(job)
     if code == "j":
         return job["name"]
     if code == "T":
@@ -41,13 +41,13 @@ def field(code, job):
     return ""
 
 
-def render(fmt, job):
+def render(fmt, job, id_override=None):
     out = []
     i = 0
     while i < len(fmt):
         c = fmt[i]
         if c == "%" and i + 1 < len(fmt):
-            out.append(field(fmt[i + 1], job))
+            out.append(field(fmt[i + 1], job, id_override))
             i += 2
         else:
             out.append(c)
@@ -73,7 +73,7 @@ def main():
             fmt = a.split("=", 1)[1]
         elif a == "-j" or a == "--jobs":
             i += 1
-            ids = fs.lookup_ids(args[i])
+            ids = fs.query_tokens(args[i])
         elif a == "-u" or a == "--user":
             i += 1
             users = args[i].split(",")
@@ -84,23 +84,36 @@ def main():
     if users is None and ids is None:
         users = [fs.user()]
 
+    collapse = os.environ.get("FAKESLURM_ARRAY_COLLAPSE") == "1"
     with fs.locked_state() as state:
         jobs = state["jobs"]
         if ids is not None:
-            missing = [j for j in ids if j not in jobs]
+            matched, missing = fs.match_jobs(state, ids)
             if missing:
                 fs.advance(state)
                 fs.die(fs.INVALID_JOB)
-            rows = [jobs[j] for j in ids]
+            rows = [jobs[k] for k in matched]
         else:
             rows = [j for j in jobs.values() if j["user"] in users]
         lines = []
-        for job in sorted(rows, key=lambda j: j["id"]):
+        pending_arrays = {}  # base -> {"tasks": [...], "job": sample, "throttle": N}
+        for job in sorted(rows, key=lambda j: fs.array_sort_key(fs.job_label(j))):
             if fs.is_terminal(job):
                 continue
             if states is not None and job["state"] not in states and "ALL" not in states:
                 continue
+            if collapse and fs.is_array_task(job) and job["state"] == "PENDING":
+                grp = pending_arrays.setdefault(
+                    job["array_base"],
+                    {"tasks": [], "job": job, "throttle": job.get("array_throttle")},
+                )
+                grp["tasks"].append(job["array_task"])
+                continue
             lines.append(render(fmt, job))
+        for base in sorted(pending_arrays, key=int):
+            grp = pending_arrays[base]
+            collapsed_id = "%s_[%s]" % (base, fs.collapse_spec(grp["tasks"], grp["throttle"]))
+            lines.append(render(fmt, grp["job"], id_override=collapsed_id))
         fs.advance(state)
     sys.stdout.write("".join(line + "\n" for line in lines))
 

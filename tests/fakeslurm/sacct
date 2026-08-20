@@ -10,7 +10,7 @@ import _fakeslurm as fs  # noqa: E402
 
 def row(job, fields, step=None):
     """Values for the main row (``step is None``) or a ``.batch``/``.extern`` step row."""
-    jid = str(job["id"]) + ("." + step if step else "")
+    jid = fs.job_label(job) + ("." + step if step else "")
     elapsed = fs.hms(fs.elapsed_seconds(job))
     start = fs.ts(job["start_time"]) if job["start_time"] else ""
     end = fs.ts(job["end_time"]) if job["end_time"] else ""
@@ -56,7 +56,7 @@ def main():
             fields = args[i].split(",")
         elif a == "-j" or a == "--jobs":
             i += 1
-            ids = fs.lookup_ids(args[i])
+            ids = fs.query_tokens(args[i])
         elif a == "-u" or a == "--user":
             i += 1
             users = args[i].split(",")
@@ -69,11 +69,12 @@ def main():
     with fs.locked_state() as state:
         jobs = state["jobs"]
         if ids is not None:
-            rows = [jobs[j] for j in ids if j in jobs]
+            matched, _missing = fs.match_jobs(state, ids)
+            rows = [jobs[k] for k in matched]
         else:
             rows = [j for j in jobs.values() if j["user"] in users]
         lines = []
-        for job in sorted(rows, key=lambda j: j["id"]):
+        for job in sorted(rows, key=lambda j: fs.array_sort_key(fs.job_label(j))):
             if not fs.accounting_visible(job, state):
                 continue
             lines.append(row(job, fields))

@@ -29,7 +29,7 @@ CORE_EXPECTED = {
     "cancel",
     "connection",
 }
-ALL_EXPECTED = CORE_EXPECTED | {"glob", "diff", "job_output", "sinfo", "projects"}
+ALL_EXPECTED = CORE_EXPECTED | {"glob", "diff", "job_output", "sinfo", "projects", "sweep"}
 
 # Roundtrip tests exercise tools that are only in the `all` set (glob/job_output/sinfo), so
 # drive an all-tools server. The core/all split itself is checked by the list_tools tests.

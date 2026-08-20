@@ -15,8 +15,17 @@ LONG = {
     "--time": "time_limit",
     "--output": "output",
     "--error": "error",
+    "--array": "array",
+    "--dependency": "dependency",
 }
-SHORT = {"-J": "name", "-p": "partition", "-A": "account", "-t": "time_limit", "-o": "output"}
+SHORT = {
+    "-J": "name",
+    "-p": "partition",
+    "-A": "account",
+    "-t": "time_limit",
+    "-o": "output",
+    "-a": "array",
+}
 
 
 def parse_flags(tokens, into):
@@ -90,21 +99,19 @@ def main():
     opts = directives
 
     cwd = os.getcwd()
-    with fs.locked_state() as state:
-        jid = state["next_id"]
-        state["next_id"] = jid + 1
-        out = opts.get("output") or "slurm-%j.out"
-        out = out.replace("%j", str(jid)).replace("%J", str(jid))
-        if not os.path.isabs(out):
-            out = os.path.join(cwd, out)
-        err = opts.get("error") or ""
-        if err:
-            err = err.replace("%j", str(jid)).replace("%J", str(jid))
-            if not os.path.isabs(err):
-                err = os.path.join(cwd, err)
-        state["jobs"][str(jid)] = {
-            "id": jid,
-            "name": opts.get("name") or os.path.basename(script),
+
+    def resolve_path(tmpl, base, task=None):
+        s = tmpl.replace("%A", str(base)).replace("%j", str(base)).replace("%J", str(base))
+        if task is not None:
+            s = s.replace("%a", str(task))
+        if not os.path.isabs(s):
+            s = os.path.join(cwd, s)
+        return s
+
+    def base_job(base, name):
+        return {
+            "id": base,
+            "name": name,
             "state": "PENDING",
             "state_raw": "PENDING",
             "submit_time": fs.time.time(),
@@ -116,14 +123,43 @@ def main():
             "account": opts.get("account") or "rrg-fake",
             "time_limit": opts.get("time_limit") or "00:03:00",
             "workdir": cwd,
-            "stdout": out,
-            "stderr": err,
             "script": os.path.abspath(script),
             "exit_code": "0:0",
             "nodelist": "",
             "fail": "FAKESLURM_FAIL" in content,
             "outcome": os.environ.get("FAKESLURM_OUTCOME"),
         }
+
+    name = opts.get("name") or os.path.basename(script)
+    with fs.locked_state() as state:
+        jid = state["next_id"]
+        state["next_id"] = jid + 1
+        if opts.get("array"):
+            tasks, throttle = fs.parse_array_spec(opts["array"])
+            out_tmpl = opts.get("output") or "slurm-%A_%a.out"
+            err_tmpl = opts.get("error") or ""
+            fail_tasks = fs.array_fail_set()
+            for t in tasks:
+                job = base_job(jid, name)
+                job["full_id"] = "%d_%d" % (jid, t)
+                job["array_base"] = str(jid)
+                job["array_task"] = t
+                job["array_throttle"] = throttle
+                job["output_tmpl"] = out_tmpl
+                job["error_tmpl"] = err_tmpl
+                job["stdout"] = resolve_path(out_tmpl, jid, t)
+                job["stderr"] = resolve_path(err_tmpl, jid, t) if err_tmpl else ""
+                if t in fail_tasks:
+                    job["fail"] = True
+                    job["outcome"] = None
+                state["jobs"][job["full_id"]] = job
+        else:
+            out = resolve_path(opts.get("output") or "slurm-%j.out", jid)
+            err = resolve_path(opts["error"], jid) if opts.get("error") else ""
+            job = base_job(jid, name)
+            job["stdout"] = out
+            job["stderr"] = err
+            state["jobs"][str(jid)] = job
     sys.stdout.write(f"{jid}\n")
 
 

@@ -206,6 +206,115 @@ def lookup_ids(arg):
     return [a.strip().split("_")[0].split(".")[0] for a in arg.split(",") if a.strip()]
 
 
+def query_tokens(arg):
+    """Raw ``-j`` tokens (comma-split), dropping any trailing ``.step`` but keeping ``_task``."""
+    out = []
+    for a in arg.split(","):
+        a = a.strip()
+        if not a:
+            continue
+        out.append(a.split(".")[0])
+    return out
+
+
+def array_sort_key(key):
+    base, sep, task = key.partition("_")
+    try:
+        b = int(base)
+    except ValueError:
+        b = 0
+    return (b, int(task) if sep and task.isdigit() else -1)
+
+
+def match_jobs(state, tokens):
+    """Resolve ``-j`` tokens to job keys, expanding a base id to its array tasks.
+
+    Returns ``(matched_keys, missing_tokens)``; a token that matches nothing is missing.
+    """
+    jobs = state["jobs"]
+    matched = []
+    missing = []
+    seen = set()
+    for tok in tokens:
+        if tok in jobs:
+            if tok not in seen:
+                seen.add(tok)
+                matched.append(tok)
+            continue
+        subs = [k for k in jobs if k.startswith(tok + "_")]
+        if subs:
+            for s in sorted(subs, key=array_sort_key):
+                if s not in seen:
+                    seen.add(s)
+                    matched.append(s)
+        else:
+            missing.append(tok)
+    return sorted(matched, key=array_sort_key), missing
+
+
+def job_label(job):
+    """Display id for a job: the full ``base_task`` for an array task, else the plain id."""
+    return job.get("full_id") or str(job["id"])
+
+
+def is_array_task(job):
+    return job.get("array_task") is not None
+
+
+def parse_array_spec(spec):
+    """``"0-9%4"`` -> ``([0..9], 4)``; ``"1,3"`` -> ``([1,3], None)``; supports ``lo-hi:step``."""
+    throttle = None
+    s = spec
+    if "%" in s:
+        s, _, thr = s.partition("%")
+        throttle = int(thr) if thr.isdigit() else None
+    tasks = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if ":" in part:
+            part, _, st = part.partition(":")
+            if st.isdigit() and int(st) > 0:
+                step = int(st)
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            tasks.extend(range(int(lo), int(hi) + 1, step))
+        else:
+            tasks.append(int(part))
+    seen = set()
+    uniq = []
+    for t in tasks:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq, throttle
+
+
+def collapse_spec(task_ids, throttle=None):
+    """Render pending task ids as a Slurm collapsed spec: ``5-9`` or ``5,7,9`` (+ ``%N``)."""
+    ids = sorted(task_ids)
+    if ids and ids == list(range(ids[0], ids[-1] + 1)):
+        inner = f"{ids[0]}-{ids[-1]}"
+    else:
+        inner = ",".join(str(t) for t in ids)
+    if throttle:
+        inner += f"%{throttle}"
+    return inner
+
+
+def array_fail_set():
+    """Task ids marked FAILED via ``FAKESLURM_ARRAY_FAIL=2,5``."""
+    raw = os.environ.get("FAKESLURM_ARRAY_FAIL") or ""
+    out = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if x.isdigit():
+            out.add(int(x))
+    return out
+
+
 def die(msg, rc=1):
     sys.stderr.write(msg + "\n")
     sys.exit(rc)

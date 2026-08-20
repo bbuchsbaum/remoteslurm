@@ -9,22 +9,22 @@ import _fakeslurm as fs  # noqa: E402
 
 
 def main():
-    ids = []
+    tokens = []
     for a in sys.argv[1:]:
         if not a.startswith("-"):
-            ids.extend(fs.lookup_ids(a))
-    if not ids:
+            tokens.extend(fs.query_tokens(a))
+    if not tokens:
         fs.die("scancel: error: No job identification provided")
     rc = 0
     with fs.locked_state() as state:
-        for jid in ids:
-            job = state["jobs"].get(jid)
-            if job is None:
-                sys.stderr.write(
-                    f"scancel: error: Kill job error on job id {jid}: Invalid job id specified\n"
-                )
-                rc = 1
-                continue
+        matched, missing = fs.match_jobs(state, tokens)  # a base id cancels all its tasks
+        for tok in missing:
+            sys.stderr.write(
+                f"scancel: error: Kill job error on job id {tok}: Invalid job id specified\n"
+            )
+            rc = 1
+        for key in matched:
+            job = state["jobs"][key]
             if fs.is_terminal(job):
                 continue
             job["state"] = "CANCELLED"

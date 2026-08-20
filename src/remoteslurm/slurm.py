@@ -76,6 +76,18 @@ TERMINAL_STATES = {
     "OUT_OF_MEMORY",
     "REVOKED",
 }
+# Terminal states that count as a *failure* when rolling up an array (CANCELLED and COMPLETED
+# are handled separately). Used by :func:`aggregate_array` and the ``jobs`` TASKS column.
+ARRAY_FAILED_STATES = {
+    "FAILED",
+    "TIMEOUT",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "PREEMPTED",
+    "REVOKED",
+}
 
 JOB_ID_RE = re.compile(r"^(\d+)(?:_(\d+|\[[\d,\-%:]+\]))?(?:\+(\d+))?$")
 
@@ -138,8 +150,55 @@ def parse_sbatch_output(stdout: str, stderr: str, rc: int) -> str:
     return jid
 
 
+_COLLAPSED_ARRAY_RE = re.compile(r"^(\d+)_\[([\d,\-:%]+)\]$")
+_TASK_ARRAY_RE = re.compile(r"^(\d+)_(\d+)$")
+
+
+def expand_array_tasks(spec: str) -> list[int]:
+    """Expand a Slurm array bracket spec into task ids (order-preserving, deduplicated).
+
+    Accepts the bracket form with or without the surrounding ``[...]`` and strips the
+    ``%N`` concurrency suffix: ``"[5-9%4]"`` -> ``[5,6,7,8,9]``, ``"5,7,9"`` -> ``[5,7,9]``,
+    ``"0-6:2"`` (step) -> ``[0,2,4,6]``.
+    """
+    s = spec.strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    if "%" in s:  # trailing concurrency throttle, e.g. 5-9%4
+        s = s.split("%", 1)[0]
+    out: list[int] = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if ":" in part:
+            part, _, step_s = part.partition(":")
+            if step_s.isdigit() and int(step_s) > 0:
+                step = int(step_s)
+        if "-" in part.lstrip("-"):  # a range lo-hi (task ids are non-negative)
+            lo_s, _, hi_s = part.partition("-")
+            out.extend(range(int(lo_s), int(hi_s) + 1, step))
+        else:
+            out.append(int(part))
+    seen: set[int] = set()
+    uniq: list[int] = []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
+
+
 def parse_squeue(stdout: str) -> list[dict[str, str]]:
-    rows = []
+    """Parse ``squeue`` output into per-job rows.
+
+    A collapsed *pending* array row (``123_[5-9%4]``) is expanded into one pseudo-row per
+    task id (each carries the collapsed row's state, normally ``PENDING``); a running/single
+    task row (``123_4``) is kept as-is. Every row gains ``array_base`` and ``array_task``
+    (both ``""`` for a non-array job), so array aggregation is a simple tally over rows.
+    """
+    rows: list[dict[str, str]] = []
     for line in stdout.splitlines():
         line = line.rstrip("\n")
         if not line.strip():
@@ -149,8 +208,81 @@ def parse_squeue(stdout: str) -> list[dict[str, str]]:
             parts += [""] * (len(SQUEUE_FIELDS) - len(parts))
         row = dict(zip(SQUEUE_FIELDS, parts, strict=False))
         row["state"] = normalize_state(row["state"])
+        jid = row["job_id"]
+        m = _COLLAPSED_ARRAY_RE.match(jid)
+        if m:
+            base = m.group(1)
+            for t in expand_array_tasks(m.group(2)):
+                pseudo = dict(row)
+                pseudo["job_id"] = f"{base}_{t}"
+                pseudo["array_base"] = base
+                pseudo["array_task"] = str(t)
+                rows.append(pseudo)
+            continue
+        m2 = _TASK_ARRAY_RE.match(jid)
+        if m2:
+            row["array_base"] = m2.group(1)
+            row["array_task"] = m2.group(2)
+        else:
+            row["array_base"] = ""
+            row["array_task"] = ""
         rows.append(row)
     return rows
+
+
+def aggregate_array(
+    base_id: str,
+    squeue_rows: list[dict[str, str]],
+    sacct_jobs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Roll up an array's per-task states into one summary.
+
+    ``squeue_rows`` are :func:`parse_squeue` rows (currently active tasks win, as squeue drops
+    finished ones); ``sacct_jobs`` are :func:`parse_sacct` records keyed ``<base>_<task>`` for
+    finished tasks. Returns ``{state, tasks, failed_tasks, task_states, terminal}`` where the
+    aggregate ``state`` is FAILED if any task failed and none is running, else RUNNING if any
+    is running, else PENDING if any is pending, else CANCELLED/COMPLETED; ``terminal`` is true
+    only when every task has reached a terminal state.
+    """
+    task_states: dict[int, str] = {}
+    for key, rec in sacct_jobs.items():  # sacct: authoritative for finished tasks
+        b, sep, t = key.partition("_")
+        if sep and b == base_id and t.isdigit():
+            task_states[int(t)] = normalize_state(rec.get("state", "UNKNOWN"))
+    for r in squeue_rows:  # squeue overrides: a task shown here is currently active
+        if r.get("array_base") == base_id and r.get("array_task"):
+            try:
+                task_states[int(r["array_task"])] = normalize_state(r["state"])
+            except (TypeError, ValueError):
+                continue
+    tasks: dict[str, int] = {}
+    for s in task_states.values():
+        tasks[s] = tasks.get(s, 0) + 1
+    failed_tasks = sorted(t for t, s in task_states.items() if s in ARRAY_FAILED_STATES)
+    any_running = any(s not in TERMINAL_STATES and s != "PENDING" for s in task_states.values())
+    any_pending = any(s == "PENDING" for s in task_states.values())
+    any_completed = any(s == "COMPLETED" for s in task_states.values())
+    any_cancelled = any(s == "CANCELLED" for s in task_states.values())
+    if not task_states:
+        state = "UNKNOWN"
+    elif failed_tasks and not any_running:
+        state = "FAILED"
+    elif any_running:
+        state = "RUNNING"
+    elif any_pending:
+        state = "PENDING"
+    elif any_cancelled and not any_completed:
+        state = "CANCELLED"
+    else:
+        state = "COMPLETED"
+    terminal = bool(task_states) and all(s in TERMINAL_STATES for s in task_states.values())
+    return {
+        "state": state,
+        "tasks": tasks,
+        "failed_tasks": failed_tasks,
+        "task_states": task_states,
+        "terminal": terminal,
+    }
 
 
 def _parse_mem(s: str) -> int | None:

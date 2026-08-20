@@ -29,7 +29,7 @@ MAX_CHARS = int(os.environ.get(ENV_MAX_CHARS, "200000"))
 
 ENV_MCP_TOOLS = "REMOTESLURM_MCP_TOOLS"
 # The default tool set: the workflow-critical tools an agent needs, nothing more. Set
-# REMOTESLURM_MCP_TOOLS=all to also expose glob/diff/job_output/sinfo/projects.
+# REMOTESLURM_MCP_TOOLS=all to also expose glob/diff/job_output/sinfo/projects/sweep.
 CORE_TOOLS = {
     "info",
     "ls",
@@ -346,6 +346,50 @@ async def submit(
     return await _guard(host, f)
 
 
+async def sweep(
+    params: dict[str, list[Any]] | list[dict[str, Any]],
+    script: str | None = None,
+    path: str | None = None,
+    template: str | None = None,
+    name: str = "sweep",
+    max_concurrent: int | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Submit a parameter sweep as one job array.
+
+    ``params`` is either ``{name: [values]}`` (the Cartesian product becomes the tasks) or a
+    list of explicit row dicts. Give exactly one of ``script`` (content) or ``path`` (an
+    existing remote script). A ``params.tsv`` and a wrapper are written remotely; each task
+    reads its row and gets ``RS_PARAM_<NAME>`` env vars plus ``RS_PARAMS_JSON``. ``template``
+    and ``max_concurrent`` (the ``%N`` array throttle) behave as for ``submit``. Returns the
+    array ``job_id``, task count ``n`` and the ``params_path``; poll with ``jobs(job_id=...)``
+    and explain a failed task with ``diagnose`` (it surfaces that task's parameters).
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        job = c.sweep(
+            params,
+            script=script,
+            path=path,
+            template=template,
+            name=name,
+            max_concurrent=max_concurrent,
+        )
+        rec = c.registry.get(job.job_id)
+        sweep_meta = (rec.meta.get("sweep") if rec else None) or {}
+        st = job.status()
+        return {
+            "job_id": job.job_id,
+            "n": sweep_meta.get("n"),
+            "names": sweep_meta.get("names"),
+            "params_path": sweep_meta.get("params_path"),
+            "array": rec.meta.get("array") if rec else None,
+            "state": st.state,
+        }
+
+    return await _guard(host, f)
+
+
 async def jobs(
     job_id: str | None = None,
     refresh: bool = False,
@@ -357,7 +401,9 @@ async def jobs(
     Without it: ``{"jobs": [...], "count": n}`` covering your live queue plus jobs submitted
     through remoteslurm (finished ones too unless ``include_finished=False``). Each record has
     ``state``, ``terminal`` (done?), ``exit_code``, ``reason``, ``elapsed``, paths.
-    squeue is cached ~10 s; ``refresh=True`` bypasses the cache.
+    squeue is cached ~10 s; ``refresh=True`` bypasses the cache. A job array is one record
+    keyed by its base id, with an ``extra`` block (``tasks`` counts, ``failed_tasks``,
+    ``task_states``); pass a task id (``123_4``) for a single task.
     """
 
     def f(c: Cluster) -> dict[str, Any]:
@@ -563,6 +609,7 @@ ALL_TOOLS: dict[str, Any] = {
     "diff": diff,
     "run": run,
     "submit": submit,
+    "sweep": sweep,
     "jobs": jobs,
     "diagnose": diagnose,
     "job_output": job_output,
@@ -600,7 +647,7 @@ def mcp_config_snippet(host: str | None = None) -> str:
                     "env": {
                         ENV_DEFAULT_HOST: host or "<host>",
                         # tool set: "core" (default) or "all" (adds glob/diff/job_output/
-                        # sinfo/projects). Remove this line to keep the default core set.
+                        # sinfo/projects/sweep). Remove this line to keep the default core set.
                         ENV_MCP_TOOLS: "core",
                     },
                 }

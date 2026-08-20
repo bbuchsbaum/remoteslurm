@@ -8,10 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _fakeslurm as fs  # noqa: E402
 
 
-def render(job):
+def render(job, jobid=None, stdout=None, stderr=None):
     pending = job["state"] == "PENDING"
     kv = [
-        ("JobId", str(job["id"])),
+        ("JobId", jobid if jobid is not None else fs.job_label(job)),
         ("JobName", job["name"]),
         ("UserId", f"{job['user']}(1000)"),
         ("GroupId", f"{job['user']}(1000)"),
@@ -38,11 +38,22 @@ def render(job):
         ("NumCPUs", "1"),
         ("Command", job["script"]),
         ("WorkDir", job["workdir"]),
-        ("StdErr", job["stderr"]),
+        ("StdErr", stderr if stderr is not None else job["stderr"]),
         ("StdIn", "/dev/null"),
-        ("StdOut", job["stdout"]),
+        ("StdOut", stdout if stdout is not None else job["stdout"]),
     ]
     return " ".join(f"{k}={v}" for k, v in kv)
+
+
+def _array_template(job, code, base):
+    """Resolve an array output template for the *base* record: %A/%j/%J -> base, %a kept."""
+    tmpl = job.get(code) or ""
+    if not tmpl:
+        return ""
+    s = tmpl.replace("%A", base).replace("%J", base).replace("%j", base)
+    if not os.path.isabs(s):
+        s = os.path.join(job["workdir"], s)
+    return s
 
 
 def main():
@@ -54,11 +65,25 @@ def main():
         fs.die("scontrol: fake only supports 'show job'")
     if len(args) < 3:
         fs.die("scontrol: job id required")
-    jid = fs.lookup_ids(args[2])[0]
+    tok = fs.query_tokens(args[2])[0]
     with fs.locked_state() as state:
-        job = state["jobs"].get(jid)
-        visible = job is not None and fs.scontrol_visible(job, state)
-        line = render(job) if visible else None
+        jobs = state["jobs"]
+        line = None
+        if tok in jobs:  # a normal job or an exact array task id
+            job = jobs[tok]
+            if fs.scontrol_visible(job, state):
+                line = render(job)
+        else:  # an array base id: describe it via a representative task, keeping the %a template
+            matched, _missing = fs.match_jobs(state, [tok])
+            if matched:
+                job = jobs[matched[0]]
+                if fs.scontrol_visible(job, state):
+                    line = render(
+                        job,
+                        jobid=tok,
+                        stdout=_array_template(job, "output_tmpl", tok),
+                        stderr=_array_template(job, "error_tmpl", tok),
+                    )
         fs.advance(state)
         if line is None:
             fs.die(fs.INVALID_JOB)

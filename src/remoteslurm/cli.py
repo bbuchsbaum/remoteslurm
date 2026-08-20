@@ -641,6 +641,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         args=args.sbatch_arg or [],
         template=args.template,
         force_preamble=args.force_preamble,
+        array=args.array,
+        dependency=args.dependency,
         **options,
     )
     st = job.status()
@@ -651,6 +653,67 @@ def cmd_submit(args: argparse.Namespace) -> int:
         lambda d: print(
             f"Submitted job {job.job_id} ({d.get('state')})\n"
             f"  script: {d.get('script_path')}\n  stdout: {d.get('stdout_path')}"
+        ),
+    )
+    return EXIT_OK
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    c = get_cluster(args)
+    params: dict[str, list[str]] = {}
+    for spec in args.param or []:
+        if "=" not in spec:
+            raise InvalidArgument(f"bad -P {spec!r}, expected NAME=v1,v2")
+        k, v = spec.split("=", 1)
+        params[k] = v.split(",")
+    if not params:
+        raise InvalidArgument("at least one -P NAME=v1,v2 is required")
+    options: dict[str, Any] = {}
+    for kv in args.opt or []:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            options[k.replace("-", "_")] = v
+        else:
+            options[kv.replace("-", "_")] = True
+    script: str | None = None
+    path: str | None = None
+    if args.remote:
+        path = args.script
+    elif args.script == "-":
+        script = sys.stdin.read()
+    else:
+        p = Path(args.script).expanduser()
+        if p.exists():
+            script = p.read_text()
+        elif args.script.startswith(("#!", "#SBATCH")) or "\n" in args.script:
+            script = args.script
+        else:
+            path = args.script
+    if script is not None and not script.startswith("#!"):
+        script = "#!/bin/bash\n" + script
+    job = c.sweep(
+        params,
+        script=script,
+        path=path,
+        template=args.template,
+        name=args.name,
+        max_concurrent=args.max_concurrent,
+        cwd=args.cwd,
+        **options,
+    )
+    rec = c.registry.get(job.job_id)
+    sweep_meta = (rec.meta.get("sweep") if rec else None) or {}
+    st = job.status()
+    d = st.to_dict()
+    d["n"] = sweep_meta.get("n")
+    d["params_path"] = sweep_meta.get("params_path")
+    emit(
+        args,
+        d,
+        lambda d: print(
+            f"Submitted sweep {job.job_id} ({sweep_meta.get('n')} tasks, "
+            f"array {rec.meta.get('array') if rec else '?'})\n"
+            f"  params: {sweep_meta.get('params_path')}\n  script: {d.get('script_path')}"
         ),
     )
     return EXIT_OK
@@ -753,11 +816,40 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def array_tasks_cell(row: dict[str, Any]) -> str:
+    """A compact ``87✓ 10▶ 3◦ 2✗`` summary of an array row's task states (empty if not an array)."""
+    from . import slurm
+
+    extra = row.get("extra") or {}
+    if not extra.get("array"):
+        return ""
+    counts = extra.get("tasks") or {}
+    completed = counts.get("COMPLETED", 0)
+    pending = counts.get("PENDING", 0)
+    cancelled = counts.get("CANCELLED", 0)
+    running = sum(v for k, v in counts.items() if k not in slurm.TERMINAL_STATES and k != "PENDING")
+    failed = sum(v for k, v in counts.items() if k in slurm.ARRAY_FAILED_STATES)
+    parts = []
+    if completed:
+        parts.append(f"{completed}✓")  # ✓
+    if running:
+        parts.append(f"{running}▶")  # ▶
+    if pending:
+        parts.append(f"{pending}◦")  # ◦
+    if failed:
+        parts.append(f"{failed}✗")  # ✗
+    if cancelled:
+        parts.append(f"{cancelled}⊘")  # ⊘
+    return " ".join(parts)
+
+
 def _print_jobs(rows: list[dict[str, Any]]) -> None:
     if not rows:
         print("no jobs")
         return
     cols = ["job_id", "name", "state", "elapsed", "time_limit", "nodelist", "reason", "exit_code"]
+    if any(r.get("tasks") for r in rows):
+        cols.insert(3, "tasks")
 
     def cell(r: dict[str, Any], k: str) -> str:
         v = r.get(k)
@@ -773,6 +865,10 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     c = get_cluster(args)
     sts = c.jobs(include_finished=not args.live, refresh=args.refresh)
     rows = [s.to_dict() for s in sts]
+    for r in rows:
+        cell = array_tasks_cell(r)
+        if cell:
+            r["tasks"] = cell
     emit(args, {"jobs": rows, "count": len(rows)}, lambda d: _print_jobs(d["jobs"]))
     return EXIT_OK
 
@@ -787,6 +883,10 @@ def cmd_status(args: argparse.Namespace) -> int:
                 f"{d['job_id']}: {d['state']}"
                 + (" (accounting pending)" if d.get("accounting_pending") else "")
             )
+            extra = d.get("extra") or {}
+            if extra.get("array"):
+                _print_array_status(d, extra, show_tasks=args.tasks)
+                continue
             for k in (
                 "name",
                 "reason",
@@ -804,9 +904,32 @@ def cmd_status(args: argparse.Namespace) -> int:
                 if d.get(k) is not None:
                     v = fmt_size(d[k]) if k == "max_rss" else d[k]
                     print(f"  {k:12} {v}")
+            if extra.get("params"):
+                print(
+                    f"  {'params':12} " + " ".join(f"{k}={v}" for k, v in extra["params"].items())
+                )
 
     emit(args, out if len(out) > 1 else out[0], lambda d: human(d if isinstance(d, list) else [d]))
     return EXIT_OK
+
+
+def _print_array_status(d: dict[str, Any], extra: dict[str, Any], *, show_tasks: bool) -> None:
+    cell = array_tasks_cell(d)
+    print(f"  {'tasks':12} {extra.get('n_tasks', 0)} total  {cell}")
+    failed = extra.get("failed_tasks") or []
+    if failed:
+        print(f"  {'failed':12} " + ", ".join(str(t) for t in failed))
+    fparams = extra.get("failed_task_params") or {}
+    for t in failed:
+        p = fparams.get(t) or fparams.get(str(t))
+        if p:
+            print(f"    task {t}: " + " ".join(f"{k}={v}" for k, v in p.items()))
+    if d.get("name"):
+        print(f"  {'name':12} {d['name']}")
+    if show_tasks:
+        states = extra.get("task_states") or {}
+        for t in sorted(states, key=lambda x: int(x)):
+            print(f"    {str(t):>6}  {states[t]}")
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
@@ -828,7 +951,14 @@ def cmd_wait(args: argparse.Namespace) -> int:
             f"{d['job_id']}: {d['state']} exit={d.get('exit_code')} elapsed={d.get('elapsed')}"
         ),
     )
-    return EXIT_OK if st.state == "COMPLETED" else EXIT_ERROR
+    # For an array, succeed only if every task COMPLETED (aggregate COMPLETED can still hide a
+    # cancelled task); for a single job, COMPLETED is enough.
+    extra = st.extra or {}
+    if extra.get("array"):
+        ok = set(extra.get("tasks") or {}) == {"COMPLETED"}
+    else:
+        ok = st.state == "COMPLETED"
+    return EXIT_OK if ok else EXIT_ERROR
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -1099,6 +1229,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--template", help="config template name (see `rslurm templates`): options + preamble"
     )
     sp.add_argument(
+        "--array", metavar="SPEC", help="submit a job array, e.g. 0-9 or 0-9%%4 (throttle)"
+    )
+    sp.add_argument("--dependency", metavar="SPEC", help="sbatch --dependency, e.g. afterok:123")
+    sp.add_argument(
         "--force-preamble",
         action="store_true",
         help="apply a template's options to a --remote script even though its preamble is skipped",
@@ -1112,6 +1246,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument(
         "--sbatch-arg", action="append", metavar="ARG", help="raw extra sbatch argument"
+    )
+
+    sp = add(
+        "sweep",
+        cmd_sweep,
+        "submit a parameter sweep as a job array (-P NAME=v1,v2 per parameter)",
+    )
+    sp.add_argument(
+        "script",
+        help="local script path, '-' (stdin), inline script text, or remote path (with --remote)",
+    )
+    sp.add_argument("--remote", action="store_true", help="SCRIPT is a path on the cluster")
+    sp.add_argument(
+        "-P",
+        "--param",
+        action="append",
+        metavar="NAME=v1,v2",
+        help="a sweep parameter and its values (repeatable; the Cartesian product is taken)",
+    )
+    sp.add_argument("-n", "--name", default="sweep", help="job/array name (default: sweep)")
+    sp.add_argument("--cwd", help="remote working directory for the job")
+    sp.add_argument("--template", help="config template name (options + preamble)")
+    sp.add_argument(
+        "--max-concurrent", type=int, help="cap simultaneously running tasks (array %%N throttle)"
+    )
+    sp.add_argument(
+        "-o", "--opt", action="append", metavar="KEY=VAL", help="any sbatch option, e.g. -o mem=8G"
     )
 
     sp = add("templates", cmd_templates, "list submit templates (or --show NAME)")
@@ -1133,8 +1294,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("status", cmd_status, "detailed status of job(s)")
     sp.add_argument("job_id", nargs="+")
+    sp.add_argument("--tasks", action="store_true", help="for an array, list every task's state")
 
-    sp = add("wait", cmd_wait, "block until a job finishes")
+    sp = add(
+        "wait",
+        cmd_wait,
+        "block until a job finishes (exit 0 only if it — or every array task — COMPLETED)",
+    )
     sp.add_argument("job_id")
     sp.add_argument("--poll", type=float, default=15.0)
     sp.add_argument("--timeout", type=float)

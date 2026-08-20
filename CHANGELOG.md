@@ -14,6 +14,11 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
   verdict and hints (OOM, timeout, node failure, missing module/path, pending reasons).
 - Agent guidance: `rslurm agent-guide`, MCP resource `remoteslurm://guide`; MCP tool sets
   `REMOTESLURM_MCP_TOOLS=core|all` (default core).
+- Job arrays: `submit --array`/`--dependency`; aggregated array status (`87✓ 10▶ 3✗`),
+  per-task `status --tasks`, `%A/%a`-aware `output`, whole-array or per-task `cancel`.
+- Parameter sweeps: `rslurm sweep -P k=v1,v2 …` / `Cluster.sweep` / MCP `sweep` — one array job
+  with a params table injected as `RS_PARAM_*`; failed tasks' params shown in status/diagnose.
+- Faster `jobs()`: batched `sacct` (allocations-only by default; steps opt-in).
 
 ## 0.1.0 — 2026-08-20
 

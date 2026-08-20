@@ -1,0 +1,2 @@
+2200000_4|rs_grid|RUNNING|None|debug|rrg-brad|0:45|10:00|1|nib0123|2026-08-20T09:59:40|2026-08-20T10:00:02|/scratch/brad/grid|brad
+2200000_[5-9%4]|rs_grid|PENDING|Priority|debug|rrg-brad|0:00|10:00|1|(Priority)|2026-08-20T09:59:40|N/A|/scratch/brad/grid|brad
