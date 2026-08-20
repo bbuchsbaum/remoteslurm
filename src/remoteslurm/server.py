@@ -27,7 +27,24 @@ ENV_MAX_CHARS = "REMOTESLURM_MCP_MAX_CHARS"
 # Hard ceiling on any single string field in a tool result (agents have token caps).
 MAX_CHARS = int(os.environ.get(ENV_MAX_CHARS, "200000"))
 
-mcp = FastMCP("remoteslurm")
+ENV_MCP_TOOLS = "REMOTESLURM_MCP_TOOLS"
+# The default tool set: the workflow-critical tools an agent needs, nothing more. Set
+# REMOTESLURM_MCP_TOOLS=all to also expose glob/diff/job_output/sinfo/projects.
+CORE_TOOLS = {
+    "info",
+    "ls",
+    "read",
+    "edit",
+    "grep",
+    "write",
+    "run",
+    "submit",
+    "jobs",
+    "diagnose",
+    "sync",
+    "cancel",
+    "connection",
+}
 
 
 # -- helpers ---------------------------------------------------------------------------------
@@ -94,7 +111,6 @@ def _ls_summary(r: dict[str, Any]) -> str:
 
 
 # -- filesystem tools ------------------------------------------------------------------------
-@mcp.tool()
 async def ls(
     path: str = "~",
     limit: int = 200,
@@ -118,7 +134,6 @@ async def ls(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def read(
     path: str,
     max_bytes: int = 65536,
@@ -144,7 +159,6 @@ async def read(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def grep(
     pattern: str,
     path: str,
@@ -176,7 +190,6 @@ async def grep(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def glob(
     path: str,
     pattern: str = "*",
@@ -197,7 +210,6 @@ async def glob(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def write(
     path: str,
     content: str,
@@ -217,7 +229,6 @@ async def write(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def edit(
     path: str,
     old: str,
@@ -243,7 +254,6 @@ async def edit(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def diff(
     path: str,
     content: str,
@@ -265,7 +275,6 @@ async def diff(
 
 
 # -- commands ---------------------------------------------------------------------------------
-@mcp.tool()
 async def run(
     cmd: str,
     cwd: str | None = None,
@@ -290,7 +299,6 @@ async def run(
 
 
 # -- slurm ------------------------------------------------------------------------------------
-@mcp.tool()
 async def submit(
     script: str | None = None,
     path: str | None = None,
@@ -298,6 +306,8 @@ async def submit(
     cwd: str | None = None,
     options: dict[str, Any] | None = None,
     args: list[str] | None = None,
+    template: str | None = None,
+    force_preamble: bool = False,
     host: str | None = None,
 ) -> dict[str, Any]:
     """Submit a batch job with sbatch. Give exactly one of ``script`` (content) or ``path``.
@@ -305,12 +315,24 @@ async def submit(
     ``options`` are sbatch long options without dashes, e.g.
     ``{"time": "1:00:00", "partition": "debug", "gpus_per_node": 1, "mem": "8G"}``; ``args``
     are raw extra flags. Host defaults (account/partition) are filled in automatically.
+    ``template`` names a config template (see ``info``'s ``templates``): its options merge in
+    (host defaults < template < your ``options``) and, for ``script=``, its preamble wraps the
+    body. A template with a preamble refuses a ``path=`` submission unless ``force_preamble``.
     Returns job_id, script_path, stdout_path, stderr_path, workdir and initial state; poll
-    with ``jobs(job_id=...)`` and read logs with ``job_output``.
+    with ``jobs(job_id=...)`` and explain finished/stuck jobs with ``diagnose``.
     """
 
     def f(c: Cluster) -> dict[str, Any]:
-        job = c.submit(script, path=path, name=name, cwd=cwd, args=args, **(options or {}))
+        job = c.submit(
+            script,
+            path=path,
+            name=name,
+            cwd=cwd,
+            args=args,
+            template=template,
+            force_preamble=force_preamble,
+            **(options or {}),
+        )
         st = job.status()
         return {
             "job_id": job.job_id,
@@ -324,7 +346,6 @@ async def submit(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def jobs(
     job_id: str | None = None,
     refresh: bool = False,
@@ -348,7 +369,22 @@ async def jobs(
     return await _guard(host, f)
 
 
-@mcp.tool()
+async def diagnose(job_id: str, tail: int = 60, host: str | None = None) -> dict[str, Any]:
+    """Explain a job in one call — use this after a failure or when a job won't start.
+
+    Returns a plain-English ``verdict`` (out-of-memory, timeout, missing module, permission,
+    cancelled-by-whom, or the pending reason), actionable ``hints``, the ``stderr_tail`` /
+    ``stdout_tail``, the sacct ``steps``, the merged ``status``, the submit ``script`` and any
+    project ``sync`` marker. Prefer this over reading logs by hand. ``tail`` sets how many log
+    lines to include; the whole payload is capped (~64 KB, ``truncated`` flags a cut).
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.diagnose(job_id, tail=tail)
+
+    return await _guard(host, f)
+
+
 async def job_output(
     job_id: str,
     tail: int = 100,
@@ -369,7 +405,6 @@ async def job_output(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def cancel(job_id: str, host: str | None = None) -> dict[str, Any]:
     """Cancel one job or several (``"123,124"`` or ``"123_4"`` for an array task)."""
     ids = [j.strip() for j in job_id.split(",") if j.strip()]
@@ -381,7 +416,6 @@ async def cancel(job_id: str, host: str | None = None) -> dict[str, Any]:
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def sinfo(host: str | None = None) -> dict[str, Any]:
     """Partition summary (sinfo): partitions, node states, time limits. Cheap."""
 
@@ -392,7 +426,6 @@ async def sinfo(host: str | None = None) -> dict[str, Any]:
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def info(refresh: bool = False, host: str | None = None) -> dict[str, Any]:
     """Remote facts: user, home, hostname, Slurm version, selected env vars (cached)."""
 
@@ -402,7 +435,6 @@ async def info(refresh: bool = False, host: str | None = None) -> dict[str, Any]
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def connection(host: str | None = None) -> dict[str, Any]:
     """Check connectivity without hanging: is the ssh master alive, is the remote stub up?
 
@@ -449,7 +481,6 @@ async def connection(host: str | None = None) -> dict[str, Any]:
 
 
 # -- project sync -----------------------------------------------------------------------------
-@mcp.tool()
 async def sync(
     project: str | None = None,
     direction: str = "push",
@@ -491,7 +522,6 @@ async def sync(
     return await _guard(host, f)
 
 
-@mcp.tool()
 async def projects(host: str | None = None) -> dict[str, Any]:
     """List the host's configured sync projects (name, local, remote, excludes)."""
 
@@ -511,6 +541,53 @@ async def projects(host: str | None = None) -> dict[str, Any]:
     return await _guard(host, f)
 
 
+# -- resources ---------------------------------------------------------------------------------
+def guide_resource() -> str:
+    """The agent guide (also `rslurm agent-guide`)."""
+    from .guide import AGENT_GUIDE
+
+    return AGENT_GUIDE
+
+
+# -- server assembly ---------------------------------------------------------------------------
+# Every tool, in a stable order. Only the CORE_TOOLS subset is registered unless
+# REMOTESLURM_MCP_TOOLS=all.
+ALL_TOOLS: dict[str, Any] = {
+    "info": info,
+    "ls": ls,
+    "read": read,
+    "edit": edit,
+    "grep": grep,
+    "glob": glob,
+    "write": write,
+    "diff": diff,
+    "run": run,
+    "submit": submit,
+    "jobs": jobs,
+    "diagnose": diagnose,
+    "job_output": job_output,
+    "cancel": cancel,
+    "sinfo": sinfo,
+    "connection": connection,
+    "sync": sync,
+    "projects": projects,
+}
+
+
+def make_mcp(tool_set: str | None = None) -> FastMCP:
+    """Build the FastMCP app exposing ``core`` (default) or ``all`` tools."""
+    tool_set = (tool_set or os.environ.get(ENV_MCP_TOOLS, "core")).strip().lower()
+    m = FastMCP("remoteslurm")
+    for name, fn in ALL_TOOLS.items():
+        if tool_set == "all" or name in CORE_TOOLS:
+            m.tool(name=name)(fn)
+    m.resource("remoteslurm://guide")(guide_resource)
+    return m
+
+
+mcp = make_mcp()
+
+
 # -- entry points ------------------------------------------------------------------------------
 def mcp_config_snippet(host: str | None = None) -> str:
     """JSON snippet for a client's ``mcpServers`` config (printed by the CLI)."""
@@ -520,7 +597,12 @@ def mcp_config_snippet(host: str | None = None) -> str:
                 "remoteslurm": {
                     "command": "remoteslurm-mcp",
                     "args": [],
-                    "env": {ENV_DEFAULT_HOST: host or "<host>"},
+                    "env": {
+                        ENV_DEFAULT_HOST: host or "<host>",
+                        # tool set: "core" (default) or "all" (adds glob/diff/job_output/
+                        # sinfo/projects). Remove this line to keep the default core set.
+                        ENV_MCP_TOOLS: "core",
+                    },
                 }
             }
         },

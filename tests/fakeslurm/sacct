@@ -20,7 +20,7 @@ def row(job, fields, step=None):
         "state": job["state_raw"] if step is None else job["state"],
         "exitcode": job["exit_code"],
         "elapsed": elapsed,
-        "maxrss": "15848K" if step == "batch" else "",
+        "maxrss": (job.get("maxrss_batch", "15848K") if step == "batch" else ""),
         "nodelist": job["nodelist"] or "None assigned",
         "start": start or "Unknown",
         "end": end or "Unknown",

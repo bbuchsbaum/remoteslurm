@@ -106,18 +106,65 @@ def elapsed_seconds(job):
     return end - job["start_time"]
 
 
-def _finish(job, state_name, exit_code, tick):
+def _write(path, text):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except (OSError, TypeError):
+        pass
+
+
+def _finish(job, state_name, exit_code, tick, stdout_text=None, stderr_text=None):
     job["state"] = state_name
     job["state_raw"] = state_name
     job["exit_code"] = exit_code
     job["end_time"] = time.time()
     job["end_tick"] = tick
-    if state_name in ("COMPLETED", "FAILED"):
-        try:
-            with open(job["stdout"], "w", encoding="utf-8") as f:
-                f.write("hello\ndone\n")
-        except OSError:
-            pass
+    if stdout_text is None:
+        stdout_text = "hello\ndone\n"
+    if job.get("stdout"):
+        _write(job["stdout"], stdout_text)
+    if stderr_text is not None and job.get("stderr"):
+        _write(job["stderr"], stderr_text)
+
+
+def _apply_outcome(job, tick):
+    """Resolve a RUNNING job to a terminal state, honouring FAKESLURM_OUTCOME.
+
+    ``FAKESLURM_OUTCOME`` (recorded on the job at submit time):
+      * ``oom``       -> OUT_OF_MEMORY, batch-step MaxRSS >= ReqMem.
+      * ``timeout``   -> TIMEOUT.
+      * ``nodefail``  -> NODE_FAIL.
+      * ``fail:TEXT`` -> FAILED, TEXT written to stderr (if a distinct stderr file exists)
+                          else to stdout, so `diagnose` can match a signature.
+    """
+    outcome = job.get("outcome")
+    if outcome == "oom":
+        job["maxrss_batch"] = "1100M"
+        _finish(job, "OUT_OF_MEMORY", "0:125", tick, stdout_text="hello\nallocating memory...\n")
+    elif outcome == "timeout":
+        _finish(job, "TIMEOUT", "0:15", tick, stdout_text="hello\nstill working...\n")
+    elif outcome == "nodefail":
+        _finish(job, "NODE_FAIL", "0:0", tick, stdout_text="hello\n")
+    elif isinstance(outcome, str) and outcome.startswith("fail:"):
+        text = outcome[len("fail:") :] or "error: something went wrong"
+        if not text.endswith("\n"):
+            text += "\n"
+        if job.get("stderr"):
+            _finish(
+                job,
+                "FAILED",
+                "1:0",
+                tick,
+                stdout_text="job crashed; see stderr\n",
+                stderr_text=text,
+            )
+        else:
+            _finish(job, "FAILED", "1:0", tick, stdout_text=text)
+    elif job.get("fail"):
+        _finish(job, "FAILED", "1:0", tick)
+    else:
+        _finish(job, "COMPLETED", "0:0", tick)
 
 
 def advance(state):
@@ -133,10 +180,7 @@ def advance(state):
             job["start_tick"] = tick
             job["nodelist"] = "fake0001"
         if job["state"] == "RUNNING" and tick - job["start_tick"] >= RUNNING_TICKS:
-            if job.get("fail"):
-                _finish(job, "FAILED", "1:0", tick)
-            else:
-                _finish(job, "COMPLETED", "0:0", tick)
+            _apply_outcome(job, tick)
 
 
 def is_terminal(job):

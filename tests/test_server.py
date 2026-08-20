@@ -14,25 +14,26 @@ from remoteslurm.cluster import Cluster
 from remoteslurm.errors import NotFound
 from remoteslurm.slurm import JobStatus
 
-EXPECTED_TOOLS = {
+CORE_EXPECTED = {
+    "info",
     "ls",
     "read",
-    "grep",
-    "glob",
-    "write",
     "edit",
-    "diff",
+    "grep",
+    "write",
     "run",
     "submit",
     "jobs",
-    "job_output",
-    "cancel",
-    "sinfo",
-    "info",
-    "connection",
+    "diagnose",
     "sync",
-    "projects",
+    "cancel",
+    "connection",
 }
+ALL_EXPECTED = CORE_EXPECTED | {"glob", "diff", "job_output", "sinfo", "projects"}
+
+# Roundtrip tests exercise tools that are only in the `all` set (glob/job_output/sinfo), so
+# drive an all-tools server. The core/all split itself is checked by the list_tools tests.
+_ALL_MCP = server.make_mcp("all")
 
 
 @pytest.fixture
@@ -55,7 +56,7 @@ class _FakeConfig:
 
 def call(tool: str, **args: Any) -> dict[str, Any]:
     async def go() -> dict[str, Any]:
-        async with create_connected_server_and_client_session(server.mcp) as client:
+        async with create_connected_server_and_client_session(_ALL_MCP) as client:
             res = await client.call_tool(tool, args)
             assert not res.isError, res.content
             if res.structuredContent is not None:
@@ -65,14 +66,33 @@ def call(tool: str, **args: Any) -> dict[str, Any]:
     return asyncio.run(go())
 
 
-def test_list_tools() -> None:
+def _tool_names(m: Any) -> set[str]:
     async def go() -> set[str]:
-        async with create_connected_server_and_client_session(server.mcp) as client:
+        async with create_connected_server_and_client_session(m) as client:
             tools = await client.list_tools()
             assert all(t.description for t in tools.tools)
             return {t.name for t in tools.tools}
 
-    assert asyncio.run(go()) == EXPECTED_TOOLS
+    return asyncio.run(go())
+
+
+def test_list_tools_core_default() -> None:
+    # The default server (no REMOTESLURM_MCP_TOOLS) exposes only the core set.
+    assert _tool_names(server.mcp) == CORE_EXPECTED
+
+
+def test_list_tools_all_set() -> None:
+    assert _tool_names(server.make_mcp("all")) == ALL_EXPECTED
+
+
+def test_guide_resource_present() -> None:
+    async def go() -> str:
+        async with create_connected_server_and_client_session(server.mcp) as client:
+            res = await client.read_resource("remoteslurm://guide")
+            return res.contents[0].text  # type: ignore[union-attr]
+
+    text = asyncio.run(go())
+    assert "remoteslurm" in text and "diagnose" in text
 
 
 def test_ls_roundtrip(mcp_cluster: Cluster) -> None:

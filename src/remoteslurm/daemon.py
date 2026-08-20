@@ -359,7 +359,17 @@ def connect_via_daemon(
         return None
     from .transport import SSHTransport
 
-    transport = SSHTransport(alias=hc.ssh, mfa=hc.mfa, control_path=hc.control_path)
+    # The stub calls go through the daemon, but client-side rsync (sync/put/get) reads this
+    # transport's ssh options, so carry the full set (control_path, ProxyJump/extra opts).
+    transport = SSHTransport(
+        alias=hc.ssh,
+        mfa=hc.mfa,
+        python=hc.python,
+        install_dir=hc.install_dir,
+        control_path=hc.control_path,
+        control_persist=hc.control_persist,
+        extra_ssh_opts=list(hc.ssh_opts),
+    )
     return Cluster(hc, transport, session=DaemonSession(path, hc.name))
 
 

@@ -26,7 +26,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 ENV_SSH = "REMOTESLURM_SYNC_SSH"
 MARKER = ".remoteslurm-sync.json"
-DEFAULT_SSH = "ssh -o ControlMaster=no -o BatchMode=yes"
+DEFAULT_SSH_ARGS = ["ssh", "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR"]
+DEFAULT_SSH = " ".join(DEFAULT_SSH_ARGS)
 MIN_RSYNC = (3, 1)
 BUILTIN_EXCLUDES = [".git/", ".venv/", "__pycache__/", "*.pyc", ".DS_Store", MARKER]
 
@@ -124,6 +125,23 @@ def _require_rsync() -> str:
 
 
 # ----------------------------------------------------------------------- remote expansion
+def transport_ssh_opts(cluster: Cluster) -> list[str] | None:
+    """Reconstruct rsync's ``-e`` ssh args from the cluster's transport so rsync reuses the
+    same ControlMaster (and any ProxyJump/extra opts) remoteslurm itself uses, instead of
+    depending solely on the user's ~/.ssh/config."""
+    t = cluster.transport
+    alias = getattr(t, "alias", None)
+    if alias is None:
+        return None
+    opts = list(DEFAULT_SSH_ARGS)
+    control_path = getattr(t, "control_path", None)
+    if control_path:
+        opts += ["-o", f"ControlPath={control_path}"]
+    for extra in getattr(t, "extra_ssh_opts", None) or []:
+        opts.append(extra)
+    return opts
+
+
 def expand_remote(cluster: Cluster, path: str) -> str:
     """Expand ``~``/``$VARS`` on the remote without interpolating into a shell string."""
     out = cluster.run(["sh", "-c", 'eval "printf %s $1"', "_", path.replace('"', "")])["stdout"]
@@ -142,6 +160,7 @@ def build_rsync_cmd(
     delete: bool = False,
     excludes: list[str] | None = None,
     ssh_cmd: list[str] | None = None,
+    ssh_opts: list[str] | None = None,
 ) -> list[str]:
     """The full rsync argv (contents of ``local`` <-> contents of ``remote``)."""
     cmd = [rsync, "-az", "-s", "--itemize-changes", "--stats"]
@@ -156,7 +175,7 @@ def build_rsync_cmd(
     elif env_rsh := os.environ.get(ENV_SSH):
         rsh = env_rsh
     else:
-        rsh = DEFAULT_SSH
+        rsh = shlex.join(ssh_opts or DEFAULT_SSH_ARGS)
     cmd += ["-e", rsh]
     src_local = str(local).rstrip("/") + "/"
     remote_spec = f"{alias}:{remote.rstrip('/') or '/'}"
@@ -243,12 +262,16 @@ def _git_info(local: Path) -> tuple[str | None, bool | None]:
 
 # ----------------------------------------------------------------------- the sync itself
 def _run_rsync(cmd: list[str], timeout: float) -> tuple[int, str, str]:
+    # LC_ALL=C keeps the --stats block in English so parse_itemize (and thus the size guard)
+    # works under any user locale.
+    env = dict(os.environ, LC_ALL="C", LANG="C")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=False,
+        env=env,
     )
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -299,6 +322,7 @@ def sync(
             f"{project.name}] and pass --delete again",
         )
     alias = getattr(cluster.transport, "alias", None)
+    ssh_opts = transport_ssh_opts(cluster)
     if not alias:
         raise InvalidArgument(
             "sync needs an ssh host (the transport has no ssh alias)",
@@ -328,6 +352,7 @@ def sync(
             delete=delete,
             excludes=list(project.exclude),
             ssh_cmd=ssh_cmd,
+            ssh_opts=ssh_opts,
         )
 
     # Size guard: probe with a dry run before moving anything for real.
@@ -402,6 +427,8 @@ def read_marker(cluster: Cluster, project: ProjectConfig) -> dict[str, Any] | No
 __all__ = [
     "BUILTIN_EXCLUDES",
     "DEFAULT_SSH",
+    "DEFAULT_SSH_ARGS",
+    "transport_ssh_opts",
     "ENV_SSH",
     "MARKER",
     "build_rsync_cmd",

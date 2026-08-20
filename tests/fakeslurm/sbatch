@@ -65,6 +65,14 @@ def main():
             content = f.read()
     except OSError as e:
         fs.die(f"sbatch: error: Unable to open file {script}: {e}")
+    if "FAKESLURM_REJECT_TRANSIENT" in content:
+        # A transient controller/network error: NOT a policy rejection, so the client must
+        # not remember it in learned_notes.txt.
+        sys.stderr.write(
+            "sbatch: error: Batch job submission failed: "
+            "Unable to contact slurm controller (connect failure)\n"
+        )
+        sys.exit(1)
     if "FAKESLURM_REJECT" in content:
         sys.stderr.write(
             "SBATCH ERROR: \n"
@@ -114,6 +122,7 @@ def main():
             "exit_code": "0:0",
             "nodelist": "",
             "fail": "FAKESLURM_FAIL" in content,
+            "outcome": os.environ.get("FAKESLURM_OUTCOME"),
         }
     sys.stdout.write(f"{jid}\n")
 

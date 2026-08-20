@@ -62,6 +62,62 @@ class ProjectConfig:
         return Path(os.path.expandvars(self.local)).expanduser()
 
 
+# Keys inside a ``[hosts.X.templates.NAME]`` table that are *not* sbatch options.
+_TEMPLATE_META_KEYS = ("preamble", "epilogue", "inherit")
+
+
+@dataclass
+class Template:
+    """A named bundle of sbatch options plus a script preamble/epilogue.
+
+    Everything in the ``[hosts.X.templates.NAME]`` table except ``preamble``,
+    ``epilogue`` and ``inherit`` is treated as an sbatch option (``time``,
+    ``partition``, ``cpus_per_task`` …). ``inherit`` names another template whose
+    options/preamble/epilogue this one layers on top of (resolved with
+    :meth:`HostConfig.resolve_template`).
+    """
+
+    name: str
+    options: dict[str, Any] = field(default_factory=dict)
+    preamble: str = ""
+    epilogue: str = ""
+    inherit: str | None = None
+
+    @classmethod
+    def from_dict(cls, name: str, d: dict[str, Any]) -> Template:
+        options: dict[str, Any] = {}
+        preamble = ""
+        epilogue = ""
+        inherit: str | None = None
+        for k, v in d.items():
+            if k == "preamble":
+                if not isinstance(v, str):
+                    raise ConfigError(f"template {name!r}: preamble must be a string")
+                preamble = v
+            elif k == "epilogue":
+                if not isinstance(v, str):
+                    raise ConfigError(f"template {name!r}: epilogue must be a string")
+                epilogue = v
+            elif k == "inherit":
+                if not isinstance(v, str):
+                    raise ConfigError(f"template {name!r}: inherit must be a template name")
+                inherit = v
+            else:
+                options[k] = v
+        return cls(
+            name=name, options=options, preamble=preamble, epilogue=epilogue, inherit=inherit
+        )
+
+    def summary(self) -> dict[str, Any]:
+        """A compact, JSON-safe view (options + whether it has a preamble/epilogue)."""
+        return {
+            "options": dict(self.options),
+            "preamble": self.preamble,
+            "epilogue": self.epilogue,
+            "inherit": self.inherit,
+        }
+
+
 @dataclass
 class HostConfig:
     name: str
@@ -80,26 +136,85 @@ class HostConfig:
         default_factory=dict
     )  # default sbatch args, e.g. {"time": "1:00:00"}
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    notes: str = ""  # free-form cluster rules shown by `info`/`notes` (agents read this first)
+    templates: dict[str, Template] = field(default_factory=dict)
     max_sync_files: int = 50_000  # sync guard: max files on a non-dry push
     max_sync_bytes: int = 2 * 1024**3  # sync guard: max bytes on a non-dry push
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, name: str, d: dict[str, Any]) -> HostConfig:
-        known = {f for f in cls.__dataclass_fields__ if f not in ("name", "extra", "projects")}
+        explicit = ("name", "extra", "projects", "templates")
+        known = {f for f in cls.__dataclass_fields__ if f not in explicit}
         kw = {k: v for k, v in d.items() if k in known}
-        extra = {k: v for k, v in d.items() if k not in known and k != "projects"}
+        extra = {k: v for k, v in d.items() if k not in known and k not in explicit}
         projects: dict[str, ProjectConfig] = {}
         for pname, pd in (d.get("projects") or {}).items():
             if not isinstance(pd, dict):
                 raise ConfigError(f"[hosts.{name}.projects.{pname}] must be a table")
             projects[pname] = ProjectConfig.from_dict(pname, pd)
         kw["projects"] = projects
+        templates: dict[str, Template] = {}
+        for tname, td in (d.get("templates") or {}).items():
+            if not isinstance(td, dict):
+                raise ConfigError(f"[hosts.{name}.templates.{tname}] must be a table")
+            templates[tname] = Template.from_dict(tname, td)
+        kw["templates"] = templates
         kw.setdefault("ssh", name)
         try:
             return cls(name=name, extra=extra, **kw)
         except TypeError as e:
             raise ConfigError(f"bad config for host {name!r}: {e}") from e
+
+    def resolve_template(self, name: str) -> Template:
+        """Return ``name`` with its ``inherit`` chain flattened (child overrides parent).
+
+        Raises :class:`ConfigError` for an unknown template or an inheritance cycle.
+        Options merge parent-first (child wins); ``preamble``/``epilogue`` take the
+        nearest non-empty value down the chain.
+        """
+        chain: list[str] = []
+        seen: set[str] = set()
+        cur: str | None = name
+        while cur is not None:
+            if cur in seen:
+                raise ConfigError(
+                    f"template inheritance cycle on host {self.name!r}: "
+                    + " -> ".join([*chain, cur])
+                )
+            seen.add(cur)
+            chain.append(cur)
+            t = self.templates.get(cur)
+            if t is None:
+                where = f"inherited by {chain[-2]!r} " if len(chain) > 1 else ""
+                raise ConfigError(
+                    f"unknown template {cur!r} {where}on host {self.name!r}",
+                    action="available templates: " + (", ".join(sorted(self.templates)) or "none"),
+                )
+            cur = t.inherit
+        options: dict[str, Any] = {}
+        preamble = ""
+        epilogue = ""
+        for tname in reversed(chain):  # root -> child
+            t = self.templates[tname]
+            options.update(t.options)
+            if t.preamble:
+                preamble = t.preamble
+            if t.epilogue:
+                epilogue = t.epilogue
+        return Template(
+            name=name, options=options, preamble=preamble, epilogue=epilogue, inherit=None
+        )
+
+    def template_summaries(self) -> dict[str, dict[str, Any]]:
+        """Best-effort resolved summaries of every template (cycles fall back to raw)."""
+        out: dict[str, dict[str, Any]] = {}
+        for name in sorted(self.templates):
+            try:
+                out[name] = self.resolve_template(name).summary()
+            except ConfigError:
+                out[name] = self.templates[name].summary()
+        return out
 
 
 @dataclass
@@ -156,6 +271,25 @@ account = "rrg-someone"     # default --account for sbatch
 # allow_run = true          # enable the `run` (arbitrary command) tool
 # [hosts.trillium.defaults]
 # time = "1:00:00"
+
+# Cluster rules an agent should read before submitting (shown by `info`/`rslurm notes`).
+# Use a single-line string, or TOML's triple-quoted multi-line string for several lines:
+# notes = "Walltime >= 15 min except on `debug`. Default account rrg-someone."
+
+# Submit templates bundle sbatch options + a script preamble/epilogue; use with
+# `rslurm submit --template cpu` or MCP submit(template="cpu"). `inherit` layers one on
+# another. Any key other than preamble/epilogue/inherit is an sbatch option.
+# [hosts.trillium.templates.cpu]
+# partition = "compute"
+# time = "01:00:00"
+# cpus_per_task = 4
+# mem = "16G"
+# preamble = "module load StdEnv/2023 python/3.11\\nsource $PROJECT/venvs/mvpa/bin/activate\\n"
+#
+# [hosts.trillium.templates.debug]
+# inherit = "cpu"           # take cpu's options + preamble, then override below
+# partition = "debug"
+# time = "00:10:00"
 
 # A project is a local<->remote directory pair for `rslurm sync` (rsync):
 # [hosts.trillium.projects.mvpa]

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import slurm
-from .config import state_dir
+from .config import Template, state_dir
 from .errors import InvalidArgument, RemoteTimeout, SlurmError
 
 if TYPE_CHECKING:
@@ -22,6 +22,82 @@ if TYPE_CHECKING:
 
 SQUEUE_CACHE_SECONDS = 10.0
 ACCOUNTING_GRACE_SECONDS = 600.0  # how long after last sighting we report "accounting_pending"
+LEARNED_NOTES_CAP = 50
+
+
+# --------------------------------------------------------------------------- learned notes
+def learned_notes_path(host: str) -> Path:
+    return state_dir() / host / "learned_notes.txt"
+
+
+def read_learned_notes(host: str) -> list[str]:
+    """Lines remembered from prior policy rejections on ``host`` (client-side state)."""
+    p = learned_notes_path(host)
+    try:
+        if p.exists():
+            return [ln.rstrip("\n") for ln in p.read_text("utf-8").splitlines() if ln.strip()]
+    except OSError:
+        pass
+    return []
+
+
+def append_learned_notes(host: str, lines: list[str], *, cap: int = LEARNED_NOTES_CAP) -> None:
+    """Append policy-rejection ``lines`` (deduped, most-recent-``cap`` kept). Best effort."""
+    if not lines:
+        return
+    p = learned_notes_path(host)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        existing = read_learned_notes(host)
+        seen = set(existing)
+        for line in lines:
+            if line not in seen:
+                existing.append(line)
+                seen.add(line)
+        existing = existing[-cap:]
+        p.write_text("\n".join(existing) + "\n", "utf-8")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- template scripts
+def _opts_repr(opts: dict[str, Any]) -> str:
+    return "{" + ", ".join(f"{k}={v}" for k, v in sorted(opts.items())) + "}"
+
+
+def compose_templated_script(
+    script: str, template: Template, *, name: str, merged_options: dict[str, Any]
+) -> str:
+    """Wrap ``script`` with the template preamble/epilogue and a documentation header.
+
+    Layout: ``#!`` shebang (if any) -> ``# remoteslurm: template=… options=…`` ->
+    preamble -> original body -> epilogue. Options remain command-line sbatch flags; the
+    header is documentation only (read back by ``diagnose``).
+    """
+    header = f"# remoteslurm: template={template.name} options={_opts_repr(merged_options)}"
+    body = script
+    shebang: str | None = None
+    if body.startswith("#!"):
+        nl = body.find("\n")
+        if nl == -1:
+            shebang, body = body, ""
+        else:
+            shebang, body = body[:nl], body[nl + 1 :]
+    chunks: list[str] = []
+    if shebang is not None:
+        chunks.append(shebang + "\n")
+    chunks.append(header + "\n")
+    if template.preamble:
+        chunks.append(
+            template.preamble if template.preamble.endswith("\n") else template.preamble + "\n"
+        )
+    if body:
+        chunks.append(body if body.endswith("\n") else body + "\n")
+    if template.epilogue:
+        chunks.append(
+            template.epilogue if template.epilogue.endswith("\n") else template.epilogue + "\n"
+        )
+    return "".join(chunks)
 
 
 @dataclass
@@ -178,6 +254,8 @@ class SlurmOps:
         name: str | None = None,
         cwd: str | None = None,
         args: list[str] | None = None,
+        template: str | None = None,
+        force_preamble: bool = False,
         **options: Any,
     ) -> Job:
         """Submit a batch job.
@@ -186,6 +264,12 @@ class SlurmOps:
         existing remote script. ``options`` become ``--key=value`` sbatch flags
         (``time="1:00:00"``, ``gpus_per_node=1``, ``exclusive=True``). Host defaults
         (``account``, ``partition``, ``defaults`` table) are applied when not overridden.
+
+        ``template`` names a ``[hosts.X.templates.NAME]`` bundle: its options are merged
+        (host defaults < template < explicit ``options``) and, for ``script=`` submissions,
+        its preamble/epilogue wrap the body. A template with a non-empty preamble refuses a
+        ``path=`` submission (existing remote script) unless ``force_preamble=True``, in which
+        case only the options are applied.
         """
         if (script is None) == (path is None):
             raise InvalidArgument("provide exactly one of script= or path=")
@@ -194,9 +278,23 @@ class SlurmOps:
             opts.setdefault("account", self.host.account)
         if self.host.partition:
             opts.setdefault("partition", self.host.partition)
+        tmpl: Template | None = None
+        if template is not None:
+            tmpl = self.host.resolve_template(template)  # ConfigError if unknown/cyclic
+            opts.update(tmpl.options)
         opts.update(options)
         if name:
             opts.setdefault("job_name", name)
+        if tmpl is not None and path is not None and tmpl.preamble and not force_preamble:
+            raise InvalidArgument(
+                f"template {template!r} has a preamble but path= submissions cannot inject it",
+                action="pass force_preamble=True to apply the template's options only, "
+                "or submit the script content with script= instead",
+            )
+        if tmpl is not None and script is not None:
+            script = compose_templated_script(
+                script, tmpl, name=template or tmpl.name, merged_options=opts
+            )
         flags = slurm.sbatch_args_from_options(opts) + list(args or [])
         res = self.call(
             "sbatch",
@@ -208,7 +306,13 @@ class SlurmOps:
             name=name or opts.get("job_name"),
             script_dir=self.host.script_dir,
         )
-        job_id = slurm.parse_sbatch_output(res["stdout"], res["stderr"], res["rc"])
+        try:
+            job_id = slurm.parse_sbatch_output(res["stdout"], res["stderr"], res["rc"])
+        except SlurmError:
+            # Remember durable policy rejections (walltime/account/QOS/…); transient errors
+            # never match the allow-list, so nothing is written for them.
+            append_learned_notes(self.host.name, slurm.match_policy_lines(res.get("stderr", "")))
+            raise
         rec = JobRecord(
             job_id=job_id,
             name=name or opts.get("job_name"),
@@ -217,6 +321,7 @@ class SlurmOps:
             last_state="PENDING",
             last_seen=time.time(),
             sbatch_args=flags,
+            meta={"template": template, "options": dict(opts)},
         )
         # Fill in stdout/stderr/workdir from scontrol (best effort; job may be gone already).
         try:

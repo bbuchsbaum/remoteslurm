@@ -254,9 +254,12 @@ def mcp_cluster(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> Cluster:
     return cluster
 
 
+_ALL_MCP = server.make_mcp("all")  # diff is only in the `all` tool set
+
+
 def call(tool: str, **args: Any) -> dict[str, Any]:
     async def go() -> dict[str, Any]:
-        async with create_connected_server_and_client_session(server.mcp) as client:
+        async with create_connected_server_and_client_session(_ALL_MCP) as client:
             res = await client.call_tool(tool, args)
             assert not res.isError, res.content
             if res.structuredContent is not None:

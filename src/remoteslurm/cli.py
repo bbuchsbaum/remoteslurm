@@ -182,6 +182,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         check("host", False, e.message, e.action or "")
         return EXIT_ERROR
     check("host", True, f"{host.name} (ssh alias {host.ssh!r}, mfa={host.mfa})")
+    # A warning (never a hard failure): agents rely on `notes` to learn the cluster's rules.
+    check(
+        "cluster notes",
+        True if host.notes else None,
+        (host.notes.replace("\n", " ")[:60] if host.notes else "not set"),
+        f'add notes = "..." under [hosts.{host.name}] so agents know the cluster rules',
+    )
+    if host.templates:
+        check("templates", True, ", ".join(sorted(host.templates)))
     from . import sync as sync_mod
 
     found_rsync = sync_mod.find_rsync()
@@ -625,7 +634,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if script is not None and not script.startswith("#!"):
         script = "#!/bin/bash\n" + script
     job = c.submit(
-        script, path=path, name=args.name, cwd=args.cwd, args=args.sbatch_arg or [], **options
+        script,
+        path=path,
+        name=args.name,
+        cwd=args.cwd,
+        args=args.sbatch_arg or [],
+        template=args.template,
+        force_preamble=args.force_preamble,
+        **options,
     )
     st = job.status()
     d = st.to_dict()
@@ -637,6 +653,103 @@ def cmd_submit(args: argparse.Namespace) -> int:
             f"  script: {d.get('script_path')}\n  stdout: {d.get('stdout_path')}"
         ),
     )
+    return EXIT_OK
+
+
+def cmd_templates(args: argparse.Namespace) -> int:
+    cfg = Config.load(Path(args.config) if getattr(args, "config", None) else None)
+    host = cfg.host(args.host)
+    if args.show:
+        t = host.resolve_template(args.show)  # ConfigError on unknown/cycle
+
+        def show_human(d: dict[str, Any]) -> None:
+            print(f"template {d['name']} (host {host.name}):")
+            for k, v in d["options"].items():
+                print(f"  --{k.replace('_', '-')}={v}")
+            if d["preamble"]:
+                print("  preamble:")
+                for ln in d["preamble"].splitlines():
+                    print(f"    {ln}")
+            if d["epilogue"]:
+                print("  epilogue:")
+                for ln in d["epilogue"].splitlines():
+                    print(f"    {ln}")
+
+        emit(args, {"name": args.show, **t.summary()}, show_human)
+        return EXIT_OK
+    summaries = host.template_summaries()
+
+    def human(d: dict[str, Any]) -> None:
+        if not d["templates"]:
+            print(f"no templates configured for host {host.name}")
+            return
+        for name, s in d["templates"].items():
+            opts = " ".join(f"{k}={v}" for k, v in s["options"].items())
+            inh = f" (inherits {s['inherit']})" if s.get("inherit") else ""
+            pre = " +preamble" if s["preamble"] else ""
+            print(f"{name:12} {opts}{inh}{pre}")
+
+    emit(args, {"templates": summaries, "host": host.name, "count": len(summaries)}, human)
+    return EXIT_OK
+
+
+def cmd_notes(args: argparse.Namespace) -> int:
+    from .jobs import read_learned_notes
+
+    cfg = Config.load(Path(args.config) if getattr(args, "config", None) else None)
+    host = cfg.host(args.host)
+    learned = read_learned_notes(host.name)
+    data = {"host": host.name, "notes": host.notes, "learned_notes": learned}
+
+    def human(d: dict[str, Any]) -> None:
+        if d["notes"]:
+            print(d["notes"].rstrip("\n"))
+        else:
+            print(f'(no notes set for host {host.name}; add notes = "..." to the config)')
+        if d["learned_notes"]:
+            print("\nlearned from past rejections:")
+            for ln in d["learned_notes"]:
+                print(f"  - {ln}")
+
+    emit(args, data, human)
+    return EXIT_OK
+
+
+def cmd_agent_guide(args: argparse.Namespace) -> int:
+    from .guide import AGENT_GUIDE
+
+    if args.json:
+        print(json.dumps({"guide": AGENT_GUIDE}, indent=2))
+    else:
+        print(AGENT_GUIDE, end="" if AGENT_GUIDE.endswith("\n") else "\n")
+    return EXIT_OK
+
+
+def cmd_diagnose(args: argparse.Namespace) -> int:
+    c = get_cluster(args)
+    d = c.diagnose(args.job_id, tail=args.lines)
+
+    def human(d: dict[str, Any]) -> None:
+        print(d["verdict"])
+        for h in d["hints"]:
+            print(f"  - {h}")
+        st = d.get("status", {})
+        meta = f"state={st.get('state')}"
+        if st.get("exit_code") is not None:
+            meta += f" exit={st.get('exit_code')}"
+        if st.get("reason"):
+            meta += f" reason={st.get('reason')}"
+        print(f"\n[{meta}]")
+        if d.get("stderr_tail"):
+            print("\n--- stderr (tail) ---")
+            print(d["stderr_tail"].rstrip("\n"))
+        if d.get("stdout_tail"):
+            print("\n--- stdout (tail) ---")
+            print(d["stdout_tail"].rstrip("\n"))
+        if d.get("truncated"):
+            print("\n[diagnose output truncated to fit the size cap]", file=sys.stderr)
+
+    emit(args, d, human)
     return EXIT_OK
 
 
@@ -983,6 +1096,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-p", "--partition")
     sp.add_argument("-A", "--account")
     sp.add_argument(
+        "--template", help="config template name (see `rslurm templates`): options + preamble"
+    )
+    sp.add_argument(
+        "--force-preamble",
+        action="store_true",
+        help="apply a template's options to a --remote script even though its preamble is skipped",
+    )
+    sp.add_argument(
         "-o",
         "--opt",
         action="append",
@@ -992,6 +1113,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--sbatch-arg", action="append", metavar="ARG", help="raw extra sbatch argument"
     )
+
+    sp = add("templates", cmd_templates, "list submit templates (or --show NAME)")
+    sp.add_argument("--show", metavar="NAME", help="show one template's resolved options/preamble")
+
+    add("notes", cmd_notes, "print the host's cluster notes and any learned policy notes")
+
+    add("agent-guide", cmd_agent_guide, "print the CLAUDE.md/AGENTS.md block for coding agents")
+
+    sp = add("diagnose", cmd_diagnose, "explain a finished/stuck job (verdict, hints, log tails)")
+    sp.add_argument("job_id")
+    sp.add_argument("-n", "--lines", type=int, default=60, help="log tail lines to include")
 
     sp = add(
         "jobs", cmd_jobs, "list my jobs (queue + recently submitted)", aliases=["queue", "squeue"]

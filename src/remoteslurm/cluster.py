@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import base64
+import json
+import re
 import threading
 from typing import Any
 
+from . import slurm
 from .config import Config, HostConfig
-from .errors import InvalidArgument, PermissionDenied
-from .jobs import SlurmOps
+from .errors import InvalidArgument, PermissionDenied, RemoteSlurmError
+from .jobs import SlurmOps, read_learned_notes
 from .session import DEFAULT_TIMEOUT, Session
 from .transport import LocalTransport, SSHTransport, Transport
 
@@ -90,7 +93,12 @@ class Cluster(SlurmOps):
 
     def info(self, refresh: bool = False) -> dict[str, Any]:
         if self._info is None or refresh:
-            self._info = self.call("info", _timeout=30)
+            base = dict(self.call("info", _timeout=30))
+            # Local (client-side) facts an agent should read before submitting.
+            base["notes"] = self.host.notes
+            base["templates"] = self.host.template_summaries()
+            base["learned_notes"] = read_learned_notes(self.host.name)
+            self._info = base
         return self._info
 
     @property
@@ -289,3 +297,116 @@ class Cluster(SlurmOps):
         else:
             args["argv"] = list(cmd)
         return self.call("run", _timeout=timeout + 15, **args)
+
+    # -- diagnose -------------------------------------------------------------------------------
+    def _safe_user(self) -> str | None:
+        try:
+            return self.user
+        except RemoteSlurmError:
+            return None
+
+    def diagnose(self, job_id: str, *, tail: int = 60) -> dict[str, Any]:
+        """Explain what happened to a job in one call: status, tails, steps, sync marker,
+        a plain-English ``verdict`` and actionable ``hints``.
+
+        Gathers the merged status, the submit script (<=16 KB), stdout/stderr tails, the
+        sacct step table and any ``.remoteslurm-sync.json`` marker, runs the pure
+        :data:`~remoteslurm.slurm.DIAGNOSTICS` rules, and caps the whole payload at
+        ~64 KB (``truncated`` flags a cut).
+        """
+        slurm.parse_job_id(job_id)
+        st = self.job_status(job_id, refresh=True)
+        rec = self.registry.get(job_id)
+
+        script: str | None = None
+        script_path = st.script_path or (rec.script_path if rec else None)
+        if script_path:
+            try:
+                r = self.read(script_path, max_bytes=16 * 1024)
+                script = None if r.get("binary") else r.get("content")
+            except RemoteSlurmError:
+                script = None
+
+        stdout_tail = self._tail_or_empty(job_id, tail, "stdout")
+        stderr_tail = ""
+        if st.stderr_path and st.stderr_path != st.stdout_path:
+            stderr_tail = self._tail_or_empty(job_id, tail, "stderr")
+
+        steps: list[dict[str, Any]] = []
+        req_mem: int | None = None
+        max_rss = st.max_rss
+        state_raw: str | None = None
+        try:
+            acct = self.sacct([job_id])
+            a = acct.get(job_id.split("_")[0]) or acct.get(job_id)
+            if a:
+                steps = a.get("steps", []) or []
+                req_mem = slurm._parse_mem(a.get("req_mem") or "")
+                if a.get("max_rss") is not None:
+                    max_rss = a["max_rss"]
+                state_raw = a.get("state_raw")
+        except RemoteSlurmError:
+            pass
+
+        sync = self._read_sync_marker(st.workdir)
+
+        cancelled_by: str | None = None
+        if state_raw:
+            m = re.search(r"CANCELLED by (\S+)", state_raw)
+            if m:
+                cancelled_by = m.group(1)
+
+        ctx = slurm.DiagContext(
+            state=st.state,
+            exit_code=st.exit_code,
+            exit_code_raw=st.exit_code_raw,
+            reason=st.reason,
+            max_rss=max_rss,
+            req_mem=req_mem,
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
+            cancelled_by=cancelled_by,
+            whoami=self._safe_user(),
+            elapsed=st.elapsed,
+            time_limit=st.time_limit,
+        )
+        verdict, hints = slurm.diagnose_job(ctx)
+        if sync:
+            hints.append(_sync_hint(sync))
+
+        out: dict[str, Any] = {
+            "job_id": job_id,
+            "status": st.to_dict(),
+            "script": script,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "steps": steps,
+            "sync": sync,
+            "verdict": verdict,
+            "hints": hints,
+            "truncated": False,
+        }
+        return slurm.cap_diagnostic_fields(out)
+
+    def _tail_or_empty(self, job_id: str, tail: int, stream: str) -> str:
+        try:
+            return str(self.job_output(job_id, tail=tail, stream=stream).get("content", ""))
+        except RemoteSlurmError:
+            return ""
+
+    def _read_sync_marker(self, workdir: str | None) -> dict[str, Any] | None:
+        if not workdir:
+            return None
+        try:
+            text = self.read_text(workdir.rstrip("/") + "/.remoteslurm-sync.json", max_bytes=8192)
+            return dict(json.loads(text))
+        except (RemoteSlurmError, ValueError):
+            return None
+
+
+def _sync_hint(marker: dict[str, Any]) -> str:
+    rev = marker.get("local_git_rev") or "?"
+    rev = rev[:12] if isinstance(rev, str) else "?"
+    dirty = " (working tree was dirty)" if marker.get("local_dirty") else ""
+    when = marker.get("pushed_at") or "?"
+    return f"code was pushed {when} at git rev {rev}{dirty}; re-sync if you changed files since"
