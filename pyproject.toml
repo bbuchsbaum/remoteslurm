@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "remoteslurm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast, agent-friendly control of a remote Slurm login node over a persistent SSH connection (library + CLI + MCP server)."
 readme = "README.md"
 requires-python = ">=3.11"

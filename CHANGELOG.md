@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (in progress)
+## 0.2.0 — 2026-08-20
 
 v2 "workflow layer" — see docs/plans/v2-plan.md.
 
