@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""FakeSlurm srun: run the command after ``--`` locally, faking a queue wait + node allocation.
+
+remoteslurm invokes ``srun [opts] -- bash -c '...'``; this shim ignores the resource options,
+exports ``$SLURMD_NODENAME`` (so the wrapped command's ``RS_NODE=`` sentinel resolves), and
+``exec``s the command so a cancel/timeout signal reaches the whole tree.
+
+Knobs (env):
+  * ``FAKESLURM_SRUN_QUEUE`` = ``<seconds>`` | ``never`` (default ``0``):
+      ``never`` prints the "queued and waiting for resources" line and exits WITHOUT running the
+      command (simulates never getting an allocation); a number sleeps that long first.
+  * ``FAKESLURM_SRUN_NODE``  = node name exported as ``$SLURMD_NODENAME`` (default ``fakenode1``).
+"""
+
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _fakeslurm as fs  # noqa: E402
+
+FAKE_JOB_ID = 9000
+VALUE_FLAGS = {
+    "-p",
+    "--partition",
+    "-t",
+    "--time",
+    "-c",
+    "--cpus-per-task",
+    "-A",
+    "--account",
+    "--mem",
+}
+
+
+def command_after_separator(argv):
+    """Everything after the ``--`` separator (best-effort scan if it is absent)."""
+    if "--" in argv:
+        return argv[argv.index("--") + 1 :]
+    cmd = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("-"):
+            i += 2 if (a in VALUE_FLAGS and "=" not in a) else 1
+            continue
+        cmd = argv[i:]
+        break
+    return cmd
+
+
+def main():
+    cmd = command_after_separator(sys.argv[1:])
+    if not cmd:
+        fs.die("srun: error: no command given")
+    queue = os.environ.get("FAKESLURM_SRUN_QUEUE", "0")
+    if queue == "never":
+        sys.stderr.write("srun: job %d queued and waiting for resources\n" % FAKE_JOB_ID)
+        sys.stderr.flush()
+        sys.exit(1)
+    try:
+        wait = float(queue)
+    except ValueError:
+        wait = 0.0
+    if wait > 0:
+        sys.stderr.write("srun: job %d queued and waiting for resources\n" % FAKE_JOB_ID)
+        sys.stderr.flush()
+        time.sleep(wait)
+    sys.stderr.write("srun: job %d has been allocated resources\n" % FAKE_JOB_ID)
+    sys.stderr.flush()
+    node = os.environ.get("FAKESLURM_SRUN_NODE", "fakenode1")
+    env = dict(os.environ, SLURMD_NODENAME=node)
+    os.execvpe(cmd[0], cmd, env)  # replace this process so a cancel reaches the real command
+
+
+if __name__ == "__main__":
+    main()

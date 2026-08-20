@@ -309,6 +309,46 @@ def aggregate_array(
     }
 
 
+def walltime_to_seconds(spec: str | int | None) -> int | None:
+    """Parse a Slurm walltime spec into seconds.
+
+    Accepts the Slurm forms ``minutes``, ``minutes:seconds``, ``hours:minutes:seconds``,
+    ``days-hours``, ``days-hours:minutes`` and ``days-hours:minutes:seconds``. Returns ``None``
+    for an unset / unparseable value (the caller then falls back to a default budget).
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, int):
+        return spec * 60 if spec >= 0 else None  # a bare int is minutes, matching Slurm
+    s = str(spec).strip()
+    if not s:
+        return None
+    days = 0
+    if "-" in s:
+        d, _, s = s.partition("-")
+        if not d.isdigit():
+            return None
+        days = int(d)
+    parts = s.split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if days and len(parts) == 1:  # days-hours
+        h, m, sec = nums[0], 0, 0
+    elif days and len(parts) == 2:  # days-hours:minutes
+        h, m, sec = nums[0], nums[1], 0
+    elif days:  # days-hours:minutes:seconds
+        h, m, sec = nums[0], nums[1], nums[2]
+    elif len(parts) == 1:  # minutes
+        return days * 86400 + nums[0] * 60
+    elif len(parts) == 2:  # minutes:seconds
+        return nums[0] * 60 + nums[1]
+    else:  # hours:minutes:seconds
+        h, m, sec = nums[0], nums[1], nums[2]
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
 def _parse_mem(s: str) -> int | None:
     """'15848K' -> bytes; '' -> None."""
     s = s.strip()

@@ -3,17 +3,53 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import json
+import os
 import re
 import threading
 from typing import Any
 
 from . import slurm
 from .config import Config, HostConfig
-from .errors import InvalidArgument, PermissionDenied, RemoteSlurmError
+from .errors import (
+    ConfirmationRequired,
+    InvalidArgument,
+    PermissionDenied,
+    RemoteSlurmError,
+)
 from .jobs import SlurmOps, read_learned_notes
 from .session import DEFAULT_TIMEOUT, Session
 from .transport import LocalTransport, SSHTransport, Transport
+
+
+def _expand_home(path: str, home: str | None) -> str:
+    """Expand a leading ``~`` (and ``$HOME``) using the known remote home, if any."""
+    if home and path == "~":
+        return home
+    if home and path.startswith("~/"):
+        return home.rstrip("/") + "/" + path[2:]
+    if home and path.startswith("$HOME"):
+        return home.rstrip("/") + path[len("$HOME") :]
+    return path
+
+
+def _matches_protected(path: str, patterns: list[str], home: str | None) -> bool:
+    """True if ``path`` matches any protected glob (raw or with ``~``/``$HOME`` expanded).
+
+    ``fnmatch`` is used so ``*`` spans path separators, letting ``~/.ssh/**`` cover everything
+    under it; both the pattern and the path are compared raw and home-expanded so a
+    ``~``-relative arg matches an absolute pattern and vice-versa.
+    """
+    forms = {path, _expand_home(path, home)}
+    for pat in patterns:
+        pats = {pat, _expand_home(pat, home)}
+        for p in forms:
+            for q in pats:
+                if fnmatch.fnmatch(p, q):
+                    return True
+    return False
+
 
 _registry_lock = threading.Lock()
 _clusters: dict[str, Cluster] = {}
@@ -116,6 +152,76 @@ class Cluster(SlurmOps):
     def home(self) -> str:
         return str(self.info()["home"])
 
+    # -- safety rails (E2) --------------------------------------------------------------------
+    def _cached_home(self) -> str | None:
+        """The remote home for protected-path matching (cached ``info``; never raises)."""
+        if self._info is not None:
+            return self._info.get("home")
+        try:
+            return str(self.info().get("home"))
+        except RemoteSlurmError:
+            return None
+
+    def _check_protected(self, path: str, *, force: bool = False, action: str = "write") -> None:
+        """Refuse to touch a configured protected path unless ``force``."""
+        patterns = self.host.protected_paths
+        if force or not patterns:
+            return
+        if _matches_protected(path, patterns, self._cached_home()):
+            raise PermissionDenied(
+                f"{path} is a protected path on host {self.host.name} (refusing to {action})",
+                action="pass force=True (library/MCP) or --force (CLI) to override",
+                path=path,
+            )
+
+    def _enforce_run_policy(self, cmd: str | list[str]) -> None:
+        """Apply ``allow_run`` to a ``run``/``srun`` request (client-side gate).
+
+        ``true`` allows anything; ``false`` disables running; ``"safe"`` requires an argv list
+        whose ``argv[0]`` basename matches ``run_allowlist``.
+        """
+        mode = self.host.allow_run
+        if mode is False:
+            raise PermissionDenied(
+                f"`run` is disabled for host {self.host.name}",
+                action='set allow_run = true (or "safe") in the host config',
+            )
+        if isinstance(mode, str) and mode == "safe":
+            if isinstance(cmd, str):
+                raise PermissionDenied(
+                    f'allow_run = "safe" on host {self.host.name} forbids shell-string commands',
+                    action="pass the command as an argv list, e.g. run(['python3', '-c', '...'])",
+                )
+            exe = os.path.basename(cmd[0]) if cmd else ""
+            allow = self.host.run_allowlist
+            if not any(fnmatch.fnmatch(exe, pat) for pat in allow):
+                raise PermissionDenied(
+                    f"{exe!r} is not in run_allowlist on host {self.host.name}",
+                    action="add it to run_allowlist, or use a permitted executable; "
+                    f"allowed: {', '.join(sorted(allow))}",
+                )
+            # A shell with -c/-lc is arbitrary execution — it defeats the allow-list even though
+            # the shell itself is listed (so `bash script.sh` stays allowed, `bash -c '…'` does not).
+            if exe in ("bash", "sh", "zsh", "dash", "ksh") and any(
+                a in ("-c", "-lc", "-ic", "-lic") or (a.startswith("-") and "c" in a[1:])
+                for a in cmd[1:]
+            ):
+                raise PermissionDenied(
+                    f'allow_run = "safe" forbids `{exe} -c` (arbitrary shell) on '
+                    f"host {self.host.name}",
+                    action="run the target executable directly as argv, e.g. "
+                    "['python3', 'script.py']",
+                )
+
+    def _require_confirm(self, op: str, confirm: bool, what: str) -> None:
+        """Raise ``ConfirmationRequired`` if ``op`` is gated by ``host.confirm`` and unconfirmed."""
+        if op in self.host.confirm and not confirm:
+            raise ConfirmationRequired(
+                f"{op} needs confirmation on host {self.host.name}: {what}",
+                what=what,
+                op=op,
+            )
+
     # -- filesystem ---------------------------------------------------------------------------
     def ls(
         self, path: str = "~", *, limit: int = 200, token: str | None = None, hidden: bool = True
@@ -174,7 +280,9 @@ class Cluster(SlurmOps):
         append: bool = False,
         mkdirs: bool = True,
         mode: int | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
+        self._check_protected(path, force=force, action="write")
         args: dict[str, Any] = {"path": path, "append": append, "mkdirs": mkdirs, "mode": mode}
         if isinstance(content, bytes):
             args["content_b64"] = base64.b64encode(content).decode("ascii")
@@ -183,7 +291,14 @@ class Cluster(SlurmOps):
         return self.call("write", _timeout=120, **args)
 
     def edit(
-        self, path: str, old: str, new: str, *, expect: int = 1, all: bool = False
+        self,
+        path: str,
+        old: str,
+        new: str,
+        *,
+        expect: int = 1,
+        all: bool = False,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Replace exact occurrences of ``old`` with ``new`` in a remote text file.
 
@@ -191,7 +306,9 @@ class Cluster(SlurmOps):
         every occurrence is replaced. Returns ``replacements``, ``first_line`` and a
         unified-diff ``preview``. Line endings and file mode are preserved; the
         replacement is atomic (the inode changes, hard links are not preserved).
+        A protected path (``protected_paths``) is refused unless ``force=True``.
         """
+        self._check_protected(path, force=force, action="edit")
         r = self.call("edit", path=path, old=old, new=new, expect=expect, all=all, _timeout=120)
         self.registry.audit("edit", path=r["path"], replacements=r["replacements"])
         return r
@@ -221,8 +338,26 @@ class Cluster(SlurmOps):
     def mkdir(self, path: str) -> dict[str, Any]:
         return self.call("mkdir", path=path)
 
-    def rm(self, path: str, *, recursive: bool = False) -> dict[str, Any]:
-        return self.call("rm", path=path, recursive=recursive, _timeout=300)
+    def rm(
+        self,
+        path: str,
+        *,
+        recursive: bool = False,
+        force: bool = False,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Remove a remote file (or, with ``recursive``, a directory tree).
+
+        Refuses a configured protected path unless ``force=True``; when ``rm`` is listed in the
+        host's ``confirm``, requires ``confirm=True`` (else raises ``ConfirmationRequired``). The
+        stub adds its own guards (shared roots, shallow recursive deletes).
+        """
+        self._check_protected(path, force=force, action="remove")
+        what = f"remove {'-r ' if recursive else ''}{path}"
+        self._require_confirm("rm", confirm, what)
+        r = self.call("rm", path=path, recursive=recursive, _timeout=300)
+        self.registry.audit("rm", path=path, recursive=recursive)
+        return r
 
     def glob(
         self,
@@ -282,17 +417,49 @@ class Cluster(SlurmOps):
         login: bool = False,
         max_output: int = 65536,
         cancel_on_timeout: bool = True,
+        compute: bool = False,
+        template: str | None = None,
+        partition: str | None = None,
+        time: str | None = None,
+        cpus: int | None = None,
+        mem: str | None = None,
+        gpus: int | None = None,
+        account: str | None = None,
+        queue_timeout: int = 600,
     ) -> dict[str, Any]:
-        """Run a command on the login node (bounded output).
+        """Run a command on the login node (bounded output), or on a compute node with
+        ``compute=True`` (via ``srun``).
 
         ``cmd`` may be an argv list or a shell string. When ``cancel_on_timeout`` (the default)
         the remote process group is killed if the client-side call times out (or is
-        interrupted), so nothing lingers on the login node.
+        interrupted), so nothing lingers.
+
+        With ``compute=True`` the command runs under ``srun`` on an allocated node. Resources
+        come from ``template`` (a config template) then the explicit ``partition``/``time``/
+        ``cpus``/``mem``/``gpus``/``account`` kwargs (account falls back to the host default).
+        ``queue_timeout`` bounds how long to wait for the allocation; the result is
+        ``{started: true, rc, stdout, stderr, node, elapsed}`` for a run that got a node, or
+        ``{started: false, reason}`` if it never left the queue. ``allow_run`` is enforced
+        exactly as for a login-node ``run``.
         """
-        if not self.host.allow_run:
-            raise PermissionDenied(
-                f"`run` is disabled for host {self.host.name}",
-                action="set allow_run = true in the host config",
+        self._enforce_run_policy(cmd)
+        if compute:
+            return self._run_compute(
+                cmd,
+                template=template,
+                partition=partition,
+                time=time,
+                cpus=cpus,
+                mem=mem,
+                gpus=gpus,
+                account=account,
+                queue_timeout=queue_timeout,
+                cwd=cwd,
+                env=env,
+                stdin=stdin,
+                login=login,
+                max_output=max_output,
+                cancel_on_timeout=cancel_on_timeout,
             )
         args: dict[str, Any] = {
             "cwd": cwd,
@@ -307,6 +474,97 @@ class Cluster(SlurmOps):
         else:
             args["argv"] = list(cmd)
         return self.call("run", _timeout=timeout + 15, _cancel_on_timeout=cancel_on_timeout, **args)
+
+    def _resolve_compute_resources(
+        self,
+        *,
+        template: str | None,
+        partition: str | None,
+        time: str | None,
+        cpus: int | None,
+        mem: str | None,
+        gpus: int | None,
+        account: str | None,
+    ) -> dict[str, Any]:
+        """Merge template options (< explicit kwargs) into srun resource fields."""
+        res: dict[str, Any] = {}
+        if template is not None:
+            opts = self.host.resolve_template(template).options  # ConfigError if unknown/cyclic
+            res["partition"] = opts.get("partition")
+            res["time"] = opts.get("time")
+            res["cpus"] = opts.get("cpus_per_task", opts.get("cpus"))
+            res["mem"] = opts.get("mem")
+            res["gpus"] = opts.get("gpus_per_node", opts.get("gpus"))
+            res["account"] = opts.get("account")
+        for k, v in (
+            ("partition", partition),
+            ("time", time),
+            ("cpus", cpus),
+            ("mem", mem),
+            ("gpus", gpus),
+            ("account", account),
+        ):
+            if v is not None:
+                res[k] = v
+        if not res.get("account") and self.host.account:
+            res["account"] = self.host.account
+        return {k: v for k, v in res.items() if v is not None}
+
+    def _run_compute(
+        self,
+        cmd: str | list[str],
+        *,
+        template: str | None,
+        partition: str | None,
+        time: str | None,
+        cpus: int | None,
+        mem: str | None,
+        gpus: int | None,
+        account: str | None,
+        queue_timeout: int,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        stdin: str | None,
+        login: bool,
+        max_output: int,
+        cancel_on_timeout: bool,
+    ) -> dict[str, Any]:
+        res = self._resolve_compute_resources(
+            template=template,
+            partition=partition,
+            time=time,
+            cpus=cpus,
+            mem=mem,
+            gpus=gpus,
+            account=account,
+        )
+        walltime = slurm.walltime_to_seconds(res.get("time")) or 3600
+        total = int(queue_timeout) + int(walltime) + 30
+        args: dict[str, Any] = dict(res)
+        args.update(
+            {
+                "cwd": cwd,
+                "env": env,
+                "stdin": stdin,
+                "queue_timeout": queue_timeout,
+                "timeout": total,
+                "max_output": max_output,
+                "login": login,  # honoured for both cmd and argv forms (module loads)
+            }
+        )
+        if isinstance(cmd, str):
+            args["cmd"] = cmd
+        else:
+            args["argv"] = list(cmd)
+        r = self.call("srun", _timeout=total + 30, _cancel_on_timeout=cancel_on_timeout, **args)
+        self.registry.audit(
+            "srun",
+            started=r.get("started"),
+            node=r.get("node"),
+            rc=r.get("rc"),
+            partition=res.get("partition"),
+        )
+        return r
 
     # -- diagnose -------------------------------------------------------------------------------
     def _safe_user(self) -> str | None:

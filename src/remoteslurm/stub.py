@@ -62,6 +62,11 @@ DEFAULT_RUN_TIMEOUT = 60
 MAX_RUN_TIMEOUT = 3600
 DEFAULT_RUN_OUTPUT = 64 * 1024
 MAX_RUN_OUTPUT = 4 * 1024 * 1024
+DEFAULT_QUEUE_TIMEOUT = 600  # `srun`: default seconds to wait for an allocation
+# `srun` may legitimately run for days (queue wait + walltime); its total budget is computed
+# client-side, so allow a far larger ceiling than the plain `run` cap.
+MAX_SRUN_TIMEOUT = 8 * 24 * 3600
+RS_NODE_SENTINEL = "RS_NODE="  # emitted on stderr once the step is actually allocated
 MAX_EDIT_BYTES = 8 * 1024 * 1024
 EDIT_PREVIEW_BYTES = 4096
 DEFAULT_DIFF_LINES = 500
@@ -693,12 +698,42 @@ def op_mkdir(args):
     return {"path": p}
 
 
+def _rm_roots():
+    """Directories a recursive `rm` must never take out wholesale: home + the big shared roots."""
+    roots = set()
+    for name in ("HOME", "SCRATCH", "PROJECT"):
+        v = os.environ.get(name)
+        if v:
+            roots.add(os.path.normpath(os.path.expanduser(os.path.expandvars(v))))
+    roots.add(os.path.normpath(os.path.expanduser("~")))
+    return roots
+
+
 def op_rm(args):
     p = _path(args.get("path"), must_exist=True)
     recursive = bool(args.get("recursive", False))
     home = os.path.expanduser("~")
     if p in ("/", home) or p == os.path.dirname(home):
         raise StubError("invalid_arg", "refusing to remove %s" % p, path=p)
+    if recursive:
+        # A recursive delete is the dangerous one: refuse the shared roots themselves
+        # ($HOME/$SCRATCH/$PROJECT) and anything shallower than three path components
+        # (e.g. /scratch/<user>), which are almost always a fat-fingered target.
+        if p in _rm_roots():
+            raise StubError(
+                "invalid_arg",
+                "refusing to recursively remove the root directory %s" % p,
+                path=p,
+                action="delete a specific subdirectory, not the whole root",
+            )
+        depth = len([seg for seg in p.split("/") if seg])
+        if depth < 3:
+            raise StubError(
+                "invalid_arg",
+                "refusing recursive remove of shallow path %s (depth %d < 3)" % (p, depth),
+                path=p,
+                action="target a deeper subdirectory, or remove entries individually",
+            )
     try:
         if os.path.isdir(p) and not os.path.islink(p):
             if recursive:
@@ -869,6 +904,140 @@ def op_run(args):
     )
 
 
+def _srun_flags(args):
+    """Build the ``srun`` option flags (no shell) from the resource args."""
+    flags = ["srun", "--quiet", "--unbuffered"]
+    part = args.get("partition")
+    if part:
+        flags += ["-p", str(part)]
+    walltime = args.get("time")
+    if walltime:
+        flags += ["-t", str(walltime)]
+    cpus = args.get("cpus")
+    if cpus:
+        flags += ["-c", str(cpus)]
+    mem = args.get("mem")
+    if mem:
+        flags += ["--mem", str(mem)]
+    gpus = args.get("gpus")
+    if gpus:
+        flags.append("--gres=gpu:%s" % gpus)
+    account = args.get("account")
+    if account:
+        flags += ["-A", str(account)]
+    return flags
+
+
+def _extract_node(stderr):
+    """Pull the ``RS_NODE=<name>`` sentinel out of stderr; return (node, cleaned_stderr).
+
+    Its presence means the wrapped command actually started (the allocation was granted), which
+    is how we tell a real run from one that only ever sat in the queue.
+    """
+    node = None
+    kept = []
+    for line in stderr.splitlines(True):
+        stripped = line.strip()
+        if node is None and stripped.startswith(RS_NODE_SENTINEL):
+            node = stripped[len(RS_NODE_SENTINEL) :] or None
+            continue
+        kept.append(line)
+    return node, "".join(kept)
+
+
+def _srun_result(stdout, stderr, rc, queue_timeout, elapsed, timed_out=False):
+    """Shape a raw srun run into the started/queued result the client expects."""
+    node, clean_err = _extract_node(stderr)
+    if node is not None:
+        return {
+            "started": True,
+            "rc": rc,
+            "stdout": stdout,
+            "stderr": clean_err,
+            "node": node,
+            "elapsed": elapsed,
+            "timed_out": timed_out,
+        }
+    # Never allocated: distinguish "still queued" from a hard srun error.
+    if "queued and waiting for resources" in stderr or timed_out:
+        reason = "still queued after %ss" % queue_timeout
+    else:
+        reason = (clean_err.strip().splitlines() or ["srun did not start the job"])[-1]
+    return {
+        "started": False,
+        "reason": reason,
+        "rc": rc,
+        "stdout": stdout,
+        "stderr": clean_err,
+    }
+
+
+def op_srun(args):
+    """Run a command on a *compute node* via ``srun`` (a SLOW, cancellable op).
+
+    Wraps the command so it first echoes an ``RS_NODE=$SLURMD_NODENAME`` sentinel to stderr;
+    the client uses that to report the node and to tell a real run from one that only sat in
+    the queue. The total client budget (``timeout``) is queue-wait + walltime + slack, computed
+    client-side; ``queue_timeout`` is used only for the "still queued" message. Because the step
+    runs in its own session, ``cancel``/timeout kills the whole ``srun`` tree, which releases
+    the allocation.
+    """
+    if not _which("srun"):
+        raise StubError("slurm_error", "srun not found on PATH (is this a Slurm login node?)")
+    argv_in = args.get("argv")
+    cmd = args.get("cmd")
+    login = bool(args.get("login"))
+    flag = "-lc" if login else "-c"
+    sentinel = 'echo "%s$SLURMD_NODENAME" >&2; ' % RS_NODE_SENTINEL
+    if cmd is not None:
+        if not isinstance(cmd, str):
+            raise StubError("invalid_arg", "cmd must be a string")
+        wrapped = ["bash", flag, sentinel + cmd]
+    elif argv_in is not None:
+        if (
+            not isinstance(argv_in, (list, tuple))
+            or not argv_in
+            or not all(isinstance(a, str) for a in argv_in)
+        ):
+            raise StubError("invalid_arg", "argv must be a non-empty list of strings")
+        # `exec "$@"` runs the argv vector with no shell parsing of the user's arguments; the
+        # sentinel echo is the only shell we add.
+        wrapped = ["bash", flag, sentinel + 'exec "$@"', "rs-srun"] + list(argv_in)
+    else:
+        raise StubError("invalid_arg", "either argv or cmd is required")
+    full = _srun_flags(args) + ["--"] + wrapped
+    timeout = _clamp(args.get("timeout"), DEFAULT_QUEUE_TIMEOUT + 30, MAX_SRUN_TIMEOUT, lo=1)
+    max_output = _clamp(args.get("max_output"), DEFAULT_RUN_OUTPUT, MAX_RUN_OUTPUT)
+    queue_timeout = args.get("queue_timeout") or DEFAULT_QUEUE_TIMEOUT
+    cwd = args.get("cwd")
+    t0 = time.time()
+    try:
+        res = _run(
+            full,
+            timeout=timeout,
+            cwd=cwd,
+            env=args.get("env"),
+            stdin=args.get("stdin"),
+            max_output=max_output,
+            on_spawn=args.get("_register"),
+            new_session=True,
+        )
+    except StubError as e:
+        if e.code == "timeout":
+            # Budget exhausted: turn it into a structured started/queued result rather than a
+            # bare timeout error (the process group was already killed by `_run`).
+            return _srun_result(
+                e.details.get("stdout", ""),
+                e.details.get("stderr", ""),
+                None,
+                queue_timeout,
+                round(time.time() - t0, 3),
+                timed_out=True,
+            )
+        raise
+    return _srun_result(res["stdout"], res["stderr"], res["rc"], queue_timeout, res.get("duration"))
+
+
 def _slurm(argv, timeout=60, cwd=None, stdin=None, on_spawn=None, new_session=False):
     if not _which(argv[0]):
         raise StubError(
@@ -1032,6 +1201,7 @@ OPS = {
     "glob": op_glob,
     "grep": op_grep,
     "run": op_run,
+    "srun": op_srun,
     "sbatch": op_sbatch,
     "squeue": op_squeue,
     "sacct": op_sacct,

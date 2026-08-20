@@ -67,7 +67,9 @@ def test_mcp_cancel_reports_skipped(cluster: Cluster, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(server, "_get_cluster", lambda host=None: cluster)
     monkeypatch.setattr(
-        Cluster, "cancel", lambda self, ids: {"cancelled": [], "skipped": list(ids), "rc": 0}
+        Cluster,
+        "cancel",
+        lambda self, ids, **kw: {"cancelled": [], "skipped": list(ids), "rc": 0},
     )
     r = asyncio.run(server.cancel("999"))
     assert r["cancelled"] == [] and r["skipped"] == ["999"]

@@ -273,7 +273,9 @@ def test_job_output_and_cancel(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         Cluster,
         "cancel",
-        lambda self, ids: (got.append(ids), {"rc": 0, "cancelled": ["7"], "skipped": ["8"]})[1],
+        lambda self, ids, **kw: (got.append(ids), {"rc": 0, "cancelled": ["7"], "skipped": ["8"]})[
+            1
+        ],
     )
     r = call("cancel", job_id="7, 8")
     assert got == [["7", "8"]] and r["cancelled"] == ["7"] and r["skipped"] == ["8"]

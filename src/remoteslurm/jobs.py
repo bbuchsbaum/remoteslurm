@@ -18,7 +18,13 @@ from typing import TYPE_CHECKING, Any
 
 from . import slurm
 from .config import Template, state_dir
-from .errors import InvalidArgument, RemoteSlurmError, RemoteTimeout, SlurmError
+from .errors import (
+    ConfirmationRequired,
+    InvalidArgument,
+    RemoteSlurmError,
+    RemoteTimeout,
+    SlurmError,
+)
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -824,10 +830,16 @@ class SlurmOps:
                 )
             time.sleep(poll)
 
-    def cancel(self, job_id: str | list[str]) -> dict[str, Any]:
+    def cancel(self, job_id: str | list[str], *, confirm: bool = False) -> dict[str, Any]:
         ids = [job_id] if isinstance(job_id, str) else list(job_id)
         for j in ids:
             slurm.parse_job_id(j)
+        if "cancel" in self.host.confirm and not confirm:
+            raise ConfirmationRequired(
+                f"cancel needs confirmation on host {self.host.name}: cancel {', '.join(ids)}",
+                what=f"cancel {', '.join(ids)}",
+                op="cancel",
+            )
         res = self.call("scancel", jobs=ids)
         self.registry.audit("cancel", jobs=ids, result=res)
         self._invalidate_squeue()

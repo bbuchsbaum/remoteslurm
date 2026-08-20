@@ -152,9 +152,18 @@ print(st.state, job.output(tail=20)["content"])
 ## Safety defaults
 
 - Library-spawned `ssh` always uses `BatchMode=yes` and `ControlMaster=no`: it can fail, never prompt.
-- The remote stub never uses a shell for its own operations (argv lists only); `run` is the
-  one explicit escape hatch and can be disabled per host (`allow_run = false`).
-- `scancel` only acts on jobs `squeue` attributes to you; `rm` refuses `/`, `$HOME` and its parent.
+- The remote stub never uses a shell for its own operations (argv lists only); `run`/`run
+  --compute` (srun) are the explicit escape hatches. Per host, `allow_run = false` disables
+  them and `allow_run = "safe"` requires an argv list whose executable is in `run_allowlist`.
+  Enforcement is client-side; the daemon socket is same-user trust (`0600`, owner-only).
+- `scancel` only acts on jobs `squeue` attributes to you; `rm` refuses `/`, `$HOME` and its
+  parent, and a recursive `rm` also refuses the `$SCRATCH`/`$PROJECT` roots and any path
+  shallower than three components.
+- `protected_paths` (default `~/.ssh/**`, `~/.bashrc`, `~/.bash_profile`,
+  `~/.cache/remoteslurm/**`) block `write`/`edit`/`rm`/`put`/`sync --delete` unless you pass
+  `--force` (CLI) / `force=True` (library, MCP). Ops listed in `confirm` (e.g. `["rm",
+  "cancel"]`) prompt `y/N` in the CLI (`--yes` skips) and require `confirm=True` in the
+  library/MCP (otherwise a `ConfirmationRequired` / `{needs_confirmation: true}` reply).
 - Reads are capped (64 KB default, 4 MB max), writes at 8 MB, listings at 2000 entries,
   grep at 50 MB/file; binary files are detected and returned base64-encoded.
 - Every `submit`, `run`, `cancel` is appended to `~/.local/state/remoteslurm/<host>/audit.log`.

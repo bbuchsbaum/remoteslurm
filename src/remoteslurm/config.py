@@ -65,6 +65,63 @@ class ProjectConfig:
 # Keys inside a ``[hosts.X.templates.NAME]`` table that are *not* sbatch options.
 _TEMPLATE_META_KEYS = ("preamble", "epilogue", "inherit")
 
+# Files/globs `write`/`edit`/`rm`/`put`/`sync --delete` refuse to touch without an explicit
+# force. Matched client-side against both the raw path and its `~`-expansion (see
+# ``Cluster._check_protected``).
+DEFAULT_PROTECTED_PATHS = [
+    "~/.ssh/**",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.cache/remoteslurm/**",
+]
+
+# When ``allow_run = "safe"`` only argv whose ``argv[0]`` basename matches one of these
+# (fnmatch) patterns may run. Deliberately covers the common scientific / cluster tools.
+DEFAULT_RUN_ALLOWLIST = [
+    "python*",
+    "python3",
+    "Rscript",
+    "git",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "du",
+    "df",
+    "rsync",
+    "module",
+    "squeue",
+    "sacct",
+    "sinfo",
+    "scontrol",
+    "scancel",
+    "bash",
+    "sh",
+    "echo",
+    "cp",
+    "mv",
+    "mkdir",
+]
+
+
+def _normalize_allow_run(v: Any, host: str) -> bool | str:
+    """Accept ``true``/``false`` (bool) or the string ``"safe"`` (also ``"true"``/``"false"``)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s == "safe":
+            return "safe"
+        if s in ("true", "yes", "on"):
+            return True
+        if s in ("false", "no", "off"):
+            return False
+    raise ConfigError(
+        f'[hosts.{host}] allow_run must be true, false or "safe", not {v!r}',
+        action='use allow_run = true | false | "safe"',
+    )
+
 
 @dataclass
 class Template:
@@ -129,7 +186,7 @@ class HostConfig:
     install_dir: str | None = None
     control_path: str | None = None
     control_persist: str = "12h"
-    allow_run: bool = True
+    allow_run: bool | str = True  # true | false | "safe" (argv-only + run_allowlist)
     script_dir: str | None = None  # where generated sbatch scripts are written (remote)
     ssh_opts: list[str] = field(default_factory=list)
     defaults: dict[str, Any] = field(
@@ -140,6 +197,11 @@ class HostConfig:
     templates: dict[str, Template] = field(default_factory=dict)
     max_sync_files: int = 50_000  # sync guard: max files on a non-dry push
     max_sync_bytes: int = 2 * 1024**3  # sync guard: max bytes on a non-dry push
+    # Safety rails (E2): paths `write`/`edit`/`rm`/`put`/`sync --delete` refuse without force,
+    # op names that need an explicit confirmation, and the `allow_run = "safe"` executable list.
+    protected_paths: list[str] = field(default_factory=lambda: list(DEFAULT_PROTECTED_PATHS))
+    confirm: list[str] = field(default_factory=list)
+    run_allowlist: list[str] = field(default_factory=lambda: list(DEFAULT_RUN_ALLOWLIST))
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -161,6 +223,8 @@ class HostConfig:
             templates[tname] = Template.from_dict(tname, td)
         kw["templates"] = templates
         kw.setdefault("ssh", name)
+        if "allow_run" in kw:
+            kw["allow_run"] = _normalize_allow_run(kw["allow_run"], name)
         try:
             return cls(name=name, extra=extra, **kw)
         except TypeError as e:
@@ -268,7 +332,12 @@ account = "rrg-someone"     # default --account for sbatch
 # partition = "compute"
 # python = "python3"        # remote interpreter for the stub
 # control_persist = "12h"
-# allow_run = true          # enable the `run` (arbitrary command) tool
+# allow_run = true          # true | false | "safe" (argv-only + run_allowlist) for `run`/srun
+
+# Safety rails (all optional; sensible defaults shown):
+# protected_paths = ["~/.ssh/**", "~/.bashrc", "~/.bash_profile", "~/.cache/remoteslurm/**"]
+# confirm = ["rm", "cancel"]   # ops needing --yes (CLI) / confirm=true (library, MCP)
+# run_allowlist = ["python*", "Rscript", "git", "ls", "cat"]   # only used when allow_run = "safe"
 # [hosts.trillium.defaults]
 # time = "1:00:00"
 

@@ -100,6 +100,26 @@ async def _guard(host: str | None, fn: Callable[[Cluster], dict[str, Any]]) -> d
         return {"error": "internal", "message": f"{type(e).__name__}: {e}"}
 
 
+async def _guard_confirmable(
+    host: str | None, fn: Callable[[Cluster], dict[str, Any]]
+) -> dict[str, Any]:
+    """Like :func:`_guard`, but turns a ``ConfirmationRequired`` into a plain
+    ``{needs_confirmation: true, what: ...}`` reply (agents re-call with ``confirm=True``)."""
+    from .errors import ConfirmationRequired
+
+    def work() -> dict[str, Any]:
+        return fn(_get_cluster(host))
+
+    try:
+        return _cap(await asyncio.to_thread(work))
+    except ConfirmationRequired as e:
+        return {"needs_confirmation": True, "what": e.what}
+    except RemoteSlurmError as e:
+        return e.to_dict()
+    except Exception as e:  # noqa: BLE001
+        return {"error": "internal", "message": f"{type(e).__name__}: {e}"}
+
+
 def _ls_summary(r: dict[str, Any]) -> str:
     entries = r.get("entries", [])
     ndirs = sum(1 for e in entries if e.get("type") == "dir")
@@ -215,16 +235,18 @@ async def write(
     content: str,
     append: bool = False,
     mode: int | None = None,
+    force: bool = False,
     host: str | None = None,
 ) -> dict[str, Any]:
     """Write (or append) text to a remote file, creating parent directories as needed.
 
     ``mode`` is an octal permission as an int (e.g. 493 == 0o755). Returns path and bytes
-    written. Use ``submit`` with ``script=`` instead of writing job scripts by hand.
+    written. Use ``submit`` with ``script=`` instead of writing job scripts by hand. A
+    configured protected path (``error: permission``) is refused unless ``force=True``.
     """
 
     def f(c: Cluster) -> dict[str, Any]:
-        return c.write(path, content, append=append, mode=mode)
+        return c.write(path, content, append=append, mode=mode, force=force)
 
     return await _guard(host, f)
 
@@ -235,6 +257,7 @@ async def edit(
     new: str,
     expect: int = 1,
     all: bool = False,
+    force: bool = False,
     host: str | None = None,
 ) -> dict[str, Any]:
     """Replace an exact string in a remote text file — use ``edit`` instead of read+write
@@ -249,7 +272,7 @@ async def edit(
     """
 
     def f(c: Cluster) -> dict[str, Any]:
-        return c.edit(path, old, new, expect=expect, all=all)
+        return c.edit(path, old, new, expect=expect, all=all, force=force)
 
     return await _guard(host, f)
 
@@ -281,18 +304,48 @@ async def run(
     timeout: int = 60,
     login: bool = False,
     max_output: int = 65536,
+    compute: bool = False,
+    template: str | None = None,
+    partition: str | None = None,
+    time: str | None = None,
+    cpus: int | None = None,
+    mem: str | None = None,
+    gpus: int | None = None,
+    queue_timeout: int = 600,
     host: str | None = None,
 ) -> dict[str, Any]:
-    """Run a shell command on the *login node* (not a compute node) and return rc/stdout/stderr.
+    """Run a shell command on the *login node* and return rc/stdout/stderr — or, with
+    ``compute=True``, on a *compute node* via srun.
 
-    Output is capped at ``max_output`` bytes per stream; ``timeout`` is clamped to 1..3600 s.
-    ``login=True`` runs through a login shell (loads modules/profile). Keep it light: heavy
-    work belongs in ``submit``. Returns ``error: permission`` when the host config has
-    ``allow_run = false``.
+    Login-node runs cap output at ``max_output`` bytes/stream and clamp ``timeout`` to 1..3600 s;
+    ``login=True`` loads modules/profile. Keep login-node work light — heavy or long work belongs
+    in ``submit`` or ``compute=True``.
+
+    ``compute=True`` queues for a node and runs the command there. Resources come from
+    ``template`` then ``partition``/``time``/``cpus``/``mem``/``gpus`` (account from the host
+    default). ``queue_timeout`` bounds the wait for an allocation; the result is
+    ``{started: true, rc, stdout, stderr, node, elapsed}`` when a node was granted, else
+    ``{started: false, reason}``. Returns ``error: permission`` when ``allow_run`` forbids the
+    command (``false``, or ``"safe"`` for a non-allowlisted / shell-string command).
     """
     to = _clamp(timeout, 1, 3600)
 
     def f(c: Cluster) -> dict[str, Any]:
+        if compute:
+            return c.run(
+                cmd,
+                compute=True,
+                template=template,
+                partition=partition,
+                time=time,
+                cpus=cpus,
+                mem=mem,
+                gpus=gpus,
+                queue_timeout=queue_timeout,
+                login=login,
+                max_output=max_output,
+                cwd=cwd,
+            )
         return c.run(cmd, cwd=cwd, timeout=to, login=login, max_output=max_output)
 
     return await _guard(host, f)
@@ -451,15 +504,19 @@ async def job_output(
     return await _guard(host, f)
 
 
-async def cancel(job_id: str, host: str | None = None) -> dict[str, Any]:
-    """Cancel one job or several (``"123,124"`` or ``"123_4"`` for an array task)."""
+async def cancel(job_id: str, confirm: bool = False, host: str | None = None) -> dict[str, Any]:
+    """Cancel one job or several (``"123,124"`` or ``"123_4"`` for an array task).
+
+    If the host requires confirmation for ``cancel`` and ``confirm`` is not ``true``, no job is
+    cancelled and the reply is ``{needs_confirmation: true, what: "..."}`` — re-call with
+    ``confirm=true`` to proceed.
+    """
     ids = [j.strip() for j in job_id.split(",") if j.strip()]
 
     def f(c: Cluster) -> dict[str, Any]:
-        r = c.cancel(ids)
-        return r
+        return c.cancel(ids, confirm=confirm)
 
-    return await _guard(host, f)
+    return await _guard_confirmable(host, f)
 
 
 async def sinfo(host: str | None = None) -> dict[str, Any]:

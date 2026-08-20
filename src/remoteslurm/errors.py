@@ -75,6 +75,20 @@ class ConfigError(RemoteSlurmError):
     code = "config_error"
 
 
+class ConfirmationRequired(RemoteSlurmError):
+    """A destructive op (``rm``/``cancel``/…) needs an explicit ``confirm=True``.
+
+    ``what`` is a short human-readable summary of what would happen; the CLI turns this into
+    a ``y/N`` prompt and the MCP layer into a ``{needs_confirmation: true, what: ...}`` reply.
+    """
+
+    code = "confirmation_required"
+
+    def __init__(self, message: str, *, what: str | None = None, **kw: Any) -> None:
+        super().__init__(message, **kw)
+        self.what = what or message
+
+
 _BY_CODE: dict[str, type[RemoteSlurmError]] = {
     cls.code: cls
     for cls in (
@@ -89,6 +103,7 @@ _BY_CODE: dict[str, type[RemoteSlurmError]] = {
         SessionDied,
         InvalidArgument,
         ConfigError,
+        ConfirmationRequired,
     )
 }
 

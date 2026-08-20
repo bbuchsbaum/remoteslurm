@@ -302,6 +302,7 @@ def sync(
     dry_run: bool = False,
     delete: bool = False,
     force: bool = False,
+    force_protected: bool = False,
     timeout: float = 1800,
     ssh_cmd: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -337,6 +338,9 @@ def sync(
             action=f"check [hosts.{cluster.host.name}.projects.{project.name}] local =",
         )
     remote = expand_remote(cluster, project.remote)
+    if delete and not dry_run:
+        # `--delete` can remove remote files; refuse if the remote root is a protected path.
+        cluster._check_protected(remote, force=force_protected, action="--delete under")
     if not pull and not dry_run:
         cluster.mkdir(remote)
 
@@ -396,8 +400,19 @@ def sync(
             "bytes": counts["bytes"] if counts else None,
             "project": project.name,
         }
-        cluster.write(remote.rstrip("/") + "/" + MARKER, json.dumps(marker, indent=2) + "\n")
+        cluster.write(
+            remote.rstrip("/") + "/" + MARKER, json.dumps(marker, indent=2) + "\n", force=True
+        )
 
+    cluster.registry.audit(
+        "sync",
+        project=project.name,
+        direction="pull" if pull else "push",
+        dry_run=dry_run,
+        delete=delete,
+        files=counts["files"] if counts else None,
+        bytes=counts["bytes"] if counts else None,
+    )
     return {
         "project": project.name,
         "direction": "pull" if pull else "push",

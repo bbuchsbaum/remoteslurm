@@ -22,6 +22,12 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
 - Cancellable long ops: the stub runs `run`/`srun`/`sbatch` in a separate pool (so `ping`/`ls`
   stay instant), a `cancel` op kills the process group, and a client-side `run` timeout or Ctrl-C
   cancels the remote process instead of leaking it. Request ids are client-generated (survive the daemon).
+- Compute-node runs: `rslurm run --compute` / `Cluster.run(compute=True)` / MCP `run(compute=True)`
+  execute on an allocated node via `srun` (with `--template`/partition/time/cpus/mem/gpus and a
+  queue-wait timeout); distinguishes "still queued" from "ran".
+- Safety rails: `allow_run = false | "safe"` (safe = argv-only, executable allow-list, no `bash -c`);
+  `protected_paths` block write/edit/rm/put/sync-delete unless forced; `confirm` list gates rm/cancel
+  behind an explicit confirmation; recursive `rm` refuses `$SCRATCH`/`$PROJECT` roots and shallow paths.
 
 ## 0.1.0 — 2026-08-20
 

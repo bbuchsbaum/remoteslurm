@@ -249,8 +249,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         tools = info["slurm_tools"]
         missing = [k for k, v in tools.items() if not v]
         check("slurm tools", not missing, info.get("slurm_version") or "", f"missing: {missing}")
-        w = c.write("~/.cache/remoteslurm/.doctor", "ok\n")
-        c.rm(w["path"])
+        w = c.write("~/.cache/remoteslurm/.doctor", "ok\n", force=True)
+        c.rm(w["path"], force=True)
         check("home writable", True, info["home"])
         env = info.get("env", {})
         check(
@@ -385,8 +385,11 @@ def cmd_find(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     c = get_cluster(args)
     cmd = " ".join(args.cmd) if len(args.cmd) > 1 or not args.argv else args.cmd[0]
+    command = list(args.cmd) if args.argv else cmd
+    if args.compute:
+        return _cmd_run_compute(args, c, command, cmd)
     r = c.run(
-        list(args.cmd) if args.argv else cmd,
+        command,
         cwd=args.cwd,
         timeout=args.timeout,
         login=args.login,
@@ -405,6 +408,39 @@ def cmd_run(args: argparse.Namespace) -> int:
     return r["rc"] if not args.json else EXIT_OK
 
 
+def _cmd_run_compute(
+    args: argparse.Namespace, c: Cluster, command: str | list[str], cmd: str
+) -> int:
+    r = c.run(
+        command,
+        compute=True,
+        template=args.template,
+        partition=args.partition,
+        time=args.time,
+        cpus=args.cpus,
+        mem=args.mem,
+        gpus=args.gpus,
+        queue_timeout=args.queue_timeout,
+        login=args.login,
+        max_output=args.max_output,
+        cwd=args.cwd,
+    )
+
+    def human(r: dict[str, Any]) -> None:
+        if not r.get("started"):
+            print(f"job did not start: {r.get('reason')}", file=sys.stderr)
+            return
+        sys.stdout.write(r.get("stdout", ""))
+        if r.get("stderr"):
+            sys.stderr.write(r["stderr"])
+        print(f"[ran on {r.get('node')} in {r.get('elapsed')}s, rc {r.get('rc')}]", file=sys.stderr)
+
+    emit(args, r, human)
+    if not args.json:
+        return EXIT_OK if r.get("started") and r.get("rc") == 0 else EXIT_ERROR
+    return EXIT_OK
+
+
 def cmd_put(args: argparse.Namespace) -> int:
     host, dest = split_target(args.dest, args.host)
     src = Path(args.src).expanduser()
@@ -412,10 +448,11 @@ def cmd_put(args: argparse.Namespace) -> int:
         raise InvalidArgument(f"local file not found: {src}")
     c = get_cluster(args, host)
     if args.rsync or src.is_dir() or src.stat().st_size > 4 * 1024 * 1024:
+        c._check_protected(dest, force=args.force, action="put into")
         return _rsync(c, str(src), dest, to_remote=True, args=args)
     if dest.endswith("/"):
         dest = dest + src.name
-    r = c.write(dest, src.read_bytes())
+    r = c.write(dest, src.read_bytes(), force=args.force)
     emit(
         args,
         r,
@@ -461,7 +498,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     old = _str_or_file(args.old, args.old_file, "old")
     new = _str_or_file(args.new, args.new_file, "new")
     c = get_cluster(args, host)
-    r = c.edit(path, old, new, expect=args.expect, all=args.all)
+    r = c.edit(path, old, new, expect=args.expect, all=args.all, force=args.force)
 
     def human(r: dict[str, Any]) -> None:
         print(f"edited {r['path']}: {r['replacements']} replacement(s) at line {r['first_line']}")
@@ -535,16 +572,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         delete=args.delete,
         force=args.force,
+        force_protected=args.force,
         timeout=args.timeout,
-    )
-    c.registry.audit(
-        "sync",
-        project=r["project"],
-        direction=r["direction"],
-        dry_run=r["dry_run"],
-        delete=args.delete,
-        files=r["files"],
-        bytes=r["bytes"],
     )
 
     def human(r: dict[str, Any]) -> None:
@@ -961,9 +990,27 @@ def cmd_wait(args: argparse.Namespace) -> int:
     return EXIT_OK if ok else EXIT_ERROR
 
 
+def _confirm_gate(args: argparse.Namespace, c: Cluster, op: str, what: str) -> bool:
+    """CLI-side confirmation for a gated op: True to proceed, False if the user declined.
+
+    ``--yes`` (or the op not being in the host's ``confirm`` list) proceeds silently; otherwise
+    prompt ``y/N`` on a tty (a non-interactive stdin counts as "no").
+    """
+    if op not in c.host.confirm or getattr(args, "yes", False):
+        return True
+    try:
+        ans = input(f"{what}? [y/N] ")
+    except EOFError:
+        ans = ""
+    return ans.strip().lower() in ("y", "yes")
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     c = get_cluster(args)
-    r = c.cancel(args.job_id)
+    if not _confirm_gate(args, c, "cancel", f"cancel {', '.join(args.job_id)}"):
+        print("aborted", file=sys.stderr)
+        return EXIT_ERROR
+    r = c.cancel(args.job_id, confirm=True)
     emit(
         args,
         r,
@@ -1147,7 +1194,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-depth", type=int, default=10)
     sp.add_argument("--hidden", action="store_true")
 
-    sp = add("run", cmd_run, "run a command on the login node (bounded output)")
+    sp = add(
+        "run",
+        cmd_run,
+        "run a command on the login node (or a compute node with --compute)",
+    )
     sp.add_argument(
         "cmd", nargs="+", help="shell command (quoted) or, with --argv, an argument vector"
     )
@@ -1158,6 +1209,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--login", action="store_true", help="use a login shell (bash -lc; loads modules, slower)"
     )
     sp.add_argument("--max-output", type=int, default=65536)
+    sp.add_argument(
+        "--compute", action="store_true", help="run on a compute node via srun (queues for a node)"
+    )
+    sp.add_argument("--template", help="config template for --compute resources (options only)")
+    sp.add_argument("-p", "--partition", help="--compute partition")
+    sp.add_argument("-t", "--time", help="--compute walltime (e.g. 00:10:00)")
+    sp.add_argument("-c", "--cpus", type=int, help="--compute cpus per task")
+    sp.add_argument("--mem", help="--compute memory (e.g. 8G)")
+    sp.add_argument("--gpus", type=int, help="--compute GPUs (--gres=gpu:N)")
+    sp.add_argument(
+        "--queue-timeout",
+        type=int,
+        default=600,
+        help="--compute: seconds to wait for an allocation before giving up",
+    )
 
     sp = add(
         "put", cmd_put, "upload a local file (small via stub; --rsync or large/dirs via rsync)"
@@ -1165,6 +1231,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("src")
     sp.add_argument("dest", help="[HOST:]PATH (trailing / = into directory)")
     sp.add_argument("--rsync", action="store_true")
+    sp.add_argument("--force", action="store_true", help="override the protected-path guard")
 
     sp = add(
         "get", cmd_get, "download a remote file (small via stub; --rsync or large/dirs via rsync)"
@@ -1181,6 +1248,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--new-file", metavar="FILE", help="read NEW from a local file (multi-line)")
     sp.add_argument("--all", action="store_true", help="replace every occurrence")
     sp.add_argument("--expect", type=int, default=1, help="required occurrence count (default 1)")
+    sp.add_argument("--force", action="store_true", help="override the protected-path guard")
 
     sp = add(
         "diff", cmd_diff, "unified diff of a remote file vs a local file (exit 1 if different)"
@@ -1308,6 +1376,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("cancel", cmd_cancel, "cancel job(s) (only your own)", aliases=["scancel"])
     sp.add_argument("job_id", nargs="+")
+    sp.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt (if host requires it)",
+    )
 
     sp = add("output", cmd_output, "show a job's stdout (or stderr) file", aliases=["out", "log"])
     sp.add_argument("job_id")
