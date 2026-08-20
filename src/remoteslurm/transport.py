@@ -194,6 +194,7 @@ class SSHTransport(Transport):
             shlex.quote(d) if d.startswith("/") and "$" not in d else d for d in dirs
         )
         py = shlex.quote(self.python)
+        n = len(stub_source().encode("utf-8"))
         return (
             "D='';"
             f"for c in {dir_expr}; do "
@@ -202,18 +203,28 @@ class SSHTransport(Transport):
             'if [ -z "$D" ]; then echo "REMOTESLURM-ERROR no writable install dir" >&2; '
             "exit 97; fi;"
             f'P="$D/{name}";'
-            'if [ ! -f "$P" ]; then '
-            f'head -c {len(stub_source().encode("utf-8"))} > "$P.tmp.$$" && '
-            'mv "$P.tmp.$$" "$P"; '
-            "else "
-            f"head -c {len(stub_source().encode('utf-8'))} > /dev/null; "
-            "fi;"
+            # Read exactly N bytes of stub source from stdin. BusyBox `head -c` may buffer-read
+            # past N on a pipe (stealing bytes that belong to the protocol stream), so use it only
+            # when it is GNU coreutils; otherwise fall back to `dd bs=1`, which reads one byte at a
+            # time and never over-reads. The rest of stdin is the JSON protocol.
+            f"RS_N={n};"
+            "if head --version 2>/dev/null | grep -q coreutils; then RS_H=1; else RS_H=0; fi;"
+            'rs_read() { if [ "$RS_H" = 1 ]; then head -c "$RS_N"; '
+            'else dd bs=1 count="$RS_N" 2>/dev/null; fi; };'
+            'if [ ! -f "$P" ]; then rs_read > "$P.tmp.$$" && mv "$P.tmp.$$" "$P"; '
+            "else rs_read > /dev/null; fi;"
             # Remove superseded stubs left by older shas (only stub-*.py in the resolved dir $D,
             # never the one we just installed/kept at $P). Keeps the install dir from growing.
             'for f in "$D"/stub-*.py; do [ "$f" = "$P" ] || rm -f "$f"; done;'
-            f"command -v {py} >/dev/null 2>&1 || "
-            f"{{ echo 'REMOTESLURM-ERROR python not found: {self.python}' >&2; exit 98; }};"
-            f'exec {py} -u "$P"'
+            # Python discovery: the configured interpreter, then python3, then python; if none is
+            # on PATH and a module system is present, `module load python` and retry python3.
+            f"PY='';for cand in {py} python3 python; do "
+            'if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi; done;'
+            'if [ -z "$PY" ]; then '
+            "command -v module >/dev/null 2>&1 && module load python 2>/dev/null; "
+            "command -v python3 >/dev/null 2>&1 && PY=python3; fi;"
+            'if [ -z "$PY" ]; then echo "REMOTESLURM-ERROR python not found" >&2; exit 98; fi;'
+            'exec "$PY" -u "$P"'
         )
 
     def spawn(self) -> subprocess.Popen[bytes]:

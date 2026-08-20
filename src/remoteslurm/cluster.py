@@ -503,6 +503,8 @@ class Cluster(SlurmOps):
                     result = frame.get("result") or {}
                     break
                 chunk = frame.get("chunk") or {}
+                if chunk.get("stream") == "keepalive":
+                    continue  # liveness heartbeat during quiet stretches; not real output
                 if on_chunk is not None:
                     on_chunk(str(chunk.get("stream", "stdout")), str(chunk.get("data", "")))
         finally:
@@ -539,7 +541,10 @@ class Cluster(SlurmOps):
             for frame in gen:
                 if frame.get("done"):
                     return
-                data = str((frame.get("chunk") or {}).get("data", ""))
+                chunk = frame.get("chunk") or {}
+                if chunk.get("stream") == "keepalive":
+                    continue
+                data = str(chunk.get("data", ""))
                 if data:
                     yield data
         finally:

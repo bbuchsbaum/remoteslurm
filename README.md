@@ -75,6 +75,29 @@ Requires Python ≥ 3.11 locally, OpenSSH, and `python3` (≥ 3.6) on the login 
 When the master expires (laptop sleep, `ControlPersist` timeout) every command returns
 `not_connected` with the exact command to run; nothing ever blocks on a hidden MFA prompt.
 
+### Jump hosts / bastions
+
+If the cluster is only reachable through a bastion, the cleanest place for it is your
+`~/.ssh/config` — a `ProxyJump` there is transparent to remoteslurm (and to the rsync that
+`sync` runs):
+
+```
+Host trillium
+  HostName trillium.internal
+  ProxyJump bastion.example.org
+  ControlMaster auto
+  ControlPath ~/.ssh/sockets/%r@%h-%p
+```
+
+Alternatively set it per host in the config with `ssh_opts`; these are passed through to every
+`ssh` remoteslurm spawns and included in rsync's transport, so both traverse the same jump host:
+
+```toml
+[hosts.trillium]
+ssh = "trillium"
+ssh_opts = ["-o", "ProxyJump=bastion.example.org"]
+```
+
 ## CLI
 
 Paths may be `HOST:PATH`; otherwise `--host`, `default_host` or `$REMOTESLURM_DEFAULT_HOST`

@@ -37,6 +37,11 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
   removed on bootstrap.
 - Live streaming (CLI): `rslurm run --stream` prints output as it arrives; `rslurm tail -f` uses a
   stub-side follow op. Stub protocol bumped to v2 (multi-frame); non-streaming behavior unchanged.
+- Portability: `squeue -u <user>` (works on Slurm < 20.02), bootstrap hardening (BusyBox `head`
+  → `dd` fallback, python3→python→module-load discovery), synthesized Slurm-20 parser fixtures,
+  ProxyJump/jump-host support, macOS CI + a Python-3.7 stub-smoke lane.
+- Streaming robustness: `follow`/`tail -f` runs in a dedicated stub pool (never starves
+  run/srun/sbatch) and emits keepalive frames so an abandoned tail is reclaimed within ~20 s.
 - Queue intelligence: `rslurm queue` (partitions with idle nodes, my accounts/QOS + limits,
   fair-share, my pending jobs with scheduler start estimates) and `rslurm quota` (Alliance
   `diskusage_report` via `quota_command`, else `df -h`); `Cluster.queue_info`/`estimate_start`/
@@ -54,6 +59,15 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
   `rslurm forget JOBID` removes one. `rslurm clean [--dry-run] [--older-than-days]` removes generated
   scripts/sweeps older than the cutoff. The stub bootstrap now deletes superseded `stub-*.py` (other
   shas) from the install dir.
+- Portability (F4): `squeue`/`squeue --start` now query with `-u <user>` instead of `--me` (works on
+  Slurm < 20.02). The bootstrap snippet detects non-GNU `head` (e.g. BusyBox) and falls back to
+  `dd bs=1` so it never over-reads the protocol stream, and discovers the interpreter through a
+  fallback chain (configured → `python3` → `python` → `module load python`). Parsers are tested
+  against synthesized older-Slurm (~20.02) fixtures alongside the trillium ones, including the old
+  `ReqMem` `4Gn`/`4Gc` suffix form. Per-host `ssh_opts` (e.g. `ProxyJump`) flow through both the ssh
+  transport and rsync. CI runs the test matrix on macOS as well as Linux and executes the stub under
+  Python 3.7 (closest proxy for the 3.6 floor). *Live Nibi fixtures/validation still pending — see
+  the plan's F4.*
 
 ## 0.1.0 — 2026-08-20
 

@@ -18,13 +18,16 @@ jobs:
       - run: uv run --no-sync ruff check src tests
       - run: uv run --no-sync ruff format --check src tests
       - run: uv run --no-sync mypy
+      # Static floor: the stub must stay Python 3.6-compatible (stdlib-only).
       - run: uvx vermin -t=3.6- --no-tips --violations src/remoteslurm/stub.py
 
   test:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,3 +37,15 @@ jobs:
       - run: uv venv && uv pip install -e '.[dev]'
       - run: uv run --no-sync pytest -q
       - run: uv build
+
+  # Runtime proxy for the stub's 3.6 floor: 3.6 is not installable on current runners, so we
+  # execute the stub (boot + ping + info) under Python 3.7, the oldest interpreter still provided
+  # by setup-python (on ubuntu-22.04). Complements the static vermin gate in `lint`.
+  stub-py37:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.7"
+      - run: python tests/stub_smoke.py

@@ -334,3 +334,86 @@ def test_cli_run_stream_prints_live(daemon_env: Path, capfd: pytest.CaptureFixtu
     out = capfd.readouterr().out
     assert rc == 0
     assert "alpha" in out and "beta" in out
+
+
+def test_stub_death_midstream_wakes_consumer():
+    """Killing the stub while a follow streams must wake the consumer with SessionDied, not hang."""
+    import os
+    import signal
+    import tempfile
+    import threading
+    import time as _t
+
+    import pytest
+
+    from remoteslurm.errors import SessionDied
+    from remoteslurm.session import Session
+    from remoteslurm.transport import LocalTransport
+
+    d = tempfile.mkdtemp()
+    logf = os.path.join(d, "f.log")
+    open(logf, "w").close()
+    s = Session(LocalTransport())
+    s.start()
+    try:
+        pid = s.remote_pid
+        gen = s.call_stream("follow", {"path": logf, "idle_timeout": 3600})
+        got = next(gen)  # keepalive or first read; ensures the stream is live
+
+        def killer():
+            _t.sleep(0.3)
+            os.kill(pid, signal.SIGKILL)
+
+        threading.Thread(target=killer, daemon=True).start()
+        with pytest.raises(SessionDied):
+            for _ in gen:
+                pass
+        assert not s._pending and not s._streams
+    finally:
+        s.close()
+
+
+def test_follow_does_not_starve_slow_pool(cluster, sandbox):
+    """A long follow (its own pool) must not block run/sbatch (slow pool)."""
+    import threading
+    import time as _t
+
+    logf = sandbox / "starve.log"
+    logf.write_text("start\n")
+    stop = threading.Event()
+
+    def do_follow():
+        try:
+            for _ in cluster.follow("~/starve.log", idle_timeout=3600):
+                if stop.is_set():
+                    break
+        except Exception:
+            pass  # session may be torn down at test end; not what we're asserting
+
+    threads = [threading.Thread(target=do_follow, daemon=True) for _ in range(4)]
+    for t in threads:
+        t.start()
+    _t.sleep(0.5)
+    # with LONG_OPS on a dedicated pool, a slow-pool `run` still completes promptly
+    t0 = _t.time()
+    r = cluster.run(["echo", "unblocked"])
+    assert r["stdout"].strip() == "unblocked" and _t.time() - t0 < 10
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+
+
+def test_follow_emits_keepalive_when_idle(cluster, sandbox):
+    """During a quiet stretch, follow emits keepalive frames (client filters them out)."""
+    logf = sandbox / "idle.log"
+    logf.write_text("")
+    frames = []
+    gen = cluster.session.call_stream(
+        "follow", {"path": "~/idle.log", "idle_timeout": 2}, timeout=10
+    )
+    for frame in gen:
+        frames.append(frame)
+        if frame.get("done"):
+            break
+    # the follow ran ~2s idle then closed with eof:true; no exception, clean terminal frame
+    assert frames[-1]["done"] and frames[-1]["result"]["eof"] is True

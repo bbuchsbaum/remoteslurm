@@ -47,6 +47,9 @@ RS = "\x1e"
 # it can never deadlock behind the very ops it is meant to interrupt.
 FAST_WORKERS = 8
 SLOW_WORKERS = 4
+# `follow` and other long-lived streaming ops get their OWN pool so a `tail -f` (which can
+# hold a worker for hours) can never starve the slow pool that runs/srun/sbatch depend on.
+LONG_WORKERS = 6
 # Ops that spawn a genuinely long-lived subprocess; they register their Popen so `cancel`
 # can reach the whole process group.
 SLOW_OPS = frozenset(("run", "srun", "sbatch"))
@@ -83,6 +86,7 @@ FOLLOW_IDLE_MAX = 24 * 3600
 FOLLOW_CHUNK_DEFAULT = 64 * 1024  # bytes emitted per `follow` chunk (never load the whole file)
 FOLLOW_CHUNK_MAX = 4 * 1024 * 1024
 FOLLOW_POLL = 0.5  # seconds between `follow` polls of a file with no new data
+FOLLOW_KEEPALIVE = 20  # emit an empty keepalive chunk after this many idle seconds
 STREAM_READ_BYTES = 64 * 1024  # os.read size when streaming a run's pipes
 DEFAULT_DIFF_LINES = 500
 MAX_DIFF_LINES = 5000
@@ -1170,6 +1174,9 @@ def op_follow(args):
     with no new data (final ``eof: true``) or the request is cancelled via its registered
     ``threading.Event`` (final ``eof: false``). Each read is bounded by ``max_bytes_per_chunk``
     so the whole file is never loaded. Final result: ``{offset, eof}``.
+
+    This follows a single open fd (like ``tail -f``, not ``tail -F``): if the file is truncated
+    or rotated mid-follow, appended content on the new inode is not picked up (it idles out).
     """
     p = _path(args.get("path"), must_exist=True)
     if os.path.isdir(p):
@@ -1193,6 +1200,7 @@ def op_follow(args):
         elif offset > size:
             offset = size
         last_data = time.time()
+        last_keepalive = time.time()
         with io.open(p, "rb") as f:
             f.seek(offset)
             while True:
@@ -1206,9 +1214,17 @@ def op_follow(args):
                     if text and emit is not None:
                         emit({"stream": "stdout", "data": text})
                     continue
-                if time.time() - last_data >= idle_timeout:
+                now = time.time()
+                if now - last_data >= idle_timeout:
                     eof = True
                     break
+                # Emit an empty keepalive frame during quiet stretches: if the client (or the
+                # daemon forwarding for it) has gone away, this write fails and the op is torn
+                # down promptly instead of pinning a worker until idle_timeout (which is 24h for
+                # `tail -f`). The client ignores "keepalive" chunks.
+                if emit is not None and now - last_keepalive >= FOLLOW_KEEPALIVE:
+                    last_keepalive = now
+                    emit({"stream": "keepalive", "data": ""})
                 # Sleep between polls, but wake immediately if cancel fires.
                 if cancel_event is not None:
                     if cancel_event.wait(FOLLOW_POLL):
@@ -1317,10 +1333,11 @@ def op_squeue(args):
     if jobs:
         argv += ["-j", ",".join(str(j) for j in jobs)]
     user = args.get("user")
+    # `--me` needs Slurm >= 20.02; `-u <user>` works on every version we target.
+    if not user and not jobs:
+        user = getpass.getuser()
     if user:
         argv += ["-u", user]
-    elif not jobs:
-        argv += ["--me"]
     if args.get("states"):
         argv += ["-t", ",".join(args["states"])]
     return _slurm(argv, timeout=60)
@@ -1403,11 +1420,9 @@ def op_squeue_start(args):
     if jobs:
         argv += ["-j", ",".join(str(j) for j in jobs)]
     else:
-        user = args.get("user")
-        if user:
-            argv += ["-u", str(user)]
-        else:
-            argv += ["--me"]
+        # `--me` needs Slurm >= 20.02; `-u <user>` works on every version we target.
+        user = args.get("user") or getpass.getuser()
+        argv += ["-u", str(user)]
     return _slurm_soft(argv, timeout=60)
 
 
@@ -1512,6 +1527,7 @@ class Server(object):
         self.lock = threading.Lock()  # serialises writes to stdout
         self.fast = ThreadPoolExecutor(max_workers=FAST_WORKERS)
         self.slow = ThreadPoolExecutor(max_workers=SLOW_WORKERS)
+        self.long = ThreadPoolExecutor(max_workers=LONG_WORKERS)
         self.reg_lock = threading.Lock()  # protects `running`, `events` and `cancelled`
         self.running = {}  # request id -> live Popen for cancellable slow ops
         self.events = {}  # request id -> threading.Event for non-subprocess cancellables (follow)
@@ -1670,10 +1686,11 @@ class Server(object):
             if op == "shutdown":
                 self.send({"id": req.get("id"), "ok": True, "result": {"bye": True}, "done": True})
                 break
-            pool = self.slow if (op in SLOW_OPS or op in LONG_OPS) else self.fast
+            pool = self.long if op in LONG_OPS else (self.slow if op in SLOW_OPS else self.fast)
             pool.submit(self.handle, req)
         self.fast.shutdown(wait=True)
         self.slow.shutdown(wait=True)
+        self.long.shutdown(wait=True)
 
 
 def main():
