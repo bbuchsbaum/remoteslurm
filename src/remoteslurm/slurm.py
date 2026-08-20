@@ -465,6 +465,213 @@ def parse_sinfo(stdout: str) -> list[dict[str, Any]]:
     return list(parts.values())
 
 
+# --------------------------------------------------------------------------- queue intelligence
+# Every parser here is deliberately tolerant: site formats vary (trillium vs Nibi vs older
+# Slurm), so an unknown/short/missing column becomes ``None`` rather than raising.
+
+
+def parse_squeue_start(stdout: str) -> list[dict[str, Any]]:
+    """``squeue --start -o "%i|%S|%r"`` -> ``[{job_id, est_start, reason}]``.
+
+    ``est_start`` is ``None`` for ``N/A``/unknown (the scheduler has no estimate yet).
+    """
+    out: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        jid = parts[0] if parts else ""
+        if not jid or jid.lower() == "job_id":  # skip a stray header, if any
+            continue
+        start = parts[1] if len(parts) > 1 else ""
+        reason = parts[2] if len(parts) > 2 else ""
+        out.append(
+            {
+                "job_id": jid,
+                "est_start": start if start and start not in ("N/A", "Unknown", "") else None,
+                "reason": reason or None,
+            }
+        )
+    return out
+
+
+SSHARE_FIELDS = [
+    "account",
+    "user",
+    "raw_shares",
+    "norm_shares",
+    "raw_usage",
+    "effective_usage",
+    "fair_share",
+]
+_SSHARE_INT = {"raw_shares", "raw_usage"}
+_SSHARE_FLOAT = {"norm_shares", "effective_usage", "fair_share"}
+
+
+def parse_sshare(stdout: str) -> list[dict[str, Any]]:
+    """``sshare -U -P`` -> per-account fair-share rows.
+
+    Columns: ``Account|User|RawShares|NormShares|RawUsage|EffectvUsage|FairShare``. Numeric
+    fields are typed (int/float) when parseable, else ``None``; a header row is skipped.
+    """
+    out: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if parts and parts[0].lower() == "account":  # header
+            continue
+        rec: dict[str, Any] = {}
+        for i, name in enumerate(SSHARE_FIELDS):
+            raw = parts[i] if i < len(parts) else ""
+            if not raw:
+                rec[name] = None
+            elif name in _SSHARE_INT:
+                try:
+                    rec[name] = int(raw)
+                except ValueError:
+                    rec[name] = None
+            elif name in _SSHARE_FLOAT:
+                try:
+                    rec[name] = float(raw)
+                except ValueError:
+                    rec[name] = None
+            else:
+                rec[name] = raw
+        out.append(rec)
+    return out
+
+
+QOS_FIELDS = ["name", "max_wall", "max_jobs_pu", "max_tres_pu", "priority"]
+
+
+def parse_qos(stdout: str) -> list[dict[str, Any]]:
+    """``sacctmgr -P -n show qos format=name,maxwall,maxjobspu,maxtresperuser,priority`` -> rows.
+
+    All values are kept as strings (``None`` when empty); the format is site-dependent so no
+    field is required. ``max_wall`` empty means "no QOS wall limit".
+    """
+    out: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if parts and parts[0].lower() == "name":  # header, if the site emits one
+            continue
+        rec: dict[str, Any] = {}
+        for i, name in enumerate(QOS_FIELDS):
+            raw = parts[i] if i < len(parts) else ""
+            rec[name] = raw or None
+        out.append(rec)
+    return out
+
+
+ASSOC_FIELDS = ["account", "partition", "qos", "grp_tres", "max_jobs"]
+
+
+def parse_assoc(stdout: str) -> list[dict[str, Any]]:
+    """``sacctmgr show assoc user=<me> format=account,partition,qos,grptres,maxjobs`` -> rows."""
+    out: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if parts and parts[0].lower() == "account":  # header
+            continue
+        rec: dict[str, Any] = {}
+        for i, name in enumerate(ASSOC_FIELDS):
+            raw = parts[i] if i < len(parts) else ""
+            rec[name] = raw or None
+        out.append(rec)
+    return out
+
+
+def parse_df(stdout: str) -> list[dict[str, Any]]:
+    """Parse ``df -h`` output into per-filesystem rows (tolerant of GNU vs BSD/macOS columns).
+
+    Uses positional columns for filesystem/size/used/avail, the first ``%`` token for the
+    capacity, and the last token for the mount point — so macOS's extra inode columns don't
+    shift the mount off the end. Short/wrapped lines are skipped.
+    """
+    out: list[dict[str, Any]] = []
+    for i, line in enumerate([ln for ln in stdout.splitlines() if ln.strip()]):
+        parts = line.split()
+        if i == 0 and parts and parts[0].lower() == "filesystem":  # header
+            continue
+        if len(parts) < 5:
+            continue
+        pct = next((p for p in parts[4:] if p.endswith("%")), None)
+        out.append(
+            {
+                "filesystem": parts[0],
+                "size": parts[1],
+                "used": parts[2],
+                "avail": parts[3],
+                "use_pct": pct,
+                "mounted_on": parts[-1],
+            }
+        )
+    return out
+
+
+# A ``<used>/<limit>`` quota pair from ``diskusage_report``. The real output is a fixed-width
+# table (NOT pipe-separated), and a value may carry an internal space (``0  B``) or spaces around
+# the slash (``88GiB/ 100GiB``, ``7 /2000K``) — hence the ``\s*`` inside and around each value.
+_DU_PAIR = re.compile(r"([\d.]+\s*[A-Za-z]*)\s*/\s*([\d.]+\s*[A-Za-z]*)")
+
+
+def _du_norm(v: str | None) -> str | None:
+    """Collapse internal whitespace in a quota value (``0  B`` -> ``0 B``); ``""`` -> ``None``."""
+    if v is None:
+        return None
+    s = " ".join(v.split())
+    return s or None
+
+
+def parse_diskusage_report(stdout: str) -> list[dict[str, Any]]:
+    """Parse Alliance ``diskusage_report --per_user`` (a fixed-width table) into rows.
+
+    Columns are ``Description``, ``Space`` (``<used>/<limit>``), ``# of files``
+    (``<used>/<limit>``). The description ends at its ``)`` (e.g. ``/home (user brad)``); the two
+    quota pairs follow. Values may contain spaces (``0  B``) and the slash may be padded
+    (``88GiB/ 100GiB``). Tolerant: the header is skipped, missing pieces become ``None``, and a
+    line that doesn't fit still yields a row with ``raw`` — it never raises. ``df -h`` is the
+    fallback when the tool is absent.
+    """
+    out: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith("description") or set(s) <= set("-= "):  # header / rule line
+            continue
+        rp = s.rfind(")")
+        if rp != -1:
+            desc, rest = s[: rp + 1].strip(), s[rp + 1 :]
+        else:  # no parenthetical: description is the text before the first number
+            m0 = re.search(r"\d", s)
+            desc = (s[: m0.start()].strip() or s) if m0 else s
+            rest = s[m0.start() :] if m0 else ""
+        pairs = _DU_PAIR.findall(rest)
+        used = limit = files_used = files_limit = None
+        if len(pairs) >= 1:
+            used, limit = _du_norm(pairs[0][0]), _du_norm(pairs[0][1])
+        if len(pairs) >= 2:
+            files_used, files_limit = _du_norm(pairs[1][0]), _du_norm(pairs[1][1])
+        out.append(
+            {
+                "description": desc,
+                "used": used,
+                "limit": limit,
+                "files_used": files_used,
+                "files_limit": files_limit,
+                "raw": s,
+            }
+        )
+    return out
+
+
 def exit_code_int(code: str | None) -> int | None:
     """'0:0' -> 0 ; '1:0' -> 1 ; '0:9' (signal) -> 128+9."""
     if not code:

@@ -243,37 +243,60 @@ class JobRegistry:
         self.path = (base or state_dir()) / host / "jobs.json"
         self._lock = threading.Lock()
 
-    def _read_file(self) -> dict[str, JobRecord]:
-        jobs: dict[str, JobRecord] = {}
+    def _read_raw(self) -> dict[str, Any]:
+        """The whole registry file as a dict (``{"jobs": [...], "last_pruned": ...}``)."""
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text("utf-8"))
-                for d in data.get("jobs", []):
-                    known = {k: v for k, v in d.items() if k in JobRecord.__dataclass_fields__}
-                    jobs[known["job_id"]] = JobRecord(**known)
-            except (OSError, ValueError, TypeError, KeyError):
+                if isinstance(data, dict):
+                    return data
+            except (OSError, ValueError):
                 pass
+        return {}
+
+    @staticmethod
+    def _jobs_from_raw(raw: dict[str, Any]) -> dict[str, JobRecord]:
+        jobs: dict[str, JobRecord] = {}
+        for d in raw.get("jobs", []):
+            try:
+                known = {k: v for k, v in d.items() if k in JobRecord.__dataclass_fields__}
+                jobs[known["job_id"]] = JobRecord(**known)
+            except (TypeError, KeyError):
+                continue
         return jobs
 
-    def _write_file(self, jobs: dict[str, JobRecord]) -> None:
+    def _read_file(self) -> dict[str, JobRecord]:
+        return self._jobs_from_raw(self._read_raw())
+
+    def _write_raw(self, raw: dict[str, Any]) -> None:
         tmp = self.path.with_name(f"jobs.{os.getpid()}.{threading.get_ident()}.tmp")
-        payload = {"jobs": [asdict(j) for j in jobs.values()]}
-        tmp.write_text(json.dumps(payload, indent=1), "utf-8")
+        tmp.write_text(json.dumps(raw, indent=1), "utf-8")
         os.replace(tmp, self.path)
 
     @contextmanager
-    def _locked(self) -> Iterator[dict[str, JobRecord]]:
-        """Yield the on-disk records under an exclusive lock; write back on exit."""
+    def _locked_raw(self) -> Iterator[dict[str, Any]]:
+        """Yield the whole registry dict under an exclusive lock; write it back on exit.
+
+        Top-level keys other than ``jobs`` (e.g. ``last_pruned``) are preserved across writes.
+        """
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path.with_suffix(".lock"), "w") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
                 try:
-                    jobs = self._read_file()
-                    yield jobs
-                    self._write_file(jobs)
+                    raw = self._read_raw()
+                    yield raw
+                    self._write_raw(raw)
                 finally:
                     fcntl.flock(lf, fcntl.LOCK_UN)
+
+    @contextmanager
+    def _locked(self) -> Iterator[dict[str, JobRecord]]:
+        """Yield the on-disk records under an exclusive lock; write back on exit."""
+        with self._locked_raw() as raw:
+            jobs = self._jobs_from_raw(raw)
+            yield jobs
+            raw["jobs"] = [asdict(j) for j in jobs.values()]
 
     def get(self, job_id: str) -> JobRecord | None:
         with self._lock:
@@ -298,6 +321,48 @@ class JobRegistry:
     def forget(self, job_id: str) -> bool:
         with self._locked() as jobs:
             return jobs.pop(job_id, None) is not None
+
+    def prune(
+        self,
+        older_than_days: int = 30,
+        *,
+        keep_active: bool = True,
+        force: bool = False,
+        interval: float = 3600.0,
+    ) -> dict[str, Any]:
+        """Drop stale records: ``last_seen`` older than the cutoff AND a terminal ``last_state``.
+
+        ``keep_active`` (default) never drops a record whose last state is active/unknown, only
+        the finished ones. Throttled to once per ``interval`` seconds via a ``last_pruned``
+        timestamp stored in the registry file (under the same flock) — pass ``force=True`` to
+        prune now regardless. Returns ``{pruned, removed, kept, throttled}``.
+        """
+        now = time.time()
+        cutoff = now - older_than_days * 86400
+        with self._locked_raw() as raw:
+            last = raw.get("last_pruned") or 0
+            jobs = self._jobs_from_raw(raw)
+            if not force and (now - float(last)) < interval:
+                # Preserve the file as-is (write back what we read) and report the throttle.
+                raw["jobs"] = [asdict(j) for j in jobs.values()]
+                return {"pruned": 0, "removed": [], "kept": len(jobs), "throttled": True}
+            removed: list[str] = []
+            for jid, rec in list(jobs.items()):
+                if not rec.last_seen or rec.last_seen >= cutoff:
+                    continue
+                terminal = bool(rec.last_state) and slurm.is_terminal(rec.last_state or "")
+                if keep_active and not terminal:
+                    continue
+                del jobs[jid]
+                removed.append(jid)
+            raw["jobs"] = [asdict(j) for j in jobs.values()]
+            raw["last_pruned"] = now
+            return {
+                "pruned": len(removed),
+                "removed": removed,
+                "kept": len(jobs),
+                "throttled": False,
+            }
 
     def audit(self, event: str, **data: Any) -> None:
         """Append-only audit log next to the registry (run/write/cancel/submit)."""
@@ -761,6 +826,12 @@ class SlurmOps:
 
         A job array shows up as one row keyed by its base id (rolled up across tasks).
         """
+        # Opportunistic housekeeping: drop long-finished records (throttled to once/hour via a
+        # timestamp in the registry file). Never let it break a listing.
+        try:
+            self.registry.prune()
+        except OSError:
+            pass
         out: dict[str, slurm.JobStatus] = {}
         for r in self.squeue(refresh=refresh):
             jid = r["array_base"] or r["job_id"]  # arrays roll up under the base id

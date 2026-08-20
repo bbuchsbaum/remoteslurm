@@ -1054,6 +1054,26 @@ def _slurm(argv, timeout=60, cwd=None, stdin=None, on_spawn=None, new_session=Fa
     )
 
 
+def _slurm_soft(argv, timeout=60, cwd=None):
+    """Run a query tool but, when it is *absent* from PATH, return a soft ``rc != 0`` result
+    instead of raising.
+
+    The queue-intelligence tools (``sshare``/``sacctmgr``/``diskusage_report``) are optional and
+    site-specific; a missing one must degrade to ``available: false`` on the client, never a hard
+    error. A tool that *is* present but exits non-zero simply returns its rc/stderr.
+    """
+    if not _which(argv[0]):
+        return {
+            "rc": 127,
+            "stdout": "",
+            "stderr": "%s: not found" % argv[0],
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "missing": True,
+        }
+    return _run(argv, timeout=timeout, cwd=cwd, max_output=MAX_RUN_OUTPUT)
+
+
 def op_sbatch(args):
     """Submit a job. Either `script` (content) or `path` (existing file) must be given.
 
@@ -1186,6 +1206,87 @@ def op_sinfo(args):
     return _slurm(["sinfo", "-h", "-o", fmt], timeout=60)
 
 
+# --------------------------------------------------------------------------- queue intelligence
+# Each of these returns a raw ``{rc, stdout, stderr}`` (like the other Slurm ops); the client
+# parses the text and tolerates missing columns/tools. They are FAST ops (short, bounded queries).
+
+
+def op_squeue_start(args):
+    """``squeue --start -h -o "%i|%S|%r"`` — scheduler start-time estimates for pending jobs."""
+    argv = ["squeue", "--start", "-h", "-o", "%i|%S|%r"]
+    jobs = args.get("jobs")
+    if jobs:
+        argv += ["-j", ",".join(str(j) for j in jobs)]
+    else:
+        user = args.get("user")
+        if user:
+            argv += ["-u", str(user)]
+        else:
+            argv += ["--me"]
+    return _slurm_soft(argv, timeout=60)
+
+
+def op_sshare(args):
+    """``sshare -U -P`` — this user's fair-share numbers (parsable, one row per account)."""
+    return _slurm_soft(["sshare", "-U", "-P"], timeout=60)
+
+
+def op_qos(args):
+    """``sacctmgr -P -n show qos format=...`` — QOS limits (walltime, jobs/user, priority)."""
+    fmt = "name,maxwall,maxjobspu,maxtresperuser,priority"
+    return _slurm_soft(["sacctmgr", "-P", "-n", "show", "qos", "format=" + fmt], timeout=60)
+
+
+def op_assoc(args):
+    """``sacctmgr -P -n show assoc user=<me> format=...`` — this user's account/QOS associations."""
+    me = args.get("user") or getpass.getuser()
+    fmt = "account,partition,qos,grptres,maxjobs"
+    return _slurm_soft(
+        ["sacctmgr", "-P", "-n", "show", "assoc", "user=" + str(me), "format=" + fmt], timeout=60
+    )
+
+
+def op_quota(args):
+    """Disk usage: run the host-provided ``command`` (argv) if given, else ``df -h`` of ``paths``.
+
+    ``command`` is a pre-split argv list (the client splits the configured ``quota_command``);
+    it is run with no shell, matching the stub's no-shell invariant. When no command is given,
+    ``df -h`` is run over the given ``paths`` (``~``/``$VARS`` expanded here, non-existent paths
+    dropped). A missing tool yields a soft ``rc != 0`` (``available: false`` on the client).
+    """
+    # The configured quota_command is run in a LOGIN shell: on Alliance clusters
+    # `diskusage_report` is a module-provided shell function, and the bare binary reports
+    # different numbers, so we must let the login profile define it. This is a user-configured,
+    # trusted command (not stub-internal input), so the shell here is intentional.
+    shell_cmd = args.get("command_shell")
+    if shell_cmd is not None:
+        if not isinstance(shell_cmd, str) or not shell_cmd.strip():
+            raise StubError("invalid_arg", "quota command_shell must be a non-empty string")
+        return _slurm_soft(["bash", "-lc", shell_cmd], timeout=90)
+    cmd = args.get("command")
+    if cmd:
+        if (
+            not isinstance(cmd, (list, tuple))
+            or not cmd
+            or not all(isinstance(a, str) for a in cmd)
+        ):
+            raise StubError("invalid_arg", "quota command must be a non-empty list of strings")
+        return _slurm_soft(list(cmd), timeout=90)
+    raw_paths = args.get("paths") or []
+    if not isinstance(raw_paths, (list, tuple)):
+        raise StubError("invalid_arg", "paths must be a list of strings")
+    paths = []
+    for p in raw_paths:
+        if not isinstance(p, str) or not p:
+            continue
+        ep = os.path.expanduser(os.path.expandvars(p))
+        if "$" in ep:  # an unset variable survived expansion; skip rather than df the wrong place
+            continue
+        if os.path.exists(ep) and ep not in paths:
+            paths.append(ep)
+    return _slurm_soft(["df", "-h"] + paths, timeout=60)
+
+
 OPS = {
     "ping": op_ping,
     "info": op_info,
@@ -1208,6 +1309,11 @@ OPS = {
     "scontrol": op_scontrol,
     "scancel": op_scancel,
     "sinfo": op_sinfo,
+    "squeue_start": op_squeue_start,
+    "sshare": op_sshare,
+    "qos": op_qos,
+    "assoc": op_assoc,
+    "quota": op_quota,
 }
 
 

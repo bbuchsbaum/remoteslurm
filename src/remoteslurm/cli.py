@@ -892,13 +892,21 @@ def _print_jobs(rows: list[dict[str, Any]]) -> None:
 
 def cmd_jobs(args: argparse.Namespace) -> int:
     c = get_cluster(args)
+    pruned: dict[str, Any] | None = None
+    if getattr(args, "prune", False):
+        pruned = c.registry.prune(force=True)
+        if not args.json:
+            print(f"pruned {pruned['pruned']} stale record(s)", file=sys.stderr)
     sts = c.jobs(include_finished=not args.live, refresh=args.refresh)
     rows = [s.to_dict() for s in sts]
     for r in rows:
         cell = array_tasks_cell(r)
         if cell:
             r["tasks"] = cell
-    emit(args, {"jobs": rows, "count": len(rows)}, lambda d: _print_jobs(d["jobs"]))
+    out: dict[str, Any] = {"jobs": rows, "count": len(rows)}
+    if pruned is not None:
+        out["pruned"] = pruned
+    emit(args, out, lambda d: _print_jobs(d["jobs"]))
     return EXIT_OK
 
 
@@ -1087,6 +1095,225 @@ def cmd_config(args: argparse.Namespace) -> int:
         },
     }
     emit(args, data, lambda d: print(json.dumps(d, indent=2)))
+    return EXIT_OK
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    c = get_cluster(args)
+    q = c.queue_info()
+
+    def human(q: dict[str, Any]) -> None:
+        parts = q.get("partitions") or []
+        print("PARTITIONS")
+        if not parts:
+            print("  (sinfo unavailable)")
+        for p in parts:
+            name = p.get("partition", "?") + ("*" if p.get("default") else "")
+            print(
+                f"  {name:16} {p.get('avail', ''):5} {str(p.get('time_limit', '')):10} "
+                f"nodes {p.get('nodes_total', 0):>4} (idle {p.get('nodes_idle', 0)})"
+            )
+        accounts = q.get("accounts") or []
+        print("\nMY ACCOUNTS / QOS")
+        if not accounts:
+            print("  (sacctmgr unavailable)")
+        for a in accounts:
+            bits = [f"account={a.get('account')}"]
+            if a.get("partition"):
+                bits.append(f"partition={a['partition']}")
+            if a.get("qos"):
+                bits.append(f"qos={a['qos']}")
+            if a.get("max_jobs"):
+                bits.append(f"maxjobs={a['max_jobs']}")
+            print("  " + "  ".join(bits))
+        qos = q.get("qos") or []
+        if qos:
+            print("\nQOS LIMITS")
+            for x in qos:
+                print(
+                    f"  {str(x.get('name')):12} maxwall={x.get('max_wall') or '-'}  "
+                    f"maxjobs/user={x.get('max_jobs_pu') or '-'}  "
+                    f"priority={x.get('priority') or '-'}"
+                )
+        fair = q.get("fairshare") or []
+        if fair:
+            print("\nFAIR-SHARE")
+            for f in fair:
+                if not f.get("account"):
+                    continue
+                print(
+                    f"  {str(f.get('account')):12} norm_shares={f.get('norm_shares')}  "
+                    f"usage={f.get('effective_usage')}  fairshare={f.get('fair_share')}"
+                )
+        pending = q.get("pending") or []
+        print("\nMY PENDING JOBS")
+        if not pending:
+            print("  (none)")
+        for j in pending:
+            line = f"  {j.get('job_id'):>10}  {j.get('name') or ''}"
+            if j.get("est_start"):
+                line += f"  est_start={j['est_start']}"
+            if j.get("reason"):
+                line += f"  ({j['reason']})"
+            print(line)
+
+    emit(args, q, human)
+    return EXIT_OK
+
+
+def cmd_quota(args: argparse.Namespace) -> int:
+    c = get_cluster(args)
+    q = c.quota()
+
+    def human(q: dict[str, Any]) -> None:
+        if not q.get("available"):
+            print(f"disk usage unavailable ({q.get('source')})", file=sys.stderr)
+            if q.get("stderr"):
+                print(q["stderr"].rstrip("\n"), file=sys.stderr)
+            return
+        if q.get("source") == "df":
+            print(f"{'FILESYSTEM':24} {'SIZE':>6} {'USED':>6} {'AVAIL':>6} {'USE%':>5}  MOUNT")
+            for u in q.get("usage", []):
+                print(
+                    f"{str(u.get('filesystem'))[:24]:24} {str(u.get('size') or ''):>6} "
+                    f"{str(u.get('used') or ''):>6} {str(u.get('avail') or ''):>6} "
+                    f"{str(u.get('use_pct') or ''):>5}  {u.get('mounted_on') or ''}"
+                )
+        else:
+            for u in q.get("usage", []):
+                line = f"  {str(u.get('description')):32}"
+                if u.get("used") or u.get("limit"):
+                    line += f" {u.get('used') or '?'}/{u.get('limit') or '?'}"
+                if u.get("files_used") or u.get("files_limit"):
+                    line += f"   files {u.get('files_used') or '?'}/{u.get('files_limit') or '?'}"
+                print(line)
+
+    emit(args, q, human)
+    return EXIT_OK
+
+
+def _completed_ok(st: Any) -> bool:
+    """True iff a job (or every array task) COMPLETED — the ``watch``/``wait`` success rule."""
+    extra = st.extra or {}
+    if extra.get("array"):
+        return set(extra.get("tasks") or {}) == {"COMPLETED"}
+    return bool(st.state == "COMPLETED")
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    from . import slurm, watch
+
+    c = get_cluster(args)
+    host = c.host.name
+    if args.all:
+        rows = c.squeue(refresh=True)
+        ids = sorted(
+            {r["array_base"] or r["job_id"] for r in rows},
+            key=lambda j: int(j.split("_")[0]),
+        )
+        if not ids:
+            print("no jobs currently in the queue", file=sys.stderr)
+            return EXIT_OK
+    else:
+        ids = list(args.job_id)
+    for j in ids:
+        slurm.parse_job_id(j)
+    poll = max(2.0, args.poll)
+    last_state: dict[str, str] = {}
+    done: dict[str, Any] = {}
+    t0 = time.time()
+    all_ok = True
+    try:
+        while len(done) < len(ids):
+            for j in ids:
+                if j in done:
+                    continue
+                st = c.job_status(j, refresh=True)
+                prev = last_state.get(j)
+                if st.state != prev:
+                    stamp = time.strftime("%H:%M:%S")
+                    extra = f" ({st.reason})" if st.reason else ""
+                    if not args.json:
+                        print(f"{stamp}  {j}: {prev or '-'} -> {st.state}{extra}")
+                    last_state[j] = st.state
+                if st.terminal:
+                    done[j] = st
+                    ev = {
+                        "t": time.time(),
+                        "job_id": j,
+                        "state": st.state,
+                        "exit_code": st.exit_code,
+                        "name": st.name,
+                    }
+                    watch.append_event(host, ev)
+                    if not _completed_ok(st):
+                        all_ok = False
+                    if args.notify:
+                        watch.notify(c.host, f"{j} {st.state}")
+            if len(done) >= len(ids):
+                break
+            if args.timeout is not None and time.time() - t0 > args.timeout:
+                print(f"timeout after {args.timeout}s", file=sys.stderr)
+                all_ok = False
+                break
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    if args.json:
+        emit(args, {"watched": ids, "results": {j: s.to_dict() for j, s in done.items()}})
+    return EXIT_OK if all_ok else EXIT_ERROR
+
+
+def cmd_events(args: argparse.Namespace) -> int:
+    from . import watch
+
+    cfg = Config.load(Path(args.config) if getattr(args, "config", None) else None)
+    host = cfg.host(args.host).name
+    evs = watch.drain_events(host, since=args.since, all=args.all)
+
+    def human(d: dict[str, Any]) -> None:
+        if not d["events"]:
+            print("no new events")
+            return
+        for e in d["events"]:
+            stamp = fmt_time(e.get("t"))
+            exit_s = f" exit={e['exit_code']}" if e.get("exit_code") is not None else ""
+            name = f" {e['name']}" if e.get("name") else ""
+            print(f"{stamp}  {e.get('job_id')}: {e.get('state')}{exit_s}{name}")
+
+    emit(args, {"events": evs, "count": len(evs), "host": host}, human)
+    return EXIT_OK
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    from .jobs import JobRegistry
+
+    cfg = Config.load(Path(args.config) if getattr(args, "config", None) else None)
+    host = cfg.host(args.host).name
+    ok = JobRegistry(host).forget(args.job_id)
+    emit(
+        args,
+        {"job_id": args.job_id, "forgotten": ok},
+        lambda d: print(f"forgot {args.job_id}" if ok else f"{args.job_id} not in the registry"),
+    )
+    return EXIT_OK if ok else EXIT_ERROR
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    c = get_cluster(args)
+    r = c.clean(older_than_days=args.older_than_days, dry_run=args.dry_run)
+
+    def human(r: dict[str, Any]) -> None:
+        pre = "[dry-run] would remove" if r["dry_run"] else "removed"
+        if not r["removed"]:
+            print(f"nothing to clean ({r['kept']} file(s) kept)")
+            return
+        print(f"{pre} {r['count']} file(s) ({r['kept']} kept):")
+        for p in r["removed"]:
+            print(f"  {p}")
+
+    emit(args, r, human)
     return EXIT_OK
 
 
@@ -1354,11 +1581,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("job_id")
     sp.add_argument("-n", "--lines", type=int, default=60, help="log tail lines to include")
 
-    sp = add(
-        "jobs", cmd_jobs, "list my jobs (queue + recently submitted)", aliases=["queue", "squeue"]
-    )
+    sp = add("jobs", cmd_jobs, "list my jobs (queue + recently submitted)", aliases=["squeue"])
     sp.add_argument("--live", action="store_true", help="only jobs currently in the queue")
     sp.add_argument("--refresh", action="store_true", help="bypass the squeue cache")
+    sp.add_argument(
+        "--prune", action="store_true", help="drop long-finished registry records first"
+    )
 
     sp = add("status", cmd_status, "detailed status of job(s)")
     sp.add_argument("job_id", nargs="+")
@@ -1391,6 +1619,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("sinfo", cmd_sinfo, "partition summary", aliases=["partitions"])
     add("info", cmd_info, "remote user/home/env/slurm version")
+
+    add(
+        "queue",
+        cmd_queue,
+        "queue intelligence: partitions, my accounts/QOS, fair-share, pending start estimates",
+    )
+
+    add("quota", cmd_quota, "disk usage/quota (diskusage_report, else df -h)")
+
+    sp = add(
+        "watch",
+        cmd_watch,
+        "watch job(s) until they finish (exit 0 only if all COMPLETED); foreground",
+    )
+    sp.add_argument("job_id", nargs="*", help="job id(s) to watch (or use --all)")
+    sp.add_argument("--all", action="store_true", help="watch everything currently in the queue")
+    sp.add_argument("--notify", action="store_true", help="desktop notification on each finish")
+    sp.add_argument("--poll", type=float, default=30.0, help="seconds between polls (default 30)")
+    sp.add_argument("--timeout", type=float, help="give up after this many seconds")
+
+    sp = add("events", cmd_events, "show job-finish events recorded by `watch` (unseen by default)")
+    sp.add_argument("--since", help="only events at/after this ISO time (or epoch)")
+    sp.add_argument("--all", action="store_true", help="show all events, not just unseen ones")
+
+    sp = add("forget", cmd_forget, "remove a job from the local registry")
+    sp.add_argument("job_id")
+
+    sp = add(
+        "clean", cmd_clean, "remove generated sbatch scripts/sweeps older than the cutoff (remote)"
+    )
+    sp.add_argument("-n", "--dry-run", action="store_true", help="list what would be removed")
+    sp.add_argument(
+        "--older-than-days", type=int, default=30, help="age cutoff in days (default 30)"
+    )
 
     sp = add("config", cmd_config, "show config, or --init to write an example")
     sp.add_argument("--init", action="store_true")

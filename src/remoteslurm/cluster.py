@@ -8,6 +8,7 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Any
 
 from . import slurm
@@ -639,6 +640,16 @@ class Cluster(SlurmOps):
             time_limit=st.time_limit,
         )
         verdict, hints = slurm.diagnose_job(ctx)
+        if st.state == "PENDING":
+            try:
+                est = self.estimate_start(job_id)
+            except RemoteSlurmError:
+                est = None
+            if est and est.get("est_start"):
+                hint = f"estimated start: {est['est_start']}"
+                if est.get("reason"):
+                    hint += f" (scheduler reason: {est['reason']})"
+                hints.append(hint)
         if sync:
             hints.append(_sync_hint(sync))
 
@@ -661,6 +672,203 @@ class Cluster(SlurmOps):
             return str(self.job_output(job_id, tail=tail, stream=stream).get("content", ""))
         except RemoteSlurmError:
             return ""
+
+    # -- queue intelligence (F1) --------------------------------------------------------------
+    def estimate_start(self, job_id: str) -> dict[str, Any] | None:
+        """The scheduler's start-time estimate for a pending job (``{job_id, est_start, reason}``).
+
+        Returns ``None`` when the tool is unavailable, the job is not pending, or no row matches.
+        """
+        slurm.parse_job_id(job_id)
+        res = self.call("squeue_start", jobs=[job_id])
+        if res.get("rc") != 0:
+            return None
+        base = job_id.split("_")[0]
+        for r in slurm.parse_squeue_start(res.get("stdout", "")):
+            if r["job_id"] == job_id or r["job_id"].split("_")[0] == base:
+                return r
+        return None
+
+    def _fairshare(self) -> list[dict[str, Any]]:
+        res = self.call("sshare")
+        if res.get("rc") != 0:
+            return []
+        return slurm.parse_sshare(res.get("stdout", ""))
+
+    def _qos(self) -> list[dict[str, Any]]:
+        res = self.call("qos")
+        if res.get("rc") != 0:
+            return []
+        return slurm.parse_qos(res.get("stdout", ""))
+
+    def _assoc(self) -> list[dict[str, Any]]:
+        res = self.call("assoc", user=self._safe_user())
+        if res.get("rc") != 0:
+            return []
+        return slurm.parse_assoc(res.get("stdout", ""))
+
+    def _pending_estimates(self) -> list[dict[str, Any]]:
+        """My PENDING jobs with the scheduler's start estimate (one batched squeue_start)."""
+        try:
+            rows = self.squeue(refresh=True)
+        except RemoteSlurmError:
+            return []
+        pending = [r for r in rows if r.get("state") == "PENDING"]
+        if not pending:
+            return []
+        est: dict[str, dict[str, Any]] = {}
+        try:
+            res = self.call("squeue_start", jobs=[r["job_id"] for r in pending])
+            if res.get("rc") == 0:
+                for e in slurm.parse_squeue_start(res.get("stdout", "")):
+                    est[e["job_id"]] = e
+        except RemoteSlurmError:
+            pass
+        out: list[dict[str, Any]] = []
+        for r in pending:
+            e = est.get(r["job_id"], {})
+            reason = e.get("reason") or (
+                r["reason"] if r.get("reason") not in ("None", "", None) else None
+            )
+            out.append(
+                {
+                    "job_id": r["job_id"],
+                    "name": r.get("name") or None,
+                    "est_start": e.get("est_start"),
+                    "reason": reason,
+                }
+            )
+        return out
+
+    def queue_info(self) -> dict[str, Any]:
+        """One-call snapshot for ``rslurm queue``: partitions, my accounts/QOS + limits,
+        fair-share, and my pending jobs with start estimates.
+
+        Every section degrades to an empty list when its Slurm tool is missing (site formats
+        vary); nothing here raises for an absent ``sshare``/``sacctmgr``.
+        """
+        try:
+            partitions = self.sinfo()
+        except RemoteSlurmError:
+            partitions = []
+        return {
+            "partitions": partitions,
+            "fairshare": self._fairshare(),
+            "qos": self._qos(),
+            "accounts": self._assoc(),
+            "pending": self._pending_estimates(),
+        }
+
+    def _quota_paths(self) -> list[str]:
+        """Filesystems to ``df`` when there is no ``quota_command``: home + scratch/project."""
+        info: dict[str, Any] = {}
+        try:
+            info = self.info()
+        except RemoteSlurmError:
+            pass
+        env = info.get("env", {}) if info else {}
+        paths: list[str] = []
+        for key in ("HOME", "SCRATCH", "PROJECT"):
+            v = env.get(key)
+            if v and v not in paths:
+                paths.append(v)
+        home = info.get("home")
+        if not paths and home:
+            paths.append(home)
+        return paths
+
+    def quota(self) -> dict[str, Any]:
+        """Disk usage/quota. Uses the host's ``quota_command`` (Alliance: ``diskusage_report
+        --per_user``) when set, else ``df -h`` of home/scratch/project.
+
+        Returns ``{available, source, usage, raw, ...}``; ``available`` is false when the tool is
+        missing (``usage`` empty) so an agent can fall back gracefully.
+        """
+        cmd = self.host.quota_command
+        if cmd:
+            # Run in a login shell so module-provided wrappers (Alliance's `diskusage_report`
+            # is a shell function) resolve; the bare binary can report different numbers.
+            res = self.call("quota", command_shell=cmd, _timeout=120)
+            available = res.get("rc") == 0 and not res.get("missing")
+            usage = slurm.parse_diskusage_report(res.get("stdout", "")) if available else []
+            return {
+                "available": available,
+                "source": "command",
+                "command": cmd,
+                "usage": usage,
+                "raw": res.get("stdout", ""),
+                "stderr": "" if available else res.get("stderr", ""),
+            }
+        paths = self._quota_paths()
+        res = self.call("quota", paths=paths, _timeout=90)
+        usage = slurm.parse_df(res.get("stdout", ""))
+        return {
+            "available": bool(usage),
+            "source": "df",
+            "paths": paths,
+            "usage": usage,
+            "raw": res.get("stdout", ""),
+            "stderr": "" if usage else res.get("stderr", ""),
+        }
+
+    # -- housekeeping (F3) --------------------------------------------------------------------
+    def clean(self, *, older_than_days: int = 30, dry_run: bool = False) -> dict[str, Any]:
+        """Remove generated sbatch scripts / sweep files older than the cutoff.
+
+        Scans the host ``script_dir`` (default ``~/.remoteslurm/scripts`` and
+        ``~/.remoteslurm/sweeps``), deleting files whose mtime is older than
+        ``older_than_days`` via the stub's ``glob`` + ``rm``. Protected paths are skipped
+        (counted under ``kept``). ``dry_run`` reports what *would* be removed without touching
+        anything.
+        """
+        from .errors import NotFound
+
+        cutoff = time.time() - older_than_days * 86400
+        dirs = (
+            [self.host.script_dir]
+            if self.host.script_dir
+            else ["~/.remoteslurm/scripts", "~/.remoteslurm/sweeps"]
+        )
+        removed: list[str] = []
+        kept = 0
+        scanned: list[str] = []
+        for d in dirs:
+            try:
+                g = self.glob(d, "*", limit=10000, max_depth=20, hidden=False, type="file")
+            except NotFound:
+                continue
+            except RemoteSlurmError:
+                continue
+            if g.get("root"):
+                scanned.append(g["root"])
+            for m in g.get("matches", []):
+                path = m.get("path")
+                mtime = m.get("mtime")
+                if not path or mtime is None or mtime >= cutoff:
+                    kept += 1
+                    continue
+                if _matches_protected(path, self.host.protected_paths, self._cached_home()):
+                    kept += 1
+                    continue
+                if dry_run:
+                    removed.append(path)
+                    continue
+                try:
+                    self.rm(path)
+                    removed.append(path)
+                except RemoteSlurmError:
+                    kept += 1
+        self.registry.audit(
+            "clean", dry_run=dry_run, removed=len(removed), older_than_days=older_than_days
+        )
+        return {
+            "dry_run": dry_run,
+            "removed": removed,
+            "count": len(removed),
+            "kept": kept,
+            "dirs": scanned,
+            "older_than_days": older_than_days,
+        }
 
     def _read_sync_marker(self, workdir: str | None) -> dict[str, Any] | None:
         if not workdir:

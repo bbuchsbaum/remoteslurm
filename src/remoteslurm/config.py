@@ -195,6 +195,11 @@ class HostConfig:
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     notes: str = ""  # free-form cluster rules shown by `info`/`notes` (agents read this first)
     templates: dict[str, Template] = field(default_factory=dict)
+    # F1: how to report disk usage (Alliance: "diskusage_report --per_user"); else df fallback.
+    quota_command: str | None = None
+    # F2: command run by `watch --notify` on a job's terminal state (MSG is substituted with the
+    # message). None -> a platform default at runtime (osascript on macOS, notify-send on Linux).
+    notify_command: str | None = None
     max_sync_files: int = 50_000  # sync guard: max files on a non-dry push
     max_sync_bytes: int = 2 * 1024**3  # sync guard: max bytes on a non-dry push
     # Safety rails (E2): paths `write`/`edit`/`rm`/`put`/`sync --delete` refuse without force,
@@ -333,6 +338,8 @@ account = "rrg-someone"     # default --account for sbatch
 # python = "python3"        # remote interpreter for the stub
 # control_persist = "12h"
 # allow_run = true          # true | false | "safe" (argv-only + run_allowlist) for `run`/srun
+# quota_command = "diskusage_report --per_user"   # `rslurm quota` (Alliance); else df -h fallback
+# notify_command = "osascript -e 'display notification \\"MSG\\" with title \\"remoteslurm\\"'"
 
 # Safety rails (all optional; sensible defaults shown):
 # protected_paths = ["~/.ssh/**", "~/.bashrc", "~/.bash_profile", "~/.cache/remoteslurm/**"]

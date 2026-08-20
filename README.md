@@ -97,9 +97,16 @@ rslurm submit --remote '$SCRATCH/proj/job.sh' -o gpus-per-node=1 -o mem=16G
 rslurm jobs                                 # queue + recently submitted (with final state)
 rslurm status 2166996
 rslurm wait 2166996 --poll 10
+rslurm watch 2166996 --notify               # foreground: print transitions, notify on finish
+rslurm events                               # job-finish events recorded by watch (unseen)
 rslurm output 2166996 -n 100                # the job's stdout file
 rslurm cancel 2166996                       # only your own jobs; ownership is verified
 rslurm sinfo
+rslurm queue                                # partitions, my accounts/QOS, fair-share, ETA
+rslurm quota                                # disk usage (diskusage_report, else df -h)
+rslurm jobs --prune                         # drop long-finished registry records
+rslurm forget 2166996                       # remove one job from the local registry
+rslurm clean --dry-run                      # remove generated scripts/sweeps past the cutoff
 ```
 
 ### Speed: the session daemon
@@ -120,11 +127,14 @@ remoteslurm mcp-config                 # prints the mcpServers snippet
 claude mcp add remoteslurm -s user -e REMOTESLURM_DEFAULT_HOST=trillium -- remoteslurm-mcp
 ```
 
-Tools: `ls`, `read`, `grep`, `glob`, `write`, `run`, `submit`, `jobs`, `job_output`,
-`cancel`, `sinfo`, `info`, `connection`. All return JSON with `truncated` / `next_token`
-hints; errors come back as `{"error": "<code>", "message": ..., "action": ...}` rather than
-exceptions. `connection` never starts anything — it reports whether the ssh master is alive
-and what to run if not.
+Tool sets are chosen with `REMOTESLURM_MCP_TOOLS=core|all` (default `core`). Core:
+`info`, `ls`, `read`, `edit`, `grep`, `write`, `run`, `submit`, `jobs`, `diagnose`, `sync`,
+`cancel`, `wait`, `connection`. The `all` set adds `glob`, `diff`, `job_output`, `sinfo`,
+`projects`, `sweep`, `queue_info`, `quota`, `events`. All return JSON with `truncated` /
+`next_token` hints; errors come back as `{"error": "<code>", "message": ..., "action": ...}`
+rather than exceptions. `wait` is *bounded* (returns `terminal:false` on timeout — loop as
+needed); `events` reports jobs that finished while you were away. `connection` never starts
+anything — it reports whether the ssh master is alive and what to run if not.
 
 Example prompts once registered:
 

@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import shlex
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -29,7 +30,8 @@ MAX_CHARS = int(os.environ.get(ENV_MAX_CHARS, "200000"))
 
 ENV_MCP_TOOLS = "REMOTESLURM_MCP_TOOLS"
 # The default tool set: the workflow-critical tools an agent needs, nothing more. Set
-# REMOTESLURM_MCP_TOOLS=all to also expose glob/diff/job_output/sinfo/projects/sweep.
+# REMOTESLURM_MCP_TOOLS=all to also expose glob/diff/job_output/sinfo/projects/sweep/
+# queue_info/quota/events. (`wait` is core — agents want a bounded wait.)
 CORE_TOOLS = {
     "info",
     "ls",
@@ -44,6 +46,7 @@ CORE_TOOLS = {
     "sync",
     "cancel",
     "connection",
+    "wait",
 }
 
 
@@ -644,6 +647,87 @@ async def projects(host: str | None = None) -> dict[str, Any]:
     return await _guard(host, f)
 
 
+# -- queue intelligence (F1) ------------------------------------------------------------------
+async def queue_info(host: str | None = None) -> dict[str, Any]:
+    """One-call queue picture: ``partitions`` (with idle-node counts), my ``accounts``/``qos``
+    limits, ``fairshare``, and my ``pending`` jobs with the scheduler's start estimates.
+
+    Use this to pick a partition/account and to explain why a job hasn't started. Each section
+    is empty when its Slurm tool is missing on the cluster (site formats vary) — never an error.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.queue_info()
+
+    return await _guard(host, f)
+
+
+async def quota(host: str | None = None) -> dict[str, Any]:
+    """Disk usage / quota for the user's filesystems.
+
+    Uses the host's configured ``quota_command`` (Alliance clusters: ``diskusage_report
+    --per_user``) when set, else ``df -h`` of home/scratch/project. Returns ``available`` (false
+    when the tool is missing), ``usage`` (parsed rows) and the ``raw`` text.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.quota()
+
+    return await _guard(host, f)
+
+
+# -- watch / wait (F2) ------------------------------------------------------------------------
+async def wait(job_id: str, timeout: int = 120, host: str | None = None) -> dict[str, Any]:
+    """Bounded wait for a job to finish — poll up to ``timeout`` seconds (capped at 300), then
+    return the current status with ``terminal: bool``.
+
+    Most MCP clients cap how long a single tool call may run, so this is deliberately bounded:
+    on timeout it returns the latest status with ``terminal: false`` — call it again to keep
+    waiting (loop only as needed). When the job has finished it returns ``terminal: true`` with
+    ``state``/``exit_code``. Prefer this over tight polling of ``jobs``.
+    """
+    cap = _clamp(timeout, 1, 300)
+
+    def f(c: Cluster) -> dict[str, Any]:
+        interval = 5.0
+        remaining = float(cap)
+        st = c.job_status(job_id, refresh=True)
+        while not st.terminal and remaining > 0:
+            time.sleep(min(interval, remaining))
+            remaining -= interval
+            st = c.job_status(job_id, refresh=True)
+        d = st.to_dict()
+        d["terminal"] = bool(st.terminal)
+        return d
+
+    return await _guard(host, f)
+
+
+async def events(since: str | None = None, host: str | None = None) -> dict[str, Any]:
+    """Job-finish events recorded by ``rslurm watch`` — "did anything finish while I worked?".
+
+    With no ``since``, returns only events not yet seen (a read cursor advances so the next call
+    won't repeat them). With ``since`` (an ISO timestamp or epoch), returns every event at/after
+    that time and leaves the cursor untouched. Returns ``{events: [...], count}``; never blocks.
+    """
+
+    def work() -> dict[str, Any]:
+        from . import watch
+        from .config import Config
+
+        cfg = Config.load()
+        hc = cfg.host(host)
+        evs = watch.drain_events(hc.name, since=since, all=False)
+        return {"events": evs, "count": len(evs), "host": hc.name}
+
+    try:
+        return await asyncio.to_thread(work)
+    except RemoteSlurmError as e:
+        return e.to_dict()
+    except Exception as e:  # noqa: BLE001
+        return {"error": "internal", "message": f"{type(e).__name__}: {e}"}
+
+
 # -- resources ---------------------------------------------------------------------------------
 def guide_resource() -> str:
     """The agent guide (also `rslurm agent-guide`)."""
@@ -675,6 +759,10 @@ ALL_TOOLS: dict[str, Any] = {
     "connection": connection,
     "sync": sync,
     "projects": projects,
+    "wait": wait,
+    "queue_info": queue_info,
+    "quota": quota,
+    "events": events,
 }
 
 
@@ -704,7 +792,7 @@ def mcp_config_snippet(host: str | None = None) -> str:
                     "env": {
                         ENV_DEFAULT_HOST: host or "<host>",
                         # tool set: "core" (default) or "all" (adds glob/diff/job_output/
-                        # sinfo/projects/sweep). Remove this line to keep the default core set.
+                        # sinfo/projects/sweep/queue_info/quota/events). Remove to keep core.
                         ENV_MCP_TOOLS: "core",
                     },
                 }

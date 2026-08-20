@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""FakeSlurm sacctmgr: `show qos ...` / `show assoc ...` -> the matching recorded fixture."""
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FIX = os.path.join(HERE, "..", "fixtures", "slurm")
+
+if __name__ == "__main__":
+    # Drop flags (-P, -n); keep positionals like "show", "qos", "format=...", "user=...".
+    words = [a for a in sys.argv[1:] if not a.startswith("-")]
+    entity = ""
+    if words and words[0] == "show" and len(words) > 1:
+        entity = words[1]
+    name = "assoc.txt" if entity.startswith("assoc") else "qos.txt"
+    with open(os.path.join(FIX, name), encoding="utf-8") as f:
+        sys.stdout.write(f.read())

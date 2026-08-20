@@ -208,6 +208,9 @@ class SSHTransport(Transport):
             "else "
             f"head -c {len(stub_source().encode('utf-8'))} > /dev/null; "
             "fi;"
+            # Remove superseded stubs left by older shas (only stub-*.py in the resolved dir $D,
+            # never the one we just installed/kept at $P). Keeps the install dir from growing.
+            'for f in "$D"/stub-*.py; do [ "$f" = "$P" ] || rm -f "$f"; done;'
             f"command -v {py} >/dev/null 2>&1 || "
             f"{{ echo 'REMOTESLURM-ERROR python not found: {self.python}' >&2; exit 98; }};"
             f'exec {py} -u "$P"'

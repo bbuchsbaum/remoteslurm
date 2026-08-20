@@ -28,6 +28,23 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
 - Safety rails: `allow_run = false | "safe"` (safe = argv-only, executable allow-list, no `bash -c`);
   `protected_paths` block write/edit/rm/put/sync-delete unless forced; `confirm` list gates rm/cancel
   behind an explicit confirmation; recursive `rm` refuses `$SCRATCH`/`$PROJECT` roots and shallow paths.
+- Queue intelligence: `rslurm queue` (partitions with idle nodes, my accounts/QOS + limits,
+  fair-share, my pending jobs with scheduler start estimates) and `rslurm quota` (Alliance
+  `diskusage_report` via `quota_command`, else `df -h`); `Cluster.queue_info`/`estimate_start`/
+  `quota`; MCP `queue_info`/`quota` (in the `all` set). `diagnose` now adds the start estimate to a
+  PENDING verdict. Parsers tolerate missing tools/columns (a missing `sshare`/`sacctmgr` degrades
+  to empty, never an error).
+- Watch & notifications: `rslurm watch JOB… [--all] [--notify] [--poll]` — a foreground loop that
+  prints state transitions, records terminal events to `<state>/<host>/events.jsonl`, and fires a
+  desktop notification (`notify_command`; macOS/Linux defaults) on each finish (exit 0 only if all
+  COMPLETED). `rslurm events` drains unseen events (byte-offset cursor) or `--all`/`--since`; MCP
+  `events`. MCP `wait(job_id, timeout)` is a *bounded* poll (cap 300 s) returning `terminal:false`
+  on timeout — agents loop as needed (in the core set).
+- Housekeeping: `JobRegistry.prune` drops long-finished records (kept once/hour via a `last_pruned`
+  stamp in the registry file); `jobs()` prunes opportunistically; `rslurm jobs --prune` forces it,
+  `rslurm forget JOBID` removes one. `rslurm clean [--dry-run] [--older-than-days]` removes generated
+  scripts/sweeps older than the cutoff. The stub bootstrap now deletes superseded `stub-*.py` (other
+  shas) from the install dir.
 
 ## 0.1.0 — 2026-08-20
 

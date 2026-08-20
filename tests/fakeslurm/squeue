@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _fakeslurm as fs  # noqa: E402
 
 
-def field(code, job, id_override=None):
+def field(code, job, id_override=None, start_mode=False):
     pending = job["state"] == "PENDING"
     if code == "i":
         return id_override if id_override is not None else fs.job_label(job)
@@ -33,6 +33,9 @@ def field(code, job, id_override=None):
     if code == "V":
         return fs.ts(job["submit_time"])
     if code == "S":
+        # squeue --start: a pending job gets an *estimated* start time (an hour out here).
+        if start_mode and pending:
+            return fs.ts(fs.time.time() + 3600)
         return fs.ts(job["start_time"]) if job["start_time"] else "N/A"
     if code == "Z":
         return job["workdir"]
@@ -41,13 +44,13 @@ def field(code, job, id_override=None):
     return ""
 
 
-def render(fmt, job, id_override=None):
+def render(fmt, job, id_override=None, start_mode=False):
     out = []
     i = 0
     while i < len(fmt):
         c = fmt[i]
         if c == "%" and i + 1 < len(fmt):
-            out.append(field(fmt[i + 1], job, id_override))
+            out.append(field(fmt[i + 1], job, id_override, start_mode))
             i += 2
         else:
             out.append(c)
@@ -61,11 +64,14 @@ def main():
     ids = None
     users = None
     states = None
+    start_mode = False
     i = 0
     while i < len(args):
         a = args[i]
         if a == "-h" or a == "--noheader" or a == "--me":
             pass
+        elif a == "--start":
+            start_mode = True
         elif a == "-o" or a == "--format":
             i += 1
             fmt = args[i]
@@ -100,16 +106,19 @@ def main():
         for job in sorted(rows, key=lambda j: fs.array_sort_key(fs.job_label(j))):
             if fs.is_terminal(job):
                 continue
+            # `squeue --start` reports estimates only for jobs not yet started (pending ones).
+            if start_mode and job["state"] != "PENDING":
+                continue
             if states is not None and job["state"] not in states and "ALL" not in states:
                 continue
-            if collapse and fs.is_array_task(job) and job["state"] == "PENDING":
+            if not start_mode and collapse and fs.is_array_task(job) and job["state"] == "PENDING":
                 grp = pending_arrays.setdefault(
                     job["array_base"],
                     {"tasks": [], "job": job, "throttle": job.get("array_throttle")},
                 )
                 grp["tasks"].append(job["array_task"])
                 continue
-            lines.append(render(fmt, job))
+            lines.append(render(fmt, job, start_mode=start_mode))
         for base in sorted(pending_arrays, key=int):
             grp = pending_arrays[base]
             collapsed_id = "%s_[%s]" % (base, fs.collapse_spec(grp["tasks"], grp["throttle"]))

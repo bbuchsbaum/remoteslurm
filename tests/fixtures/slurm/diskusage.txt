@@ -1,0 +1,5 @@
+                            Description                Space         # of files
+                  /home (user def-brad)        88GiB/ 100GiB         767K/1000K
+               /scratch (user def-brad)      1122GiB/  25TiB        1264K/  10M
+            /project (project def-brad)         0  B/1024GiB           7 /2000K
+            /project (project rrg-brad)        16TiB/  50TiB        2013K/ 100M
