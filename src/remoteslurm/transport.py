@@ -197,7 +197,8 @@ class SSHTransport(Transport):
         return (
             "D='';"
             f"for c in {dir_expr}; do "
-            'if mkdir -p "$c" 2>/dev/null && [ -w "$c" ]; then D="$c"; break; fi; done;'
+            'if mkdir -p "$c" 2>/dev/null && [ -w "$c" ] && [ -O "$c" ]; '
+            'then chmod 700 "$c"; D="$c"; break; fi; done;'
             'if [ -z "$D" ]; then echo "REMOTESLURM-ERROR no writable install dir" >&2; '
             "exit 97; fi;"
             f'P="$D/{name}";'
@@ -214,8 +215,10 @@ class SSHTransport(Transport):
 
     def spawn(self) -> subprocess.Popen[bytes]:
         self.ensure_master()
+        # The user's login shell may be csh/tcsh; always run the POSIX snippet under sh.
+        remote_cmd = "sh -c " + shlex.quote(self.remote_bootstrap_script())
         proc = subprocess.Popen(
-            [*self._ssh_base(), self.alias, self.remote_bootstrap_script()],
+            [*self._ssh_base(), self.alias, remote_cmd],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

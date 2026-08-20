@@ -10,7 +10,7 @@ import time
 from concurrent.futures import Future
 from typing import Any
 
-from .errors import RemoteSlurmError, RemoteTimeout, SessionDied, from_stub_error
+from .errors import NotConnected, RemoteTimeout, SessionDied, from_stub_error
 from .transport import Transport
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,8 @@ READY_PREFIX = b"REMOTESLURM-READY"
 ERROR_PREFIX = b"REMOTESLURM-ERROR"
 DEFAULT_TIMEOUT = 60.0
 READY_TIMEOUT = 45.0
+STALE_SECONDS = 90.0  # idle longer than this -> probe before reuse
+PROBE_TIMEOUT = 10.0
 
 
 class Session:
@@ -226,10 +228,39 @@ class Session:
         *,
         timeout: float | None = DEFAULT_TIMEOUT,
     ) -> Any:
+        if op != "ping" and self.alive and time.time() - self.last_used > STALE_SECONDS:
+            self._probe()
         fut = self.submit(op, args)
         try:
             return fut.result(timeout=timeout)
         except TimeoutError as e:
+            with self._lock:
+                for rid, f in list(self._pending.items()):
+                    if f is fut:
+                        self._pending.pop(rid, None)
+            self._raise_if_master_dead()
             raise RemoteTimeout(f"{op} did not complete within {timeout}s", op=op) from e
-        except RemoteSlurmError:
-            raise
+
+    def _probe(self) -> None:
+        """Cheap ping before reusing a session that sat idle (laptop sleep, dead master)."""
+        fut = self.submit("ping", {})
+        try:
+            fut.result(timeout=PROBE_TIMEOUT)
+        except TimeoutError:
+            with self._lock:
+                self._kill_locked()
+            self._raise_if_master_dead()
+            # master alive but stub wedged: the next submit() respawns it
+
+    def _raise_if_master_dead(self) -> None:
+        """If the transport can tell us the ssh master is gone, fail fast with an action."""
+        check = getattr(self.transport, "master_alive", None)
+        if check is None or check():
+            return
+        with self._lock:
+            self._kill_locked()
+        alias = getattr(self.transport, "alias", "?")
+        raise NotConnected(
+            f"ssh connection to {alias} is gone (laptop sleep or ControlPersist expired)",
+            action=f"run in a terminal: remoteslurm connect {alias}",
+        )

@@ -329,7 +329,6 @@ async def cancel(job_id: str, host: str | None = None) -> dict[str, Any]:
 
     def f(c: Cluster) -> dict[str, Any]:
         r = c.cancel(ids)
-        r["cancelled"] = ids
         return r
 
     return await _guard(host, f)

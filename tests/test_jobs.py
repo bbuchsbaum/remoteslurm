@@ -58,7 +58,8 @@ def test_submit_returns_job_and_records_registry(cluster, sandbox, _isolated_sta
     assert rec["workdir"]
     assert rec["last_state"] == "PENDING"
     # the stdout path lives in the sandbox, next to the generated script
-    assert Path(rec["stdout_path"]).parent == Path(rec["script_path"]).parent
+    # jobs run from $HOME by default (not from the generated-script directory)
+    assert Path(rec["stdout_path"]).parent == Path(cluster.home)
 
 
 def test_submit_argument_validation(cluster):

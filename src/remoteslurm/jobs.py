@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -37,62 +40,71 @@ class JobRecord:
 
 
 class JobRegistry:
-    """Per-host JSON file of jobs submitted through remoteslurm (survives agent restarts)."""
+    """Per-host JSON file of jobs submitted through remoteslurm (survives agent restarts).
+
+    Several processes (CLI invocations, the MCP server, the daemon) may write the same file,
+    so every mutation re-reads the file under an exclusive ``flock`` and merges by job id.
+    """
 
     def __init__(self, host: str, base: Path | None = None) -> None:
         self.path = (base or state_dir()) / host / "jobs.json"
         self._lock = threading.Lock()
-        self._jobs: dict[str, JobRecord] | None = None
 
-    def _load(self) -> dict[str, JobRecord]:
-        if self._jobs is None:
-            self._jobs = {}
-            if self.path.exists():
-                try:
-                    data = json.loads(self.path.read_text("utf-8"))
-                    for d in data.get("jobs", []):
-                        known = {k: v for k, v in d.items() if k in JobRecord.__dataclass_fields__}
-                        self._jobs[known["job_id"]] = JobRecord(**known)
-                except (OSError, ValueError, TypeError, KeyError):
-                    pass
-        return self._jobs
+    def _read_file(self) -> dict[str, JobRecord]:
+        jobs: dict[str, JobRecord] = {}
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text("utf-8"))
+                for d in data.get("jobs", []):
+                    known = {k: v for k, v in d.items() if k in JobRecord.__dataclass_fields__}
+                    jobs[known["job_id"]] = JobRecord(**known)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        return jobs
 
-    def _save(self) -> None:
-        assert self._jobs is not None
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        payload = {"jobs": [asdict(j) for j in self._jobs.values()]}
+    def _write_file(self, jobs: dict[str, JobRecord]) -> None:
+        tmp = self.path.with_name(f"jobs.{os.getpid()}.{threading.get_ident()}.tmp")
+        payload = {"jobs": [asdict(j) for j in jobs.values()]}
         tmp.write_text(json.dumps(payload, indent=1), "utf-8")
         os.replace(tmp, self.path)
 
+    @contextmanager
+    def _locked(self) -> Iterator[dict[str, JobRecord]]:
+        """Yield the on-disk records under an exclusive lock; write back on exit."""
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path.with_suffix(".lock"), "w") as lf:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                try:
+                    jobs = self._read_file()
+                    yield jobs
+                    self._write_file(jobs)
+                finally:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+
     def get(self, job_id: str) -> JobRecord | None:
         with self._lock:
-            return self._load().get(job_id)
+            return self._read_file().get(job_id)
 
     def all(self) -> list[JobRecord]:
         with self._lock:
-            return sorted(self._load().values(), key=lambda j: j.submit_time)
+            return sorted(self._read_file().values(), key=lambda j: j.submit_time)
 
     def put(self, rec: JobRecord) -> None:
-        with self._lock:
-            self._load()[rec.job_id] = rec
-            self._save()
+        with self._locked() as jobs:
+            jobs[rec.job_id] = rec
 
     def update(self, job_id: str, **fields: Any) -> None:
-        with self._lock:
-            rec = self._load().get(job_id)
+        with self._locked() as jobs:
+            rec = jobs.get(job_id)
             if rec is None:
                 return
             for k, v in fields.items():
                 setattr(rec, k, v)
-            self._save()
 
     def forget(self, job_id: str) -> bool:
-        with self._lock:
-            ok = self._load().pop(job_id, None) is not None
-            if ok:
-                self._save()
-            return ok
+        with self._locked() as jobs:
+            return jobs.pop(job_id, None) is not None
 
     def audit(self, event: str, **data: Any) -> None:
         """Append-only audit log next to the registry (run/write/cancel/submit)."""
@@ -431,6 +443,12 @@ class SlurmOps:
                 callback(st)
             if st.terminal:
                 return st
+            if st.source == "unknown":
+                raise SlurmError(
+                    f"job {job_id} is not known to squeue, scontrol or sacct",
+                    job_id=job_id,
+                    action="check the job id; if it just finished, accounting may be delayed",
+                )
             if timeout is not None and time.time() - t0 > timeout:
                 raise RemoteTimeout(
                     f"job {job_id} not finished after {timeout}s (state {st.state})",

@@ -152,28 +152,24 @@ def _decode(b):
 
 
 def _tail_bytes(f, size, nlines, max_bytes):
-    """Return the last nlines lines (bounded by max_bytes) of an open binary file."""
+    """Return (last nlines lines bounded by max_bytes, bytes skipped before them)."""
     if size == 0:
         return b"", 0
     want = min(size, max_bytes)
-    f.seek(size - want)
+    start = size - want
+    f.seek(start)
     data = f.read(want)
-    # drop partial first line if we did not start at the beginning
-    truncated_head = want < size
-    parts = data.split(b"\n")
-    if data.endswith(b"\n"):
-        parts = parts[:-1]
-    if len(parts) > nlines:
-        parts = parts[-nlines:]
-        truncated_head = True
-    elif truncated_head and len(parts) > 0:
-        # first line is partial; drop it unless it's all we have
-        if len(parts) > 1:
-            parts = parts[1:]
-    out = b"\n".join(parts)
-    if parts:
-        out += b"\n"
-    return out, (size - len(out)) if truncated_head else 0
+    partial_first = False
+    if start > 0:
+        f.seek(start - 1)
+        partial_first = f.read(1) != b"\n"
+    lines = data.splitlines(True)
+    if partial_first and len(lines) > 1:
+        lines = lines[1:]
+    if len(lines) > nlines:
+        lines = lines[-nlines:]
+    out = b"".join(lines)
+    return out, size - len(out)
 
 
 def _run(
@@ -641,7 +637,7 @@ def op_sbatch(args):
     else:
         raise StubError("invalid_arg", "either script or path is required")
     argv = ["sbatch", "--parsable"] + extra + [path]
-    res = _slurm(argv, timeout=120, cwd=cwd or os.path.dirname(path))
+    res = _slurm(argv, timeout=120, cwd=cwd or os.path.expanduser("~"))
     res["script_path"] = path
     res["argv"] = argv
     return res

@@ -14,6 +14,7 @@ Control ops start with an underscore: ``_status``, ``_stop``, ``_close`` (drop o
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ from typing import Any
 
 from .cluster import Cluster
 from .config import Config, state_dir
-from .errors import RemoteSlurmError, from_stub_error
+from .errors import RemoteSlurmError, RemoteTimeout, SessionDied, from_stub_error
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ ENV_SOCKET = "REMOTESLURM_SOCKET"
 ENV_IDLE = "REMOTESLURM_DAEMON_IDLE"
 DEFAULT_IDLE_SECONDS = 4 * 3600
 SPAWN_WAIT_SECONDS = 8.0
+READY_GRACE = 60.0  # first call may include a 45 s stub bootstrap
 
 
 def socket_path() -> Path:
@@ -61,6 +63,10 @@ def _error_payload(e: RemoteSlurmError) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- server side
+class DaemonAlreadyRunning(RuntimeError):
+    pass
+
+
 class _Handler(socketserver.StreamRequestHandler):
     server: DaemonServer
 
@@ -99,6 +105,14 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
 
     def __init__(self, path: Path, idle_seconds: float, config_path: Path | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # One daemon per socket: hold an exclusive lock for our whole lifetime so two CLIs
+        # racing to spawn cannot both bind (the loser would orphan the winner's ssh session).
+        self._lockfile = open(path.with_suffix(".lock"), "w")
+        try:
+            fcntl.flock(self._lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            self._lockfile.close()
+            raise DaemonAlreadyRunning(str(path)) from e
         if path.exists():
             path.unlink()
         super().__init__(str(path), _Handler)
@@ -179,6 +193,11 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
                 self.path.unlink()
             except OSError:
                 pass
+            try:
+                fcntl.flock(self._lockfile, fcntl.LOCK_UN)
+                self._lockfile.close()
+            except OSError:
+                pass
 
     def _idle_watch(self) -> None:
         while not self._stop.is_set():
@@ -198,26 +217,43 @@ def serve(path: Path | None = None, idle_seconds: float | None = None) -> None:
         else float(os.environ.get(ENV_IDLE, DEFAULT_IDLE_SECONDS))
     )
     cfgp = os.environ.get("REMOTESLURM_CONFIG")
-    srv = DaemonServer(path, idle, Path(cfgp).expanduser() if cfgp else None)
+    try:
+        srv = DaemonServer(path, idle, Path(cfgp).expanduser() if cfgp else None)
+    except DaemonAlreadyRunning:
+        log.info("another daemon owns %s; exiting", path)
+        return
     srv.serve()
 
 
 # --------------------------------------------------------------------------- client side
 def _request(path: Path, req: dict[str, Any], timeout: float | None) -> Any:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(5.0)
-        s.connect(str(path))
-        s.settimeout((timeout or 60.0) + 10.0)
-        s.sendall(json.dumps(req, separators=(",", ":")).encode("utf-8") + b"\n")
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(1 << 16)
-            if not chunk:
-                break
-            buf += chunk
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5.0)
+            s.connect(str(path))
+            s.settimeout((timeout or 60.0) + READY_GRACE)
+            s.sendall(json.dumps(req, separators=(",", ":")).encode("utf-8") + b"\n")
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(1 << 16)
+                if not chunk:
+                    break
+                buf += chunk
+    except TimeoutError as e:
+        raise RemoteTimeout(
+            f"daemon did not answer {req.get('op')} in time", op=req.get("op")
+        ) from e
+    except OSError as e:
+        raise SessionDied(
+            f"cannot reach the remoteslurm daemon at {path}: {e}",
+            action="retry (the daemon restarts on demand) or use --no-daemon",
+        ) from e
     if not buf:
-        raise RemoteSlurmError("daemon closed the connection without a reply")
-    msg = json.loads(buf)
+        raise SessionDied("daemon closed the connection without a reply", action="retry")
+    try:
+        msg = json.loads(buf)
+    except ValueError as e:
+        raise SessionDied("daemon sent an undecodable reply") from e
     if msg.get("ok"):
         return msg.get("result")
     raise from_stub_error(msg.get("error") or {})

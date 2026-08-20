@@ -6,6 +6,7 @@ import argparse
 import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -421,12 +422,21 @@ def _rsync(c: Cluster, src: str, dest: str, *, to_remote: bool, args: argparse.N
     if not shutil.which("rsync"):
         raise InvalidArgument("rsync not found locally")
     alias = c.transport.alias
-    # expand ~ and $VARS remotely before handing to rsync
-    remote = c.run(["sh", "-c", f'printf %s "{dest if to_remote else src}"'])["stdout"]
-    rs = ["rsync", "-az", "--info=progress2", "-e", "ssh -o ControlMaster=no -o BatchMode=yes"]
+    # expand ~ and $VARS remotely without interpolating into a shell string; -s protects args
+    target = dest if to_remote else src
+    remote = c.run(["sh", "-c", 'eval "printf %s $1"', "_", target.replace('"', "")])["stdout"]
+    remote = remote or target
+    rs = [
+        "rsync",
+        "-az",
+        "-s",
+        "--info=progress2",
+        "-e",
+        "ssh -o ControlMaster=no -o BatchMode=yes",
+    ]
     rs += [src, f"{alias}:{remote}"] if to_remote else [f"{alias}:{remote}", dest]
     if not args.json:
-        print(" ".join(rs), file=sys.stderr)
+        print(" ".join(shlex.quote(x) for x in rs), file=sys.stderr)
     r = subprocess.run(rs)
     return r.returncode
 

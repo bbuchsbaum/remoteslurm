@@ -85,3 +85,21 @@ README.md, docs/plans/v1-design.md (this plan, copied into repo), .github/workfl
 
 ## Explicitly out of v1
 Quotas/usage reporting, MCP streaming `follow`, sqlite registry, heterogeneous jobs, async transport, per-cluster job templates (easy follow-up), non-OpenSSH transports.
+
+## Implementation notes (2026-08-20, post-review)
+
+- **Added: local session daemon** (`daemon.py`). Measured: every new ssh channel to trillium costs ~2 s
+  even over a live master (PAM + rc files), so a per-invocation CLI would never be fast. The CLI now
+  talks to a per-user unix-socket daemon that keeps stub sessions warm (auto-spawned, flock-guarded,
+  idle exit 4 h). Warm CLI calls: ~150 ms. `--no-daemon` / `REMOTESLURM_NO_DAEMON` bypass it.
+- Liveness is lazy rather than a background heartbeat: a session idle > 90 s is probed with a 10 s
+  ping before reuse; any timeout checks `ssh -O check` and raises `not_connected` (with action) if the
+  master is gone. Verified live: `ssh -O exit` -> exit code 3 with the connect instruction, no hang.
+- The bootstrap snippet runs under `sh -c` (csh/tcsh login shells), install dirs must be owned by
+  the user (`[ -O ]`, chmod 700).
+- Job registry writes are merge-on-write under `flock` (multiple CLIs + MCP server share the file).
+- `wait()` raises `slurm_error` for jobs unknown to squeue/scontrol/sacct instead of spinning.
+- Jobs submitted from script content run with cwd `$HOME` unless `cwd` is given.
+- Open (low severity, from review): no stub `cancel` op / separate pool for long `run`s; `%A/%a`
+  output-path templates for array tasks; `scancel` ownership check when `squeue -j` fails; registry
+  pruning; `squeue --me` needs Slurm >= 20.02.
