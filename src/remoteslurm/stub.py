@@ -1,0 +1,842 @@
+# remoteslurm remote stub.
+#
+# This single file is shipped to the remote login node and executed with the
+# system python3 there. It MUST stay:
+#   * stdlib-only,
+#   * Python 3.6 compatible (no walrus, no f-string "=", no PEP 585/604 types,
+#     no `from __future__ import annotations`),
+#   * free of any shell usage (argv lists only).
+#
+# Protocol (JSON lines over stdin/stdout):
+#   client -> stub : {"id": <str>, "op": <str>, "args": {...}}
+#   stub   -> client: "\x1e" + json({"id", "ok": bool, "result"|"error", "done": true})
+# The stub announces readiness with a single line:
+#   REMOTESLURM-READY <protocol> <pid> <python-version>
+# Everything printed before that line (rc files, module noise) is discarded by
+# the client, and every response line is prefixed with the RS byte (0x1e) so
+# stray output from other sources is skipped.
+
+import base64
+import errno
+import fnmatch
+import getpass
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import stat as statmod
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+
+PROTOCOL = 1
+RS = "\x1e"
+WORKERS = 4
+
+DEFAULT_READ_BYTES = 64 * 1024
+MAX_READ_BYTES = 4 * 1024 * 1024
+MAX_WRITE_BYTES = 8 * 1024 * 1024
+DEFAULT_LS_LIMIT = 200
+MAX_LS_LIMIT = 2000
+DEFAULT_GREP_MATCHES = 200
+MAX_GREP_MATCHES = 5000
+GREP_MAX_FILE_SIZE = 50 * 1024 * 1024
+DEFAULT_GLOB_LIMIT = 500
+MAX_GLOB_LIMIT = 10000
+DEFAULT_RUN_TIMEOUT = 60
+MAX_RUN_TIMEOUT = 3600
+DEFAULT_RUN_OUTPUT = 64 * 1024
+MAX_RUN_OUTPUT = 4 * 1024 * 1024
+
+
+class StubError(Exception):
+    def __init__(self, code, message, **details):
+        Exception.__init__(self, message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+    def to_dict(self):
+        d = {"code": self.code, "message": self.message}
+        d.update(self.details)
+        return d
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def _path(p, must_exist=False):
+    if not isinstance(p, str) or not p:
+        raise StubError("invalid_arg", "path must be a non-empty string")
+    if "\x00" in p:
+        raise StubError("invalid_arg", "path contains NUL byte")
+    p = os.path.expanduser(os.path.expandvars(p))
+    if not os.path.isabs(p):
+        p = os.path.join(os.getcwd(), p)
+    p = os.path.normpath(p)
+    if must_exist and not os.path.lexists(p):
+        raise StubError("not_found", "no such path: %s" % p, path=p)
+    return p
+
+
+def _os_error(e, p):
+    if isinstance(e, FileNotFoundError):
+        return StubError("not_found", "no such path: %s" % p, path=p)
+    if isinstance(e, PermissionError):
+        return StubError("permission", "permission denied: %s" % p, path=p)
+    if isinstance(e, IsADirectoryError):
+        return StubError("invalid_arg", "is a directory: %s" % p, path=p)
+    if isinstance(e, NotADirectoryError):
+        return StubError("invalid_arg", "not a directory: %s" % p, path=p)
+    return StubError("error", "%s: %s" % (type(e).__name__, e), path=p)
+
+
+def _clamp(v, default, hi, lo=1):
+    if v is None:
+        return default
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        raise StubError("invalid_arg", "expected integer, got %r" % (v,))
+    return max(lo, min(v, hi))
+
+
+def _ftype(st):
+    m = st.st_mode
+    if statmod.S_ISDIR(m):
+        return "dir"
+    if statmod.S_ISREG(m):
+        return "file"
+    if statmod.S_ISLNK(m):
+        return "link"
+    return "other"
+
+
+def _stat_entry(path, name=None, follow=True):
+    try:
+        lst = os.lstat(path)
+    except OSError as e:
+        raise _os_error(e, path)
+    entry = {
+        "name": name if name is not None else os.path.basename(path),
+        "type": _ftype(lst),
+        "size": lst.st_size,
+        "mtime": lst.st_mtime,
+        "mode": statmod.S_IMODE(lst.st_mode),
+        "uid": lst.st_uid,
+    }
+    if statmod.S_ISLNK(lst.st_mode):
+        try:
+            entry["target"] = os.readlink(path)
+            if follow:
+                st = os.stat(path)
+                entry["type"] = _ftype(st)
+                entry["size"] = st.st_size
+                entry["link"] = True
+        except OSError:
+            entry["broken"] = True
+    return entry
+
+
+def _is_binary(chunk):
+    return b"\x00" in chunk
+
+
+def _decode(b):
+    return b.decode("utf-8", errors="replace")
+
+
+def _tail_bytes(f, size, nlines, max_bytes):
+    """Return the last nlines lines (bounded by max_bytes) of an open binary file."""
+    if size == 0:
+        return b"", 0
+    want = min(size, max_bytes)
+    f.seek(size - want)
+    data = f.read(want)
+    # drop partial first line if we did not start at the beginning
+    truncated_head = want < size
+    parts = data.split(b"\n")
+    if data.endswith(b"\n"):
+        parts = parts[:-1]
+    if len(parts) > nlines:
+        parts = parts[-nlines:]
+        truncated_head = True
+    elif truncated_head and len(parts) > 0:
+        # first line is partial; drop it unless it's all we have
+        if len(parts) > 1:
+            parts = parts[1:]
+    out = b"\n".join(parts)
+    if parts:
+        out += b"\n"
+    return out, (size - len(out)) if truncated_head else 0
+
+
+def _run(
+    argv, timeout=DEFAULT_RUN_TIMEOUT, cwd=None, env=None, stdin=None, max_output=DEFAULT_RUN_OUTPUT
+):
+    if not isinstance(argv, (list, tuple)) or not argv or not all(isinstance(a, str) for a in argv):
+        raise StubError("invalid_arg", "argv must be a non-empty list of strings")
+    if cwd is not None:
+        cwd = _path(cwd, must_exist=True)
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        for k, v in env.items():
+            full_env[str(k)] = str(v)
+    t0 = time.time()
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=full_env,
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise StubError("not_found", "command not found: %s" % argv[0], command=argv[0])
+    except PermissionError:
+        raise StubError("permission", "cannot execute: %s" % argv[0], command=argv[0])
+    try:
+        out, err = proc.communicate(
+            input=stdin.encode("utf-8") if stdin is not None else None, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        raise StubError(
+            "timeout",
+            "command timed out after %ss: %s" % (timeout, " ".join(argv[:4])),
+            stdout=_decode(out[-max_output:]),
+            stderr=_decode(err[-max_output:]),
+        )
+    dur = time.time() - t0
+    res = {
+        "rc": proc.returncode,
+        "stdout": _decode(out[:max_output]),
+        "stderr": _decode(err[:max_output]),
+        "stdout_truncated": len(out) > max_output,
+        "stderr_truncated": len(err) > max_output,
+        "duration": round(dur, 3),
+    }
+    return res
+
+
+def _which(name):
+    return shutil.which(name)
+
+
+# --------------------------------------------------------------------------- ops
+
+
+def op_ping(args):
+    return {"pid": os.getpid(), "time": time.time(), "protocol": PROTOCOL}
+
+
+def op_info(args):
+    env_keys = ["SCRATCH", "PROJECT", "HOME", "USER", "SLURM_CLUSTER_NAME", "CC_CLUSTER", "TMPDIR"]
+    env = {k: os.environ[k] for k in env_keys if k in os.environ}
+    slurm_version = None
+    if _which("sinfo"):
+        try:
+            r = _run(["sinfo", "--version"], timeout=10)
+            slurm_version = (r["stdout"] or r["stderr"]).strip()
+        except StubError:
+            pass
+    return {
+        "user": getpass.getuser(),
+        "hostname": socket.gethostname(),
+        "home": os.path.expanduser("~"),
+        "cwd": os.getcwd(),
+        "python": sys.version.split()[0],
+        "stub": os.path.abspath(__file__),
+        "protocol": PROTOCOL,
+        "env": env,
+        "slurm_version": slurm_version,
+        "slurm_tools": {
+            n: bool(_which(n))
+            for n in ("sbatch", "squeue", "sacct", "scancel", "scontrol", "sinfo")
+        },
+    }
+
+
+def op_ls(args):
+    p = _path(args.get("path", "~"), must_exist=True)
+    limit = _clamp(args.get("limit"), DEFAULT_LS_LIMIT, MAX_LS_LIMIT)
+    hidden = bool(args.get("hidden", True))
+    token = args.get("token")
+    start = 0
+    if token:
+        try:
+            start = int(token)
+        except ValueError:
+            raise StubError("invalid_arg", "bad pagination token")
+    if not os.path.isdir(p):
+        return {
+            "path": p,
+            "entries": [_stat_entry(p)],
+            "total": 1,
+            "truncated": False,
+            "next_token": None,
+        }
+    try:
+        names = os.listdir(p)
+    except OSError as e:
+        raise _os_error(e, p)
+    if not hidden:
+        names = [n for n in names if not n.startswith(".")]
+    names.sort()
+    total = len(names)
+    sel = names[start : start + limit]
+    entries = []
+    for n in sel:
+        try:
+            entries.append(_stat_entry(os.path.join(p, n), name=n))
+        except StubError as e:
+            entries.append({"name": n, "type": "other", "error": e.message})
+    end = start + len(sel)
+    return {
+        "path": p,
+        "entries": entries,
+        "total": total,
+        "offset": start,
+        "truncated": end < total,
+        "next_token": str(end) if end < total else None,
+    }
+
+
+def op_stat(args):
+    p = _path(args.get("path"), must_exist=True)
+    e = _stat_entry(p)
+    e["path"] = p
+    return e
+
+
+def op_read(args):
+    p = _path(args.get("path"), must_exist=True)
+    max_bytes = _clamp(args.get("max_bytes"), DEFAULT_READ_BYTES, MAX_READ_BYTES)
+    offset = args.get("offset", 0) or 0
+    tail = args.get("tail")  # last N lines
+    head = args.get("head")  # first N lines
+    if os.path.isdir(p):
+        raise StubError("invalid_arg", "is a directory: %s" % p, path=p)
+    try:
+        size = os.path.getsize(p)
+        with io.open(p, "rb") as f:
+            probe = f.read(8192)
+            binary = _is_binary(probe)
+            f.seek(0)
+            if tail is not None:
+                nlines = _clamp(tail, 50, 100000)
+                data, skipped = _tail_bytes(f, size, nlines, max_bytes)
+                offset = skipped
+                eof = True
+                truncated = skipped > 0
+            else:
+                if offset < 0:
+                    offset = max(0, size + offset)
+                f.seek(offset)
+                if head is not None:
+                    nlines = _clamp(head, 50, 100000)
+                    buf = []
+                    n = 0
+                    got = 0
+                    while n < nlines and got < max_bytes:
+                        line = f.readline(max_bytes - got)
+                        if not line:
+                            break
+                        buf.append(line)
+                        got += len(line)
+                        n += 1
+                    data = b"".join(buf)
+                    eof = f.tell() >= size
+                    truncated = not eof
+                else:
+                    data = f.read(max_bytes)
+                    eof = f.tell() >= size
+                    truncated = not eof
+    except OSError as e:
+        raise _os_error(e, p)
+    res = {
+        "path": p,
+        "size": size,
+        "offset": offset,
+        "length": len(data),
+        "eof": eof,
+        "truncated": truncated,
+        "binary": binary,
+    }
+    if binary:
+        res["content_b64"] = base64.b64encode(data).decode("ascii")
+    else:
+        res["content"] = _decode(data)
+        res["lines"] = data.count(b"\n")
+    return res
+
+
+def op_write(args):
+    p = _path(args.get("path"))
+    if "content_b64" in args:
+        data = base64.b64decode(args["content_b64"])
+    else:
+        c = args.get("content", "")
+        if not isinstance(c, str):
+            raise StubError("invalid_arg", "content must be a string")
+        data = c.encode("utf-8")
+    if len(data) > MAX_WRITE_BYTES:
+        raise StubError("too_large", "write exceeds %d bytes" % MAX_WRITE_BYTES, size=len(data))
+    append = bool(args.get("append", False))
+    mkdirs = bool(args.get("mkdirs", False))
+    mode = args.get("mode")
+    d = os.path.dirname(p)
+    try:
+        if mkdirs and d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        if append:
+            with io.open(p, "ab") as f:
+                f.write(data)
+        else:
+            tmp = "%s.%d.tmp" % (p, os.getpid())
+            with io.open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, p)
+        if mode is not None:
+            os.chmod(p, int(mode))
+        st = os.stat(p)
+    except OSError as e:
+        raise _os_error(e, p)
+    return {"path": p, "size": st.st_size, "written": len(data)}
+
+
+def op_mkdir(args):
+    p = _path(args.get("path"))
+    try:
+        os.makedirs(p, exist_ok=True)
+    except OSError as e:
+        raise _os_error(e, p)
+    return {"path": p}
+
+
+def op_rm(args):
+    p = _path(args.get("path"), must_exist=True)
+    recursive = bool(args.get("recursive", False))
+    home = os.path.expanduser("~")
+    if p in ("/", home) or p == os.path.dirname(home):
+        raise StubError("invalid_arg", "refusing to remove %s" % p, path=p)
+    try:
+        if os.path.isdir(p) and not os.path.islink(p):
+            if recursive:
+                shutil.rmtree(p)
+            else:
+                os.rmdir(p)
+        else:
+            os.remove(p)
+    except OSError as e:
+        if getattr(e, "errno", None) == errno.ENOTEMPTY:
+            raise StubError("invalid_arg", "directory not empty (use recursive): %s" % p, path=p)
+        raise _os_error(e, p)
+    return {"path": p, "removed": True}
+
+
+def op_glob(args):
+    root = _path(args.get("path", "."), must_exist=True)
+    pattern = args.get("pattern", "*")
+    limit = _clamp(args.get("limit"), DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT)
+    max_depth = _clamp(args.get("max_depth"), 10, 100, lo=0)
+    want_type = args.get("type")  # file|dir|None
+    hidden = bool(args.get("hidden", False))
+    results = []
+    scanned = 0
+    truncated = False
+    root_depth = root.rstrip("/").count("/")
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.rstrip("/").count("/") - root_depth
+        if not hidden:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            filenames = [f for f in filenames if not f.startswith(".")]
+        if depth >= max_depth:
+            dirnames[:] = []
+        dirnames.sort()
+        cands = []
+        if want_type in (None, "dir"):
+            cands.extend((d, "dir") for d in dirnames)
+        if want_type in (None, "file"):
+            cands.extend((f, "file") for f in sorted(filenames))
+        for name, t in cands:
+            scanned += 1
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root)
+            if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(rel, pattern):
+                if len(results) >= limit:
+                    truncated = True
+                    break
+                try:
+                    st = os.lstat(full)
+                    results.append(
+                        {"path": full, "type": t, "size": st.st_size, "mtime": st.st_mtime}
+                    )
+                except OSError:
+                    results.append({"path": full, "type": t})
+        if truncated:
+            break
+    return {"root": root, "matches": results, "scanned": scanned, "truncated": truncated}
+
+
+def op_grep(args):
+    pattern = args.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        raise StubError("invalid_arg", "pattern required")
+    root = _path(args.get("path", "."), must_exist=True)
+    glob = args.get("glob")
+    limit = _clamp(args.get("max_matches"), DEFAULT_GREP_MATCHES, MAX_GREP_MATCHES)
+    ignore_case = bool(args.get("ignore_case", False))
+    max_depth = _clamp(args.get("max_depth"), 10, 100, lo=0)
+    max_file_size = _clamp(args.get("max_file_size"), GREP_MAX_FILE_SIZE, 1 << 31)
+    hidden = bool(args.get("hidden", False))
+    context = _clamp(args.get("context"), 0, 5, lo=0)
+    max_line = 500
+    try:
+        rx = re.compile(pattern.encode("utf-8"), re.IGNORECASE if ignore_case else 0)
+    except re.error as e:
+        raise StubError("invalid_arg", "bad regex: %s" % e)
+    matches = []
+    files_scanned = 0
+    files_skipped = 0
+    truncated = False
+
+    def scan(full):
+        nonlocal truncated
+        try:
+            st = os.stat(full)
+            if not statmod.S_ISREG(st.st_mode):
+                return
+            if st.st_size > max_file_size:
+                return "skipped"
+            with io.open(full, "rb") as f:
+                head = f.read(8192)
+                if _is_binary(head):
+                    return "skipped"
+                f.seek(0)
+                prev = []
+                for i, line in enumerate(f, 1):
+                    if rx.search(line):
+                        m = {
+                            "file": full,
+                            "line": i,
+                            "text": _decode(line.rstrip(b"\r\n")[:max_line]),
+                        }
+                        if context:
+                            m["before"] = [_decode(x.rstrip(b"\r\n")[:max_line]) for x in prev]
+                        matches.append(m)
+                        if len(matches) >= limit:
+                            truncated = True
+                            return
+                    if context:
+                        prev.append(line)
+                        if len(prev) > context:
+                            prev.pop(0)
+        except OSError:
+            return "skipped"
+
+    if os.path.isfile(root):
+        files_scanned = 1
+        if scan(root) == "skipped":
+            files_skipped += 1
+    else:
+        root_depth = root.rstrip("/").count("/")
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = dirpath.rstrip("/").count("/") - root_depth
+            if not hidden:
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                filenames = [f for f in filenames if not f.startswith(".")]
+            if depth >= max_depth:
+                dirnames[:] = []
+            dirnames.sort()
+            for name in sorted(filenames):
+                if glob and not fnmatch.fnmatch(name, glob):
+                    continue
+                files_scanned += 1
+                if scan(os.path.join(dirpath, name)) == "skipped":
+                    files_skipped += 1
+                if truncated:
+                    break
+            if truncated:
+                break
+    return {
+        "root": root,
+        "matches": matches,
+        "files_scanned": files_scanned,
+        "files_skipped": files_skipped,
+        "truncated": truncated,
+    }
+
+
+def op_run(args):
+    argv = args.get("argv")
+    cmd = args.get("cmd")
+    if cmd is not None:
+        if not isinstance(cmd, str):
+            raise StubError("invalid_arg", "cmd must be a string")
+        shell = ["bash", "-lc", cmd] if args.get("login") else ["bash", "-c", cmd]
+        argv = shell
+    timeout = _clamp(args.get("timeout"), DEFAULT_RUN_TIMEOUT, MAX_RUN_TIMEOUT)
+    max_output = _clamp(args.get("max_output"), DEFAULT_RUN_OUTPUT, MAX_RUN_OUTPUT)
+    return _run(
+        argv,
+        timeout=timeout,
+        cwd=args.get("cwd"),
+        env=args.get("env"),
+        stdin=args.get("stdin"),
+        max_output=max_output,
+    )
+
+
+def _slurm(argv, timeout=60, cwd=None, stdin=None):
+    if not _which(argv[0]):
+        raise StubError(
+            "slurm_error", "%s not found on PATH (is this a Slurm login node?)" % argv[0]
+        )
+    return _run(argv, timeout=timeout, cwd=cwd, stdin=stdin, max_output=MAX_RUN_OUTPUT)
+
+
+def op_sbatch(args):
+    """Submit a job. Either `script` (content) or `path` (existing file) must be given.
+
+    Returns the raw sbatch result plus the script path; the client parses the job id.
+    """
+    script = args.get("script")
+    path = args.get("path")
+    extra = args.get("args") or []
+    cwd = args.get("cwd")
+    if cwd is not None:
+        cwd = _path(cwd, must_exist=True)
+    if not isinstance(extra, list) or not all(isinstance(a, str) for a in extra):
+        raise StubError("invalid_arg", "args must be a list of strings")
+    if script is not None:
+        if not isinstance(script, str) or not script.strip():
+            raise StubError("invalid_arg", "script content is empty")
+        if path is None:
+            name = args.get("name") or "job"
+            name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:64]
+            jobdir = _path(
+                args.get("script_dir")
+                or os.path.join(cwd or os.path.expanduser("~"), ".remoteslurm", "scripts")
+            )
+            os.makedirs(jobdir, exist_ok=True)
+            path = os.path.join(
+                jobdir, "%s-%s-%d.sh" % (name, time.strftime("%Y%m%d-%H%M%S"), os.getpid())
+            )
+        else:
+            path = _path(path)
+        if not script.endswith("\n"):
+            script += "\n"
+        op_write({"path": path, "content": script, "mkdirs": True, "mode": 0o700})
+    elif path is not None:
+        path = _path(path, must_exist=True)
+    else:
+        raise StubError("invalid_arg", "either script or path is required")
+    argv = ["sbatch", "--parsable"] + extra + [path]
+    res = _slurm(argv, timeout=120, cwd=cwd or os.path.dirname(path))
+    res["script_path"] = path
+    res["argv"] = argv
+    return res
+
+
+def op_squeue(args):
+    fmt = args.get("format")
+    if not isinstance(fmt, str) or not fmt:
+        raise StubError("invalid_arg", "format required")
+    argv = ["squeue", "-h", "-o", fmt]
+    jobs = args.get("jobs")
+    if jobs:
+        argv += ["-j", ",".join(str(j) for j in jobs)]
+    user = args.get("user")
+    if user:
+        argv += ["-u", user]
+    elif not jobs:
+        argv += ["--me"]
+    if args.get("states"):
+        argv += ["-t", ",".join(args["states"])]
+    return _slurm(argv, timeout=60)
+
+
+def op_sacct(args):
+    fields = args.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise StubError("invalid_arg", "fields required")
+    argv = ["sacct", "-n", "-P", "--format=" + ",".join(fields)]
+    jobs = args.get("jobs")
+    if jobs:
+        argv += ["-j", ",".join(str(j) for j in jobs)]
+    if args.get("since"):
+        argv += ["-S", str(args["since"])]
+    if args.get("user"):
+        argv += ["-u", str(args["user"])]
+    if args.get("all_steps") is False:
+        argv += ["-X"]
+    return _slurm(argv, timeout=120)
+
+
+def op_scontrol(args):
+    what = args.get("what", "job")
+    ident = args.get("id")
+    if what not in ("job", "partition", "node", "config"):
+        raise StubError("invalid_arg", "unsupported scontrol entity")
+    argv = ["scontrol", "-o", "show", what]
+    if ident is not None:
+        argv.append(str(ident))
+    return _slurm(argv, timeout=60)
+
+
+def op_scancel(args):
+    jobs = args.get("jobs")
+    if not isinstance(jobs, list) or not jobs or not all(isinstance(j, str) for j in jobs):
+        raise StubError("invalid_arg", "jobs must be a non-empty list of job id strings")
+    if not all(re.match(r"^\d+(_\d+|_\[[\d,-]+\])?$", j) for j in jobs):
+        raise StubError("invalid_arg", "malformed job id(s)", jobs=jobs)
+    me = getpass.getuser()
+    # ownership check: only cancel jobs squeue attributes to us
+    chk = _slurm(["squeue", "-h", "-o", "%i|%u", "-j", ",".join(jobs)], timeout=60)
+    owned = set()
+    for line in chk["stdout"].splitlines():
+        parts = line.strip().split("|")
+        if len(parts) == 2 and parts[1] == me:
+            owned.add(parts[0])
+    base_ids = set(j.split("_")[0] for j in owned)
+    to_cancel = [j for j in jobs if j in owned or j.split("_")[0] in base_ids]
+    skipped = [j for j in jobs if j not in to_cancel]
+    result = {"cancelled": [], "skipped": skipped, "rc": 0, "stderr": ""}
+    if to_cancel:
+        res = _slurm(["scancel"] + to_cancel, timeout=60)
+        result["rc"] = res["rc"]
+        result["stderr"] = res["stderr"]
+        if res["rc"] == 0:
+            result["cancelled"] = to_cancel
+    return result
+
+
+def op_sinfo(args):
+    fmt = args.get("format") or "%P|%a|%l|%D|%T|%c|%m|%G"
+    return _slurm(["sinfo", "-h", "-o", fmt], timeout=60)
+
+
+OPS = {
+    "ping": op_ping,
+    "info": op_info,
+    "ls": op_ls,
+    "stat": op_stat,
+    "read": op_read,
+    "write": op_write,
+    "mkdir": op_mkdir,
+    "rm": op_rm,
+    "glob": op_glob,
+    "grep": op_grep,
+    "run": op_run,
+    "sbatch": op_sbatch,
+    "squeue": op_squeue,
+    "sacct": op_sacct,
+    "scontrol": op_scontrol,
+    "scancel": op_scancel,
+    "sinfo": op_sinfo,
+}
+
+
+# --------------------------------------------------------------------------- server loop
+
+
+class Server(object):
+    def __init__(self, out):
+        self.out = out
+        self.lock = threading.Lock()
+        self.pool = ThreadPoolExecutor(max_workers=WORKERS)
+        self.alive = True
+
+    def send(self, payload):
+        line = RS + json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
+        with self.lock:
+            try:
+                self.out.write(line)
+                self.out.flush()
+            except (BrokenPipeError, OSError):
+                self.alive = False
+
+    def handle(self, req):
+        rid = req.get("id")
+        op = req.get("op")
+        args = req.get("args") or {}
+        try:
+            fn = OPS.get(op)
+            if fn is None:
+                raise StubError("invalid_arg", "unknown op: %r" % (op,))
+            if not isinstance(args, dict):
+                raise StubError("invalid_arg", "args must be an object")
+            result = fn(args)
+            self.send({"id": rid, "ok": True, "result": result, "done": True})
+        except StubError as e:
+            self.send({"id": rid, "ok": False, "error": e.to_dict(), "done": True})
+        except Exception as e:  # pragma: no cover - defensive
+            self.send(
+                {
+                    "id": rid,
+                    "ok": False,
+                    "error": {
+                        "code": "error",
+                        "message": "%s: %s" % (type(e).__name__, e),
+                        "traceback": traceback.format_exc()[-2000:],
+                    },
+                    "done": True,
+                }
+            )
+
+    def serve(self, inp):
+        for raw in inp:
+            if not self.alive:
+                break
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                req = json.loads(raw)
+            except ValueError:
+                self.send(
+                    {
+                        "id": None,
+                        "ok": False,
+                        "error": {"code": "invalid_arg", "message": "bad json"},
+                        "done": True,
+                    }
+                )
+                continue
+            if req.get("op") == "shutdown":
+                self.send({"id": req.get("id"), "ok": True, "result": {"bye": True}, "done": True})
+                break
+            self.pool.submit(self.handle, req)
+        self.pool.shutdown(wait=True)
+
+
+def main():
+    # Force utf-8, line-buffered, no inheritance of odd locale settings.
+    out = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+    )
+    inp = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    try:
+        os.chdir(os.path.expanduser("~"))
+    except OSError:
+        pass
+    out.write("REMOTESLURM-READY %d %d %s\n" % (PROTOCOL, os.getpid(), sys.version.split()[0]))
+    out.flush()
+    srv = Server(out)
+    try:
+        srv.serve(inp)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+if __name__ == "__main__":
+    main()
