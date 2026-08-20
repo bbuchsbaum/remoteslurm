@@ -28,6 +28,15 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
 - Safety rails: `allow_run = false | "safe"` (safe = argv-only, executable allow-list, no `bash -c`);
   `protected_paths` block write/edit/rm/put/sync-delete unless forced; `confirm` list gates rm/cancel
   behind an explicit confirmation; recursive `rm` refuses `$SCRATCH`/`$PROJECT` roots and shallow paths.
+- Queue intelligence: `rslurm queue` (partitions, my accounts/QOS/limits, fair-share, pending jobs
+  with scheduler start estimates) and `rslurm quota`; MCP `queue_info`/`quota`. `diagnose` shows the
+  start estimate for a PENDING job.
+- Watch & events: `rslurm watch` (live state transitions, desktop notification on finish, exit code
+  reflects success), `rslurm events` (drain "what finished while I was away"), bounded MCP `wait`.
+- Housekeeping: registry auto-prune, `rslurm clean` for old generated scripts, superseded stubs
+  removed on bootstrap.
+- Live streaming (CLI): `rslurm run --stream` prints output as it arrives; `rslurm tail -f` uses a
+  stub-side follow op. Stub protocol bumped to v2 (multi-frame); non-streaming behavior unchanged.
 - Queue intelligence: `rslurm queue` (partitions with idle nodes, my accounts/QOS + limits,
   fair-share, my pending jobs with scheduler start estimates) and `rslurm quota` (Alliance
   `diskusage_report` via `quota_command`, else `df -h`); `Cluster.queue_info`/`estimate_start`/

@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,9 @@ class _Handler(socketserver.StreamRequestHandler):
             self._send({"ok": False, "error": {"code": "invalid_arg", "message": "bad json"}})
             return
         self.server.touch()
+        if req.get("stream"):
+            self._handle_stream(req)
+            return
         try:
             result = self.server.dispatch(req)
             self._send({"ok": True, "result": result})
@@ -96,12 +100,47 @@ class _Handler(socketserver.StreamRequestHandler):
                 {"ok": False, "error": {"code": "error", "message": f"{type(e).__name__}: {e}"}}
             )
 
-    def _send(self, obj: dict[str, Any]) -> None:
+    def _handle_stream(self, req: dict[str, Any]) -> None:
+        """Forward a streaming (multi-frame) response: one stub frame per line, terminal last.
+
+        Each yielded frame is the raw stub frame (``{"id","ok","chunk"|"result","done"}``); an
+        error terminates the stream with a ``done: true`` error frame. If the client goes away
+        (write fails), we stop iterating and close the generator, which runs ``call_stream``'s
+        cleanup and cancels the still-running stub op.
+        """
+        rid = req.get("id")
+        gen: Generator[dict[str, Any], None, None] | None = None
         try:
-            self.wfile.write(json.dumps(obj, separators=(",", ":")).encode("utf-8") + b"\n")
+            gen = self.server.dispatch_stream(req)
+            for frame in gen:
+                if not self._send_frame(frame):
+                    break
+        except RemoteSlurmError as e:
+            self._send_frame({"id": rid, "ok": False, "error": _error_payload(e), "done": True})
+        except Exception as e:  # pragma: no cover - defensive
+            log.exception("daemon stream failed")
+            self._send_frame(
+                {
+                    "id": rid,
+                    "ok": False,
+                    "error": {"code": "error", "message": f"{type(e).__name__}: {e}"},
+                    "done": True,
+                }
+            )
+        finally:
+            if gen is not None:
+                gen.close()  # runs call_stream's finally -> cancels the stub op if still live
+
+    def _send(self, obj: dict[str, Any]) -> None:
+        self._send_frame(obj)
+
+    def _send_frame(self, frame: dict[str, Any]) -> bool:
+        try:
+            self.wfile.write(json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n")
             self.wfile.flush()
+            return True
         except (BrokenPipeError, OSError):
-            pass
+            return False
 
 
 class DaemonServer(socketserver.ThreadingUnixStreamServer):
@@ -194,6 +233,21 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
             cancel_on_timeout=bool(req.get("cancel_on_timeout")),
             request_id=req.get("id"),
         )
+
+    def dispatch_stream(self, req: dict[str, Any]) -> Generator[dict[str, Any], None, None]:
+        """Return the stream of stub frames for a ``stream: true`` request.
+
+        ``timeout`` is passed through as-is (``None`` = no client-side stream deadline, e.g. a
+        long ``follow``); the ``id`` is the client-generated request id so a later ``_cancel``
+        on a second connection targets the same op.
+        """
+        op = str(req.get("op", ""))
+        host = req.get("host")
+        args = req.get("args") or {}
+        with self._lock:
+            self.calls += 1
+        c = self._cluster(host)
+        return c.session.call_stream(op, args, timeout=req.get("timeout"), request_id=req.get("id"))
 
     def serve(self) -> None:
         watchdog = threading.Thread(target=self._idle_watch, daemon=True)
@@ -384,6 +438,88 @@ class DaemonSession:
         except KeyboardInterrupt:
             self.cancel(rid)
             raise
+
+    def call_stream(
+        self,
+        op: str,
+        args: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Stream a multi-frame response over the daemon socket, yielding each stub frame.
+
+        Opens its own connection, sends the request with ``stream: true``, and reads frames
+        line-by-line until the terminal frame (``done: true``). ``timeout`` is the total stream
+        budget (``None`` = block indefinitely, used by ``follow``/``tail -f``). On early break,
+        timeout, KeyboardInterrupt, or a truncated stream, sends ``_cancel`` on a second
+        connection so the remote op is not left running.
+        """
+        rid = request_id or uuid.uuid4().hex[:12]
+        req = {
+            "host": self.host,
+            "op": op,
+            "args": args or {},
+            "timeout": timeout,
+            "id": rid,
+            "stream": True,
+        }
+        finished = False
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            try:
+                s.settimeout(5.0)
+                s.connect(str(self.path))
+                s.settimeout(None if timeout is None else timeout + READY_GRACE)
+                s.sendall(json.dumps(req, separators=(",", ":")).encode("utf-8") + b"\n")
+            except OSError as e:
+                raise SessionDied(
+                    f"cannot reach the remoteslurm daemon at {self.path}: {e}",
+                    action="retry (the daemon restarts on demand) or use --no-daemon",
+                ) from e
+            buf = b""
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    try:
+                        chunk = s.recv(1 << 16)
+                    except TimeoutError as e:
+                        raise RemoteTimeout(
+                            f"daemon did not answer {op} stream in time", op=op
+                        ) from e
+                    except OSError as e:
+                        raise SessionDied(f"lost the daemon stream: {e}") from e
+                    if not chunk:
+                        break  # EOF
+                    buf += chunk
+                    continue
+                line, buf = buf[:nl], buf[nl + 1 :]
+                if not line.strip():
+                    continue
+                try:
+                    frame = json.loads(line)
+                except ValueError:
+                    continue
+                if not frame.get("done"):
+                    yield frame
+                    continue
+                finished = True
+                if frame.get("ok"):
+                    yield frame
+                    return
+                raise from_stub_error(frame.get("error") or {})
+            if not finished:
+                raise SessionDied(
+                    "daemon closed the stream before it finished",
+                    action="retry (the daemon restarts on demand) or use --no-daemon",
+                )
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+            if not finished:
+                self.cancel(rid)
 
     def cancel(self, request_id: str, *, timeout: float = 5.0) -> dict[str, Any]:
         """Kill the slow op running under ``request_id`` (best effort, never raises)."""

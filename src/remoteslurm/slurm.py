@@ -617,7 +617,9 @@ def parse_df(stdout: str) -> list[dict[str, Any]]:
 # A ``<used>/<limit>`` quota pair from ``diskusage_report``. The real output is a fixed-width
 # table (NOT pipe-separated), and a value may carry an internal space (``0  B``) or spaces around
 # the slash (``88GiB/ 100GiB``, ``7 /2000K``) — hence the ``\s*`` inside and around each value.
-_DU_PAIR = re.compile(r"([\d.]+\s*[A-Za-z]*)\s*/\s*([\d.]+\s*[A-Za-z]*)")
+# used side must start with a digit (so it never grabs a word from the description); the limit
+# side may be non-numeric (`unlimited`, `inf`) as Alliance reports for some project quotas.
+_DU_PAIR = re.compile(r"([\d.]+\s*[A-Za-z]*)\s*/\s*([\d.]+\s*[A-Za-z]*|unlimited|inf|N/A)")
 
 
 def _du_norm(v: str | None) -> str | None:

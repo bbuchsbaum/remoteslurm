@@ -10,7 +10,7 @@ from remoteslurm.errors import InvalidArgument, NotFound, RemoteTimeout
 
 
 def test_ping_and_info(cluster: Cluster, sandbox: Path) -> None:
-    assert cluster.ping()["protocol"] == 1
+    assert cluster.ping()["protocol"] == 2
     info = cluster.info()
     assert info["home"] == str(sandbox)
     assert "python" in info

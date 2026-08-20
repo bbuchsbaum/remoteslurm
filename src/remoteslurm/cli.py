@@ -24,6 +24,9 @@ from .transport import SSHTransport, ssh_available
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
+# `tail -f` follows via the stub `follow` op; a long idle timeout keeps it alive through quiet
+# stretches (the stub caps it at 24 h) so it behaves like a normal `tail -f` until Ctrl-C.
+TAIL_FOLLOW_IDLE = 86400
 EXIT_NOT_CONNECTED = 3
 
 
@@ -323,17 +326,16 @@ def cmd_tail(args: argparse.Namespace) -> int:
     sys.stdout.flush()
     if not args.follow:
         return EXIT_OK
-    offset = r["size"]
+    # Follow from the end of what we just printed, via the stub `follow` op (through the daemon):
+    # the login node does the polling and streams appended bytes back. A long idle timeout keeps
+    # it following through quiet stretches; Ctrl-C stops it (and cancels the remote tail).
     try:
-        while True:
-            time.sleep(args.interval)
-            r = c.read(path, offset=offset, max_bytes=args.max_bytes)
-            if r["length"]:
-                sys.stdout.write(r.get("content", ""))
-                sys.stdout.flush()
-                offset += r["length"]
+        for data in c.follow(path, offset=r["size"], idle_timeout=TAIL_FOLLOW_IDLE):
+            sys.stdout.write(data)
+            sys.stdout.flush()
     except KeyboardInterrupt:
         return EXIT_OK
+    return EXIT_OK
 
 
 def cmd_grep(args: argparse.Namespace) -> int:
@@ -388,6 +390,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     command = list(args.cmd) if args.argv else cmd
     if args.compute:
         return _cmd_run_compute(args, c, command, cmd)
+    if getattr(args, "stream", False):
+        return _cmd_run_stream(args, c, command, cmd)
     r = c.run(
         command,
         cwd=args.cwd,
@@ -406,6 +410,35 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     emit(args, r, human)
     return r["rc"] if not args.json else EXIT_OK
+
+
+def _cmd_run_stream(
+    args: argparse.Namespace, c: Cluster, command: str | list[str], cmd: str
+) -> int:
+    """`run --stream`: print stdout/stderr live as it arrives; exit code from the final result."""
+
+    def on_chunk(stream: str, data: str) -> None:
+        w = sys.stderr if stream == "stderr" else sys.stdout
+        w.write(data)
+        w.flush()
+
+    try:
+        r = c.run(
+            command,
+            cwd=args.cwd,
+            timeout=args.timeout,
+            login=args.login,
+            max_output=args.max_output,
+            stream=True,
+            on_chunk=on_chunk,
+        )
+    except KeyboardInterrupt:
+        # The stream generator already sent a cancel on the way out; just exit 130.
+        return 130
+    c.registry.audit("run", cmd=cmd, rc=r.get("rc"))
+    if r.get("stdout_truncated") or r.get("stderr_truncated"):
+        print("[output truncated; use --max-output]", file=sys.stderr)
+    return int(r.get("rc") or 0)
 
 
 def _cmd_run_compute(
@@ -1236,7 +1269,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     if not args.json:
                         print(f"{stamp}  {j}: {prev or '-'} -> {st.state}{extra}")
                     last_state[j] = st.state
-                if st.terminal:
+                # A job unknown to squeue/scontrol/sacct (bad id, or aged past the accounting
+                # grace) is never terminal — stop watching it instead of polling forever.
+                finished = st.terminal or st.source == "unknown"
+                if finished:
                     done[j] = st
                     ev = {
                         "t": time.time(),
@@ -1436,6 +1472,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--login", action="store_true", help="use a login shell (bash -lc; loads modules, slower)"
     )
     sp.add_argument("--max-output", type=int, default=65536)
+    sp.add_argument(
+        "--stream",
+        action="store_true",
+        help="stream stdout/stderr live as it arrives (login-node runs only)",
+    )
     sp.add_argument(
         "--compute", action="store_true", help="run on a compute node via srun (queues for a node)"
     )

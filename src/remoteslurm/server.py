@@ -330,6 +330,9 @@ async def run(
     ``{started: true, rc, stdout, stderr, node, elapsed}`` when a node was granted, else
     ``{started: false, reason}``. Returns ``error: permission`` when ``allow_run`` forbids the
     command (``false``, or ``"safe"`` for a non-allowlisted / shell-string command).
+
+    Live streaming of output (``run --stream``) and ``tail -f`` are CLI-only: this MCP ``run``
+    tool always returns the complete result in one response.
     """
     to = _clamp(timeout, 1, 3600)
 
@@ -690,11 +693,15 @@ async def wait(job_id: str, timeout: int = 120, host: str | None = None) -> dict
 
     def f(c: Cluster) -> dict[str, Any]:
         interval = 5.0
-        remaining = float(cap)
+        t0 = time.monotonic()
         st = c.job_status(job_id, refresh=True)
-        while not st.terminal and remaining > 0:
-            time.sleep(min(interval, remaining))
-            remaining -= interval
+        # Bound WALL-CLOCK, not iteration count: each job_status can itself take seconds over a
+        # slow ssh link, so sleep only for the time left in the cap.
+        while not st.terminal:
+            elapsed = time.monotonic() - t0
+            if elapsed >= cap:
+                break
+            time.sleep(min(interval, cap - elapsed))
             st = c.job_status(job_id, refresh=True)
         d = st.to_dict()
         d["terminal"] = bool(st.terminal)

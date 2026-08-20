@@ -255,3 +255,75 @@ def test_quota_runs_in_login_shell(make_cluster, tmp_path):
     q = c.quota()
     assert q["available"] and q["source"] == "command"
     assert q["usage"][0]["limit"] == "100GiB" and q["usage"][0]["used"] == "88GiB"
+
+
+def test_diskusage_non_numeric_limit():
+    """A project quota of `unlimited`/`inf` must keep the used value, not shift columns."""
+    from remoteslurm.slurm import parse_diskusage_report
+
+    raw = (
+        "                            Description                Space         # of files\n"
+        "               /project (project x)        88GiB/ unlimited        5K/10K\n"
+    )
+    r = parse_diskusage_report(raw)[0]
+    assert r["used"] == "88GiB" and r["limit"] == "unlimited"
+    assert r["files_used"] == "5K" and r["files_limit"] == "10K"
+
+
+def test_events_since_bad_value_raises(tmp_path, monkeypatch):
+    import pytest
+
+    from remoteslurm import watch
+    from remoteslurm.errors import InvalidArgument
+
+    monkeypatch.setenv("REMOTESLURM_STATE_DIR", str(tmp_path))
+    watch.append_event("h", {"t": 1.0, "job_id": "1", "state": "COMPLETED"})
+    with pytest.raises(InvalidArgument):
+        watch.drain_events("h", since="not-a-date")
+
+
+def test_mcp_wait_bounds_wall_clock(monkeypatch):
+    """MCP wait must bound elapsed wall-clock, not iteration count, even with slow job_status."""
+    import time as _time
+
+    from remoteslurm import server, slurm
+
+    calls = {"n": 0}
+    clock = {"t": 1000.0}
+
+    def fake_status(self, job_id, refresh=False):
+        calls["n"] += 1
+        clock["t"] += 4.0  # each status "costs" 4s of wall-clock
+        return slurm.JobStatus(job_id=job_id, state="PENDING", source="squeue", terminal=False)
+
+    monkeypatch.setattr("remoteslurm.jobs.SlurmOps.job_status", fake_status, raising=False)
+    monkeypatch.setattr(_time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(_time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+
+    import asyncio
+
+    class FakeCluster:
+        def job_status(self, job_id, refresh=False):
+            return fake_status(self, job_id, refresh)
+
+    monkeypatch.setattr(server, "_get_cluster", lambda host=None: FakeCluster())
+    res = asyncio.run(server.wait("42", timeout=20))
+    assert res["terminal"] is False
+    # 20s cap / 4s-per-status ~ at most ~6 statuses, not unbounded
+    assert calls["n"] <= 8
+
+
+def test_pending_estimates_collapses_arrays(make_cluster, monkeypatch):
+    """A pending array must yield ONE pending entry (base id), not one per task."""
+    from remoteslurm import slurm
+
+    c = make_cluster()
+    rows = slurm.parse_squeue(
+        "123_[0-999]|arr|PENDING|Priority|debug|acc|0:00|1:00|1|node|s|N/A|/w|me"
+    )
+    monkeypatch.setattr(type(c), "squeue", lambda self, refresh=False: rows)
+    monkeypatch.setattr(
+        type(c), "call", lambda self, op, **kw: {"rc": 1, "stdout": "", "stderr": ""}
+    )
+    pend = c._pending_estimates()
+    assert len(pend) == 1 and pend[0]["job_id"] == "123"

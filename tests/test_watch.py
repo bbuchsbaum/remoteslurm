@@ -64,10 +64,25 @@ def test_notify_runs_command(tmp_path: Path) -> None:
     from remoteslurm.config import HostConfig
 
     marker = tmp_path / "note.txt"
-    # MSG is substituted before the command is split, so keep it quoted in the template.
-    host = HostConfig(name="h", ssh="local", notify_command=f"sh -c 'echo \"MSG\" >> {marker}'")
+    # The message arrives as a SEPARATE argv element ($1 here), never spliced into the shell
+    # string, so a job name with quotes/`$()` cannot inject.
+    host = HostConfig(
+        name="h", ssh="local", notify_command=f"sh -c 'printf %s \"$1\" >> {marker}' rs-notify"
+    )
     assert watch.notify(host, "job-1 COMPLETED") is True
     assert marker.read_text().strip() == "job-1 COMPLETED"
+
+
+def test_notify_no_injection(tmp_path: Path) -> None:
+    from remoteslurm.config import HostConfig
+
+    marker = tmp_path / "note.txt"
+    host = HostConfig(
+        name="h", ssh="local", notify_command=f"sh -c 'printf %s \"$1\" >> {marker}' rs-notify"
+    )
+    # a malicious job name must not execute; it is sanitized and passed as data
+    watch.notify(host, f'x"; touch {tmp_path}/PWNED; echo "')
+    assert not (tmp_path / "PWNED").exists()
 
 
 # --------------------------------------------------------------------------- watch CLI

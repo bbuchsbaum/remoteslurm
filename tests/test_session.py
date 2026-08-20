@@ -62,7 +62,7 @@ def test_preamble_is_discarded() -> None:
     s = Session(NoisyTransport())
     s.start()
     try:
-        assert s.call("ping")["protocol"] == 1
+        assert s.call("ping")["protocol"] == 2
         assert any("Lmod" in line for line in s.preamble)
     finally:
         s.close()

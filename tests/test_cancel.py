@@ -134,7 +134,7 @@ def test_daemon_pool_separation_and_cancel(daemon_env: Path, sandbox: Path) -> N
 
     # A ping (fast pool) must not queue behind the 30 s run (slow pool).
     t0 = time.time()
-    assert c.ping()["protocol"] == 1
+    assert c.ping()["protocol"] == 2
     assert time.time() - t0 < 1.0, "ping blocked behind the slow run -> pools not separated"
 
     cancel = c.session.cancel(rid)
@@ -169,7 +169,7 @@ def test_pool_separation_direct_session() -> None:
         run_rid = Session.new_request_id()
         run_fut = s.submit("run", {"argv": ["sleep", "5"]}, request_id=run_rid)
         t0 = time.time()
-        assert s.call("ping", timeout=2)["protocol"] == 1
+        assert s.call("ping", timeout=2)["protocol"] == 2
         assert time.time() - t0 < 1.0
         assert not run_fut.done()  # the slow op is still running, not blocking us
         _cancel_when_running(s, run_rid)  # kill the sleep so teardown is quick
@@ -184,7 +184,7 @@ def test_ping_future_resolves_before_slow_run() -> None:
         run_rid = Session.new_request_id()
         run_fut = s.submit("run", {"argv": ["sleep", "5"]}, request_id=run_rid)
         ping_fut = s.submit("ping", {})
-        assert ping_fut.result(timeout=2)["protocol"] == 1
+        assert ping_fut.result(timeout=2)["protocol"] == 2
         assert not run_fut.done()
         _cancel_when_running(s, run_rid)
     finally:

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import time
 import uuid
+from collections.abc import Generator
 from concurrent.futures import Future
 from typing import Any
 
-from .errors import NotConnected, RemoteTimeout, SessionDied, from_stub_error
+from .errors import NotConnected, RemoteSlurmError, RemoteTimeout, SessionDied, from_stub_error
 from .transport import Transport
 
 log = logging.getLogger(__name__)
@@ -22,6 +24,11 @@ DEFAULT_TIMEOUT = 60.0
 READY_TIMEOUT = 45.0
 STALE_SECONDS = 90.0  # idle longer than this -> probe before reuse
 PROBE_TIMEOUT = 10.0
+STREAM_PROTOCOL = 2  # streaming (multi-frame) responses require remote PROTOCOL >= this
+
+# Sentinel pushed onto every open stream queue when the session dies, so a `call_stream`
+# consumer blocked on the queue wakes up instead of hanging.
+_STREAM_DEAD = object()
 
 
 class Session:
@@ -32,12 +39,16 @@ class Session:
         self._reader: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._pending: dict[str, Future[Any]] = {}
-        self._lock = threading.Lock()  # protects _pending, _proc and stdin writes
+        # Per-request queues for streaming (multi-frame) responses; a rid is in _streams while
+        # a call_stream consumer is draining its chunks. Guarded by _lock, like _pending.
+        self._streams: dict[str, queue.Queue[Any]] = {}
+        self._lock = threading.Lock()  # protects _pending, _streams, _proc and stdin writes
         self._ready = threading.Event()
         self._ready_error: str | None = None
         self.preamble: list[str] = []  # noise printed before READY (rc files, MOTD)
         self.stderr_tail: list[str] = []
         self.remote_pid: int | None = None
+        self.remote_protocol: int | None = None
         self.remote_python: str | None = None
         self.spawn_count = 0
         self.last_used = 0.0
@@ -62,6 +73,7 @@ class Session:
         self._ready.clear()
         self._ready_error = None
         self.remote_pid = None
+        self.remote_protocol = None
         self.preamble = []
         self.stderr_tail = []
         self._proc = self.transport.spawn()
@@ -124,6 +136,10 @@ class Session:
         for fut in pending.values():
             if not fut.done():
                 fut.set_exception(exc)
+        # Wake any streaming consumers blocked on their queue so they don't hang forever.
+        streams, self._streams = self._streams, {}
+        for q in streams.values():
+            q.put(_STREAM_DEAD)
 
     # -- io threads ----------------------------------------------------------------------
     def _stderr_loop(self) -> None:
@@ -151,6 +167,7 @@ class Session:
                 elif raw.startswith(READY_PREFIX):
                     parts = raw.decode("utf-8", errors="replace").split()
                     try:
+                        self.remote_protocol = int(parts[1])
                         self.remote_pid = int(parts[2])
                         self.remote_python = parts[3]
                     except (IndexError, ValueError):
@@ -185,8 +202,26 @@ class Session:
             log.warning("undecodable stub frame: %r", payload[:200])
             return
         rid = str(msg.get("id"))
+        # `done` defaults to True so any legacy single-frame reply still resolves its future.
+        # An intermediate streaming frame (``done: false``) must NOT pop the pending future;
+        # it is routed to the registered stream consumer and the future stays live until the
+        # terminal frame arrives.
+        done = msg.get("done", True)
+        if not done:
+            with self._lock:
+                q = self._streams.get(rid)
+            if q is not None:
+                q.put(msg)
+            else:
+                log.debug("stream chunk for unregistered id=%s dropped", rid)
+            return
         with self._lock:
             fut = self._pending.pop(rid, None)
+            q = self._streams.get(rid)
+        if q is not None:
+            # Hand the terminal frame to the stream consumer too, so call_stream sees the
+            # result/error and finishes; it removes its own registration.
+            q.put(msg)
         if fut is None:
             log.debug("late/unknown response id=%s", rid)
             return
@@ -280,6 +315,83 @@ class Session:
             return dict(fut.result(timeout=timeout))
         except Exception:
             return {"cancelled": False, "id": request_id}
+
+    # -- streaming (protocol 2) -----------------------------------------------------------
+    def call_stream(
+        self,
+        op: str,
+        args: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Stream a multi-frame response: yields the stub's ``chunk`` frames as they arrive and
+        finally the terminal frame (``done: true`` with the ``result``).
+
+        Registers a queue for the request id, submits ``op`` with ``stream=True``, and drains
+        the queue until the terminal frame. A failing op raises the mapped stub error on the
+        terminal frame. If the caller stops iterating early (breaks the loop / closes the
+        generator), or the call times out, a ``cancel`` is sent and the request id is removed
+        from ``_pending``/``_streams`` so nothing leaks. Setup (protocol check + submit) is
+        eager, so a protocol mismatch or a dead session raises when ``call_stream`` is called.
+        """
+        if self.remote_protocol is not None and self.remote_protocol < STREAM_PROTOCOL:
+            raise RemoteSlurmError(
+                f"remote stub protocol {self.remote_protocol} does not support streaming "
+                f"(need >= {STREAM_PROTOCOL})",
+                action="reconnect so the remote installs a stub speaking protocol >= 2",
+            )
+        q: queue.Queue[Any] = queue.Queue()
+        with self._lock:
+            rid = str(request_id) if request_id is not None else self.new_request_id()
+            while rid in self._pending or rid in self._streams:
+                rid = self.new_request_id()
+            self._streams[rid] = q
+        stream_args = dict(args or {})
+        stream_args["stream"] = True
+        try:
+            self.submit(op, stream_args, request_id=rid)
+        except BaseException:
+            with self._lock:
+                self._streams.pop(rid, None)
+            raise
+        return self._drain_stream(op, rid, q, timeout)
+
+    def _drain_stream(
+        self, op: str, rid: str, q: queue.Queue[Any], timeout: float | None
+    ) -> Generator[dict[str, Any], None, None]:
+        finished = False
+        deadline = (time.time() + timeout) if timeout else None
+        try:
+            while True:
+                wait = None if deadline is None else max(0.0, deadline - time.time())
+                try:
+                    msg = q.get(timeout=wait)
+                except queue.Empty:
+                    raise RemoteTimeout(
+                        f"{op} stream did not complete within {timeout}s", op=op
+                    ) from None
+                if msg is _STREAM_DEAD:
+                    raise SessionDied("stub connection closed", stderr=self.stderr_tail[-20:])
+                if not msg.get("done"):
+                    yield msg
+                    continue
+                if msg.get("ok"):
+                    finished = True
+                    yield msg
+                    return
+                finished = True
+                raise from_stub_error(msg.get("error") or {})
+        finally:
+            with self._lock:
+                self._streams.pop(rid, None)
+                self._pending.pop(rid, None)
+            if not finished:
+                # Broke early / timed out / session died: don't leave the remote op running.
+                try:
+                    self.cancel(rid)
+                except Exception:
+                    pass
 
     def _probe(self) -> None:
         """Cheap ping before reusing a session that sat idle (laptop sleep, dead master)."""

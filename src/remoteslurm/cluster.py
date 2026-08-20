@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from . import slurm
@@ -418,6 +419,8 @@ class Cluster(SlurmOps):
         login: bool = False,
         max_output: int = 65536,
         cancel_on_timeout: bool = True,
+        stream: bool = False,
+        on_chunk: Callable[[str, str], None] | None = None,
         compute: bool = False,
         template: str | None = None,
         partition: str | None = None,
@@ -434,6 +437,11 @@ class Cluster(SlurmOps):
         ``cmd`` may be an argv list or a shell string. When ``cancel_on_timeout`` (the default)
         the remote process group is killed if the client-side call times out (or is
         interrupted), so nothing lingers.
+
+        With ``stream=True`` (or an ``on_chunk`` callback) the login-node run streams output as
+        it arrives: ``on_chunk(stream, text)`` is invoked for each ``stdout``/``stderr`` piece
+        and the final result dict (rc + bounded captured output) is returned. Streaming is
+        login-node only; it is ignored when ``compute=True``.
 
         With ``compute=True`` the command runs under ``srun`` on an allocated node. Resources
         come from ``template`` (a config template) then the explicit ``partition``/``time``/
@@ -474,7 +482,68 @@ class Cluster(SlurmOps):
             args["login"] = login
         else:
             args["argv"] = list(cmd)
+        if stream or on_chunk is not None:
+            return self._run_stream(args, timeout=timeout, on_chunk=on_chunk)
         return self.call("run", _timeout=timeout + 15, _cancel_on_timeout=cancel_on_timeout, **args)
+
+    def _run_stream(
+        self,
+        args: dict[str, Any],
+        *,
+        timeout: int,
+        on_chunk: Callable[[str, str], None] | None,
+    ) -> dict[str, Any]:
+        """Drive a streaming login-node ``run``: forward each chunk to ``on_chunk`` and return
+        the final result dict (rc + bounded captured output)."""
+        result: dict[str, Any] = {}
+        gen = self.session.call_stream("run", args, timeout=timeout + 15)
+        try:
+            for frame in gen:
+                if frame.get("done"):
+                    result = frame.get("result") or {}
+                    break
+                chunk = frame.get("chunk") or {}
+                if on_chunk is not None:
+                    on_chunk(str(chunk.get("stream", "stdout")), str(chunk.get("data", "")))
+        finally:
+            gen.close()  # break/interrupt -> cancel the remote run, never leak the rid
+        return result
+
+    def follow(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        idle_timeout: int = 60,
+        max_bytes_per_chunk: int = 65536,
+        timeout: float | None = None,
+    ) -> Iterator[str]:
+        """Tail a remote file, yielding appended text as it arrives (via the stub ``follow`` op).
+
+        Seeks to ``offset`` (negative = from the end), then yields each appended piece until
+        ``idle_timeout`` seconds pass with no new data or the caller stops iterating (which
+        cancels the remote tail promptly). ``timeout`` bounds the whole client-side stream
+        (``None`` = follow until idle/cancel, as ``tail -f`` wants).
+        """
+        gen = self.session.call_stream(
+            "follow",
+            {
+                "path": path,
+                "offset": offset,
+                "idle_timeout": idle_timeout,
+                "max_bytes_per_chunk": max_bytes_per_chunk,
+            },
+            timeout=timeout,
+        )
+        try:
+            for frame in gen:
+                if frame.get("done"):
+                    return
+                data = str((frame.get("chunk") or {}).get("data", ""))
+                if data:
+                    yield data
+        finally:
+            gen.close()
 
     def _resolve_compute_resources(
         self,
@@ -713,7 +782,21 @@ class Cluster(SlurmOps):
             rows = self.squeue(refresh=True)
         except RemoteSlurmError:
             return []
-        pending = [r for r in rows if r.get("state") == "PENDING"]
+        # Collapse a pending array to one entry keyed by its base id (parse_squeue expands a
+        # collapsed `123_[0-9999]` bracket into one pseudo-row per task, which would otherwise
+        # emit thousands of rows and thousands of squeue_start ids).
+        seen: set[str] = set()
+        pending: list[dict[str, Any]] = []
+        for r in rows:
+            if r.get("state") != "PENDING":
+                continue
+            key = r.get("array_base") or r["job_id"]
+            if key in seen:
+                continue
+            seen.add(key)
+            r = dict(r)
+            r["job_id"] = key  # query/report the base id for an array
+            pending.append(r)
         if not pending:
             return []
         est: dict[str, dict[str, Any]] = {}

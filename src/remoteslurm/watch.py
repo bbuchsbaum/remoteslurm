@@ -12,6 +12,8 @@ from __future__ import annotations
 import datetime
 import fcntl
 import json
+import os
+import re
 import shlex
 import subprocess
 import sys
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import HostConfig, state_dir
+from .errors import InvalidArgument
 
 _lock = threading.Lock()
 
@@ -99,15 +102,16 @@ def drain_events(host: str, *, since: str | None = None, all: bool = False) -> l
         return read_all_events(host)
     if since is not None:
         cut = _since_epoch(since)
-        evs = read_all_events(host)
         if cut is None:
-            return evs
+            raise InvalidArgument(
+                f"could not parse --since value {since!r}",
+                action="use an ISO timestamp (2026-08-20T12:00) or a unix epoch",
+            )
+        evs = read_all_events(host)
         return [e for e in evs if float(e.get("t", 0) or 0) >= cut]
-    # Unseen-only: read from the stored byte offset, then advance it to end-of-file.
-    try:
-        size = p.stat().st_size
-    except OSError:
-        return []
+    # Unseen-only: read from the stored byte offset and advance the cursor to exactly the bytes
+    # consumed — done under the same flock used by append_event so a line appended concurrently
+    # can't be both missed and replayed.
     cur = cursor_path(host)
     off = 0
     if cur.exists():
@@ -115,18 +119,24 @@ def drain_events(host: str, *, since: str | None = None, all: bool = False) -> l
             off = int(cur.read_text("utf-8").strip() or "0")
         except (OSError, ValueError):
             off = 0
-    if off > size:  # file was truncated/rotated under us
-        off = 0
     try:
         with open(p, "rb") as f:
-            f.seek(off)
-            data = f.read()
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                size = os.fstat(f.fileno()).st_size
+                if off > size:  # file was truncated/rotated under us
+                    off = 0
+                f.seek(off)
+                data = f.read()
+                consumed = off + len(data)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except OSError:
         return []
     out = _load_lines(data.decode("utf-8", "replace"))
     try:
         cur.parent.mkdir(parents=True, exist_ok=True)
-        cur.write_text(str(size), "utf-8")
+        cur.write_text(str(consumed), "utf-8")
     except OSError:
         pass
     return out
@@ -139,21 +149,32 @@ def notify(host: HostConfig, message: str) -> bool:
     message is appended), else a platform default: ``osascript`` on macOS, ``notify-send`` on
     Linux. Any failure is swallowed — a missing notifier must not break ``watch``.
     """
+    # The message is passed as its own argv element (never interpolated into a shell string or
+    # AppleScript literal), so a job name with quotes/metacharacters cannot inject.
+    safe = re.sub(r"[^\w .:@/=%+-]", "_", message)[:200]
     cmd = host.notify_command
     if cmd:
-        full = cmd.replace("MSG", message) if "MSG" in cmd else cmd + " " + shlex.quote(message)
         try:
-            argv = shlex.split(full)
+            argv = shlex.split(cmd)
         except ValueError:
             return False
+        # `MSG` placeholder becomes a single argv token; otherwise the message is appended.
+        argv = [safe if tok == "MSG" else tok for tok in argv]
+        if not any(tok == safe for tok in argv):
+            argv.append(safe)
     elif sys.platform == "darwin":
         argv = [
             "osascript",
             "-e",
-            f'display notification "{message}" with title "remoteslurm"',
+            "on run argv",
+            "-e",
+            'display notification (item 1 of argv) with title "remoteslurm"',
+            "-e",
+            "end run",
+            safe,
         ]
     else:
-        argv = ["notify-send", "remoteslurm", message]
+        argv = ["notify-send", "remoteslurm", safe]
     try:
         r = subprocess.run(argv, capture_output=True, timeout=10)
         return r.returncode == 0

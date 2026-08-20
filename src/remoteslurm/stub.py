@@ -17,6 +17,7 @@
 # stray output from other sources is skipped.
 
 import base64
+import codecs
 import difflib
 import errno
 import fnmatch
@@ -25,6 +26,7 @@ import io
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -36,7 +38,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-PROTOCOL = 1
+PROTOCOL = 2
 RS = "\x1e"
 # Two pools so a long `run` (slow) can never queue behind a `ping`/`ls` (fast). Only the
 # escape-hatch ops that spawn a genuinely long-lived subprocess go to the slow pool; they
@@ -45,7 +47,14 @@ RS = "\x1e"
 # it can never deadlock behind the very ops it is meant to interrupt.
 FAST_WORKERS = 8
 SLOW_WORKERS = 4
+# Ops that spawn a genuinely long-lived subprocess; they register their Popen so `cancel`
+# can reach the whole process group.
 SLOW_OPS = frozenset(("run", "srun", "sbatch"))
+# Ops that can stream multi-frame responses when the request carries ``stream: true``.
+STREAM_OPS = frozenset(("run", "srun"))
+# Long-lived streaming ops with no subprocess (e.g. `follow` tails a file): served by the slow
+# pool, always stream, and are cancelled via a per-request ``threading.Event`` in the registry.
+LONG_OPS = frozenset(("follow",))
 KILL_GRACE = 0.5  # seconds between SIGTERM and SIGKILL when cancelling a process group
 
 DEFAULT_READ_BYTES = 64 * 1024
@@ -69,6 +78,12 @@ MAX_SRUN_TIMEOUT = 8 * 24 * 3600
 RS_NODE_SENTINEL = "RS_NODE="  # emitted on stderr once the step is actually allocated
 MAX_EDIT_BYTES = 8 * 1024 * 1024
 EDIT_PREVIEW_BYTES = 4096
+FOLLOW_IDLE_DEFAULT = 60  # `follow`: stop after this many seconds with no new bytes
+FOLLOW_IDLE_MAX = 24 * 3600
+FOLLOW_CHUNK_DEFAULT = 64 * 1024  # bytes emitted per `follow` chunk (never load the whole file)
+FOLLOW_CHUNK_MAX = 4 * 1024 * 1024
+FOLLOW_POLL = 0.5  # seconds between `follow` polls of a file with no new data
+STREAM_READ_BYTES = 64 * 1024  # os.read size when streaming a run's pipes
 DEFAULT_DIFF_LINES = 500
 MAX_DIFF_LINES = 5000
 DIFF_MAX_LINE = 2000
@@ -209,6 +224,105 @@ def _kill_group(proc, sig):
             return False
 
 
+def _stream_communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
+    """Drive ``proc`` to completion, emitting stdout/stderr as it arrives via ``emit``.
+
+    ``emit`` is called with ``{"stream": "stdout"|"stderr", "data": <text>}`` for each piece of
+    output. At most ``max_output`` bytes per stream are decoded/emitted/kept; past that the
+    stream is flagged truncated but the pipe is still drained so the child never blocks on a
+    full buffer. Returns the same result shape as the non-streaming path (rc/stdout/stderr/…),
+    where ``stdout``/``stderr`` hold the bounded capture. A timeout kills the process group and
+    raises ``StubError("timeout")`` with whatever output was captured, matching ``_run``.
+    """
+    if stdin is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin.encode("utf-8"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+    pipes = {}  # fd -> ("stdout"|"stderr", fileobj)
+    if proc.stdout is not None:
+        pipes[proc.stdout.fileno()] = ("stdout", proc.stdout)
+    if proc.stderr is not None:
+        pipes[proc.stderr.fileno()] = ("stderr", proc.stderr)
+    kept = {"stdout": [], "stderr": []}  # decoded text within the cap (for the result)
+    kept_bytes = {"stdout": 0, "stderr": 0}
+    truncated = {"stdout": False, "stderr": False}
+    dec = {
+        "stdout": codecs.getincrementaldecoder("utf-8")("replace"),
+        "stderr": codecs.getincrementaldecoder("utf-8")("replace"),
+    }
+    open_fds = set(pipes)
+    deadline = t0 + timeout
+    timed_out = False
+    while open_fds:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            ready, _, _ = select.select(list(open_fds), [], [], min(remaining, 0.5))
+        except (OSError, ValueError):
+            break
+        for fd in ready:
+            name, _f = pipes[fd]
+            try:
+                data = os.read(fd, STREAM_READ_BYTES)
+            except OSError:
+                open_fds.discard(fd)
+                continue
+            if not data:
+                open_fds.discard(fd)
+                continue
+            room = max_output - kept_bytes[name]
+            if room > 0:
+                take = data[:room]
+                kept_bytes[name] += len(take)
+                text = dec[name].decode(take)
+                if text:
+                    kept[name].append(text)
+                    if emit is not None:
+                        emit({"stream": name, "data": text})
+                if len(data) > room:
+                    truncated[name] = True
+            else:
+                truncated[name] = True
+    if not timed_out:
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    if timed_out:
+        if new_session:
+            _kill_group(proc, signal.SIGKILL)
+        else:
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            pass
+    for name in ("stdout", "stderr"):
+        tail = dec[name].decode(b"", True)
+        if tail:
+            kept[name].append(tail)
+    if timed_out:
+        raise StubError(
+            "timeout",
+            "command timed out after %ss: %s" % (timeout, " ".join(list(argv)[:4])),
+            stdout="".join(kept["stdout"]),
+            stderr="".join(kept["stderr"]),
+        )
+    dur = time.time() - t0
+    return {
+        "rc": proc.returncode,
+        "stdout": "".join(kept["stdout"]),
+        "stderr": "".join(kept["stderr"]),
+        "stdout_truncated": truncated["stdout"],
+        "stderr_truncated": truncated["stderr"],
+        "duration": round(dur, 3),
+    }
+
+
 def _run(
     argv,
     timeout=DEFAULT_RUN_TIMEOUT,
@@ -218,6 +332,7 @@ def _run(
     max_output=DEFAULT_RUN_OUTPUT,
     on_spawn=None,
     new_session=False,
+    emit=None,
 ):
     if not isinstance(argv, (list, tuple)) or not argv or not all(isinstance(a, str) for a in argv):
         raise StubError("invalid_arg", "argv must be a non-empty list of strings")
@@ -252,6 +367,9 @@ def _run(
             on_spawn(proc)
         except Exception:  # pragma: no cover - defensive
             pass
+    if emit is not None:
+        # Streaming variant: read the pipes incrementally and emit chunks as output arrives.
+        return _stream_communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0)
     try:
         out, err = proc.communicate(
             input=stdin.encode("utf-8") if stdin is not None else None, timeout=timeout
@@ -901,6 +1019,7 @@ def op_run(args):
         max_output=max_output,
         on_spawn=args.get("_register"),
         new_session=True,
+        emit=args.get("_emit"),
     )
 
 
@@ -1021,6 +1140,10 @@ def op_srun(args):
             max_output=max_output,
             on_spawn=args.get("_register"),
             new_session=True,
+            # When streaming, output is emitted live; the RS_NODE sentinel line (echoed to
+            # stderr before the command runs) is stripped from the final captured stderr but
+            # is also emitted as a stderr chunk. No client surface streams srun today.
+            emit=args.get("_emit"),
         )
     except StubError as e:
         if e.code == "timeout":
@@ -1036,6 +1159,68 @@ def op_srun(args):
             )
         raise
     return _srun_result(res["stdout"], res["stderr"], res["rc"], queue_timeout, res.get("duration"))
+
+
+def op_follow(args):
+    """Tail a file, emitting appended bytes as stream chunks until idle or cancelled.
+
+    A streaming, cancellable SLOW op: seek to ``offset`` (negative = from the end), then poll
+    every ``FOLLOW_POLL`` seconds, emitting any appended bytes as
+    ``{"stream": "stdout", "data": <text>}`` chunks. Stops when ``idle_timeout`` seconds pass
+    with no new data (final ``eof: true``) or the request is cancelled via its registered
+    ``threading.Event`` (final ``eof: false``). Each read is bounded by ``max_bytes_per_chunk``
+    so the whole file is never loaded. Final result: ``{offset, eof}``.
+    """
+    p = _path(args.get("path"), must_exist=True)
+    if os.path.isdir(p):
+        raise StubError("invalid_arg", "is a directory: %s" % p, path=p)
+    emit = args.get("_emit")
+    cancel_event = args.get("_cancel_event")
+    idle_timeout = _clamp(args.get("idle_timeout"), FOLLOW_IDLE_DEFAULT, FOLLOW_IDLE_MAX, lo=1)
+    max_chunk = _clamp(args.get("max_bytes_per_chunk"), FOLLOW_CHUNK_DEFAULT, FOLLOW_CHUNK_MAX)
+    raw_offset = args.get("offset", 0) or 0
+    try:
+        raw_offset = int(raw_offset)
+    except (TypeError, ValueError):
+        raise StubError("invalid_arg", "offset must be an integer")
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
+    eof = False
+    offset = raw_offset
+    try:
+        size = os.path.getsize(p)
+        if offset < 0:
+            offset = max(0, size + offset)
+        elif offset > size:
+            offset = size
+        last_data = time.time()
+        with io.open(p, "rb") as f:
+            f.seek(offset)
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                chunk = f.read(max_chunk)
+                if chunk:
+                    offset += len(chunk)
+                    last_data = time.time()
+                    text = dec.decode(chunk)
+                    if text and emit is not None:
+                        emit({"stream": "stdout", "data": text})
+                    continue
+                if time.time() - last_data >= idle_timeout:
+                    eof = True
+                    break
+                # Sleep between polls, but wake immediately if cancel fires.
+                if cancel_event is not None:
+                    if cancel_event.wait(FOLLOW_POLL):
+                        break
+                else:
+                    time.sleep(FOLLOW_POLL)
+    except OSError as e:
+        raise _os_error(e, p)
+    tail = dec.decode(b"", True)
+    if tail and emit is not None:
+        emit({"stream": "stdout", "data": tail})
+    return {"offset": offset, "eof": eof}
 
 
 def _slurm(argv, timeout=60, cwd=None, stdin=None, on_spawn=None, new_session=False):
@@ -1284,7 +1469,7 @@ def op_quota(args):
             continue
         if os.path.exists(ep) and ep not in paths:
             paths.append(ep)
-    return _slurm_soft(["df", "-h"] + paths, timeout=60)
+    return _slurm_soft(["df", "-hP"] + paths, timeout=60)  # -P: POSIX, one line per fs
 
 
 OPS = {
@@ -1303,6 +1488,7 @@ OPS = {
     "grep": op_grep,
     "run": op_run,
     "srun": op_srun,
+    "follow": op_follow,
     "sbatch": op_sbatch,
     "squeue": op_squeue,
     "sacct": op_sacct,
@@ -1326,8 +1512,9 @@ class Server(object):
         self.lock = threading.Lock()  # serialises writes to stdout
         self.fast = ThreadPoolExecutor(max_workers=FAST_WORKERS)
         self.slow = ThreadPoolExecutor(max_workers=SLOW_WORKERS)
-        self.reg_lock = threading.Lock()  # protects `running` and `cancelled`
+        self.reg_lock = threading.Lock()  # protects `running`, `events` and `cancelled`
         self.running = {}  # request id -> live Popen for cancellable slow ops
+        self.events = {}  # request id -> threading.Event for non-subprocess cancellables (follow)
         self.cancelled = set()  # request ids that `cancel` has just killed
         self.alive = True
 
@@ -1349,6 +1536,14 @@ class Server(object):
         with self.reg_lock:
             self.running.pop(rid, None)
 
+    def _register_event(self, rid, event):
+        with self.reg_lock:
+            self.events[rid] = event
+
+    def _unregister_event(self, rid):
+        with self.reg_lock:
+            self.events.pop(rid, None)
+
     def _take_cancelled(self, rid):
         with self.reg_lock:
             if rid in self.cancelled:
@@ -1367,9 +1562,20 @@ class Server(object):
             raise StubError("invalid_arg", "cancel requires a string request id")
         with self.reg_lock:
             proc = self.running.get(target)
-            if proc is None or proc.poll() is not None:
+            event = self.events.get(target)
+            if proc is not None:
+                if proc.poll() is not None:
+                    return {"cancelled": False, "id": target, "reason": "not running"}
+                self.cancelled.add(target)
+                # fall through to kill the process group outside the lock
+            elif event is not None:
+                # A non-subprocess cancellable (e.g. `follow`): flag it and set its event so the
+                # op's poll loop breaks out promptly and sends its terminal frame.
+                self.cancelled.add(target)
+                event.set()
+                return {"cancelled": True, "id": target}
+            else:
                 return {"cancelled": False, "id": target, "reason": "not running"}
-            self.cancelled.add(target)
         _kill_group(proc, signal.SIGTERM)
         deadline = time.time() + KILL_GRACE
         while time.time() < deadline and proc.poll() is None:
@@ -1391,23 +1597,40 @@ class Server(object):
             fn = OPS.get(op)
             if fn is None:
                 raise StubError("invalid_arg", "unknown op: %r" % (op,))
-            registered = op in SLOW_OPS
-            if registered:
-                # Give the op a callback to register its Popen; copy args so the caller's dict
-                # is never mutated and the internal key can't leak back out.
+            registers_proc = op in SLOW_OPS
+            registers_event = op in LONG_OPS
+            # `run`/`srun` stream only when asked; `follow` always streams.
+            streaming = (op in STREAM_OPS and bool(args.get("stream"))) or (op in LONG_OPS)
+            cancellable = registers_proc or registers_event
+            if registers_proc or registers_event or streaming:
+                # Copy args so the caller's dict is never mutated and the internal `_`-prefixed
+                # keys (register/emit/cancel-event callbacks) can't leak back out.
                 args = dict(args)
+            if registers_proc:
                 args["_register"] = lambda proc, _rid=rid: self._register(_rid, proc)
+            if registers_event:
+                event = threading.Event()
+                self._register_event(rid, event)
+                args["_cancel_event"] = event
+            if streaming:
+                # Intermediate frames carry a `chunk` and `done: false`; the terminal frame
+                # (sent below, after the op returns) carries the `result` and `done: true`.
+                args["_emit"] = lambda chunk, _rid=rid: self.send(
+                    {"id": _rid, "ok": True, "chunk": chunk, "done": False}
+                )
             try:
                 result = fn(args)
             finally:
-                if registered:
+                if registers_proc:
                     self._unregister(rid)
-            if registered and self._take_cancelled(rid) and isinstance(result, dict):
-                # The op returned partial output after cancel killed its process group.
+                if registers_event:
+                    self._unregister_event(rid)
+            if cancellable and self._take_cancelled(rid) and isinstance(result, dict):
+                # The op returned partial output after cancel killed its process/loop.
                 result["cancelled"] = True
             self.send({"id": rid, "ok": True, "result": result, "done": True})
         except StubError as e:
-            if op in SLOW_OPS:
+            if op in SLOW_OPS or op in LONG_OPS:
                 self._take_cancelled(rid)
             self.send({"id": rid, "ok": False, "error": e.to_dict(), "done": True})
         except Exception as e:  # pragma: no cover - defensive
@@ -1447,7 +1670,7 @@ class Server(object):
             if op == "shutdown":
                 self.send({"id": req.get("id"), "ok": True, "result": {"bye": True}, "done": True})
                 break
-            pool = self.slow if op in SLOW_OPS else self.fast
+            pool = self.slow if (op in SLOW_OPS or op in LONG_OPS) else self.fast
             pool.submit(self.handle, req)
         self.fast.shutdown(wait=True)
         self.slow.shutdown(wait=True)

@@ -21,7 +21,7 @@ def cluster() -> Cluster:
 
 
 def test_basics(cluster: Cluster) -> None:
-    assert cluster.ping()["protocol"] == 1
+    assert cluster.ping()["protocol"] == 2
     info = cluster.info()
     assert info["slurm_tools"]["sbatch"]
     assert cluster.ls("~")["path"] == info["home"]
