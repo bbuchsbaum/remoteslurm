@@ -493,10 +493,14 @@ def _print_jobs(rows: list[dict[str, Any]]) -> None:
         print("no jobs")
         return
     cols = ["job_id", "name", "state", "elapsed", "time_limit", "nodelist", "reason", "exit_code"]
-    widths = {k: max(len(k), *(len(str(r.get(k, "") or "")) for r in rows)) for k in cols}
+    def cell(r: dict[str, Any], k: str) -> str:
+        v = r.get(k)
+        return "" if v is None else str(v)
+
+    widths = {k: max(len(k), *(len(cell(r, k)) for r in rows)) for k in cols}
     print("  ".join(k.upper().ljust(widths[k]) for k in cols))
     for r in rows:
-        print("  ".join(str(r.get(k, "") or "").ljust(widths[k]) for k in cols))
+        print("  ".join(cell(r, k).ljust(widths[k]) for k in cols))
 
 
 def cmd_jobs(args: argparse.Namespace) -> int:
