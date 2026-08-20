@@ -381,6 +381,62 @@ def op_read(args):
     return res
 
 
+def _atomic_write(p, data, keep_mode=True, mode=None):
+    """Write `data` to `p` atomically. Follows a symlink to its target (so editing a symlinked
+    file edits the target, not the link), uses a unique tmp name (safe across the stub's worker
+    threads), preserves the existing mode unless `mode` is given, and never leaves the tmp behind.
+    """
+    real = os.path.realpath(p)
+    target = real if os.path.islink(p) else p
+    prev_mode = None
+    try:
+        prev_mode = statmod.S_IMODE(os.stat(target).st_mode)
+    except OSError:
+        pass
+    tmp = "%s.%d.%d.tmp" % (target, os.getpid(), threading.get_ident())
+    try:
+        with io.open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    if mode is not None:
+        os.chmod(target, int(mode))
+    elif keep_mode and prev_mode is not None:
+        os.chmod(target, prev_mode)
+    return target
+
+
+def op_expandpath(args):
+    """Expand ``~``/``~user``/``$VARS`` in a path using the *remote* environment, shell-free.
+
+    Used by sync/put/get so remote paths like ``$SCRATCH/proj`` resolve correctly without ever
+    interpolating user input into a shell (no command substitution, no word splitting, no globbing).
+    """
+    raw = args.get("path")
+    if not isinstance(raw, str) or not raw:
+        raise StubError("invalid_arg", "path must be a non-empty string")
+    if "\x00" in raw:
+        raise StubError("invalid_arg", "path contains NUL byte")
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    if "$" in expanded:
+        # A variable that isn't set on the remote survives expandvars unchanged; producing a
+        # path anyway would silently target the wrong place (e.g. $PROJECT unset -> "/mvpa").
+        raise StubError(
+            "invalid_arg",
+            "path contains an environment variable that is not set on the remote: %s" % raw,
+            path=raw,
+            action="check the variable is exported on the login node (e.g. echo $SCRATCH)",
+        )
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(os.path.expanduser("~"), expanded)
+    return {"input": raw, "path": os.path.normpath(expanded)}
+
+
 def op_write(args):
     p = _path(args.get("path"))
     if "content_b64" in args:
@@ -400,24 +456,13 @@ def op_write(args):
         if mkdirs and d and not os.path.isdir(d):
             os.makedirs(d, exist_ok=True)
         if append:
+            # append follows a symlink to its target, matching _atomic_write's behaviour
             with io.open(p, "ab") as f:
                 f.write(data)
+            if mode is not None:
+                os.chmod(p, int(mode))
         else:
-            # Preserve the mode of an existing file across the atomic replace (the
-            # tmp file is created with the default umask, not the old mode).
-            prev_mode = None
-            try:
-                prev_mode = statmod.S_IMODE(os.stat(p).st_mode)
-            except OSError:
-                pass
-            tmp = "%s.%d.tmp" % (p, os.getpid())
-            with io.open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, p)
-            if mode is None and prev_mode is not None:
-                os.chmod(p, prev_mode)
-        if mode is not None:
-            os.chmod(p, int(mode))
+            _atomic_write(p, data, keep_mode=True, mode=mode)
         st = os.stat(p)
     except OSError as e:
         raise _os_error(e, p)
@@ -534,12 +579,7 @@ def op_edit(args):
     if len(new_data) > MAX_EDIT_BYTES:
         raise StubError("too_large", "edited file would exceed %d bytes" % MAX_EDIT_BYTES, path=p)
     try:
-        st = os.stat(p)
-        tmp = "%s.%d.tmp" % (p, os.getpid())
-        with io.open(tmp, "wb") as f:
-            f.write(new_data)
-        os.replace(tmp, p)
-        os.chmod(p, statmod.S_IMODE(st.st_mode))
+        _atomic_write(p, new_data, keep_mode=True)
     except OSError as e:
         raise _os_error(e, p)
     return {
@@ -919,6 +959,7 @@ OPS = {
     "stat": op_stat,
     "read": op_read,
     "write": op_write,
+    "expandpath": op_expandpath,
     "edit": op_edit,
     "diff": op_diff,
     "mkdir": op_mkdir,

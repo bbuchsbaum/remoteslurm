@@ -389,7 +389,14 @@ def test_sync_requires_alias(sandbox: Path, cluster: Cluster) -> None:
 def test_expand_remote(cluster: Cluster, sandbox: Path) -> None:
     assert sync_mod.expand_remote(cluster, "$HOME/x") == f"{sandbox}/x"
     assert sync_mod.expand_remote(cluster, str(sandbox)) == str(sandbox)
-    assert sync_mod.expand_remote(cluster, "$UNSET_VAR_XYZ") == "$UNSET_VAR_XYZ"  # falls back
+    # No shell interpolation: a literal space is kept, not word-split.
+    assert sync_mod.expand_remote(cluster, "$HOME/a b") == f"{sandbox}/a b"
+    # Command substitution is never executed; the leftover $ makes it a refused path.
+    with pytest.raises(InvalidArgument):
+        sync_mod.expand_remote(cluster, "$HOME/$(echo INJ)")
+    # An unset variable fails loudly instead of silently producing a wrong path (e.g. /mvpa).
+    with pytest.raises(InvalidArgument):
+        sync_mod.expand_remote(cluster, "$UNSET_VAR_XYZ/mvpa")
 
 
 # --------------------------------------------------------------------------- CLI

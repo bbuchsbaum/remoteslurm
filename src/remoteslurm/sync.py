@@ -143,9 +143,8 @@ def transport_ssh_opts(cluster: Cluster) -> list[str] | None:
 
 
 def expand_remote(cluster: Cluster, path: str) -> str:
-    """Expand ``~``/``$VARS`` on the remote without interpolating into a shell string."""
-    out = cluster.run(["sh", "-c", 'eval "printf %s $1"', "_", path.replace('"', "")])["stdout"]
-    return str(out) or path
+    """Expand ``~``/``$VARS`` on the remote, shell-free (no command substitution/globbing)."""
+    return str(cluster.call("expandpath", path=path)["path"])
 
 
 # ----------------------------------------------------------------------- command / parsing

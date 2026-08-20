@@ -102,3 +102,50 @@ def test_session_timeout_pops_future_and_checks_master() -> None:
 
 def test_exit_code_helpers_still_fine() -> None:
     assert slurm.is_terminal("CANCELLED by 1")
+
+
+def test_edit_follows_symlink(cluster, sandbox):
+    """Editing a symlinked path edits the target and keeps the link (review edit-1)."""
+    import os
+
+    real = sandbox / "real.txt"
+    real.write_text("value = 1\n")
+    link = sandbox / "link.txt"
+    os.symlink(real, link)
+    cluster.edit("~/link.txt", old="value = 1", new="value = 2")
+    assert (sandbox / "link.txt").is_symlink()  # link preserved
+    assert real.read_text() == "value = 2\n"  # target edited
+
+
+def test_write_follows_symlink(cluster, sandbox):
+    import os
+
+    real = sandbox / "wr.txt"
+    real.write_text("a\n")
+    link = sandbox / "wr-link.txt"
+    os.symlink(real, link)
+    cluster.write("~/wr-link.txt", "b\n")
+    assert (sandbox / "wr-link.txt").is_symlink()
+    assert real.read_text() == "b\n"
+
+
+def test_concurrent_edits_same_file_no_corruption(cluster, sandbox):
+    """Two concurrent writes to one path must not interleave on a shared tmp name (edit-2)."""
+    (sandbox / "conc.txt").write_text("x")
+    futs = [
+        cluster.session.submit("write", {"path": "~/conc.txt", "content": str(i) * 5000})
+        for i in range(8)
+    ]
+    for f in futs:
+        f.result(timeout=30)
+    got = (sandbox / "conc.txt").read_text()
+    # whichever writer won, the file is exactly one writer's content (no torn mix)
+    assert len(set(got)) == 1 and len(got) == 5000
+
+
+def test_expandpath_is_shell_free(cluster, sandbox):
+    from remoteslurm.errors import InvalidArgument
+
+    assert cluster.call("expandpath", path="$HOME/x")["path"] == f"{sandbox}/x"
+    with pytest.raises(InvalidArgument):
+        cluster.call("expandpath", path="$NOPE_XYZ/a")
