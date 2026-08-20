@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""FakeSlurm sbatch: ``sbatch --parsable [flags] script``."""
+
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _fakeslurm as fs  # noqa: E402
+
+LONG = {
+    "--job-name": "name",
+    "--partition": "partition",
+    "--account": "account",
+    "--time": "time_limit",
+    "--output": "output",
+    "--error": "error",
+}
+SHORT = {"-J": "name", "-p": "partition", "-A": "account", "-t": "time_limit", "-o": "output"}
+
+
+def parse_flags(tokens, into):
+    """Fill ``into`` from sbatch-style tokens; returns leftover positionals."""
+    rest = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        key = None
+        val = None
+        if t.startswith("--"):
+            name, eq, v = t.partition("=")
+            if name in LONG:
+                key = LONG[name]
+                if eq:
+                    val = v
+                else:
+                    i += 1
+                    val = tokens[i] if i < len(tokens) else ""
+        elif t.startswith("-") and len(t) >= 2 and t[:2] in SHORT:
+            key = SHORT[t[:2]]
+            if len(t) > 2:
+                val = t[2:]
+            else:
+                i += 1
+                val = tokens[i] if i < len(tokens) else ""
+        elif t.startswith("-"):
+            pass  # unknown flag: ignore (value-taking unknown flags are not supported)
+        else:
+            rest.append(t)
+        if key is not None:
+            into[key] = val
+        i += 1
+    return rest
+
+
+def main():
+    argv = [a for a in sys.argv[1:] if a != "--parsable"]
+    opts = {}
+    positional = parse_flags(argv, opts)
+    if not positional:
+        fs.die("sbatch: error: no script given")
+    script = positional[0]
+    try:
+        with open(script, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        fs.die(f"sbatch: error: Unable to open file {script}: {e}")
+    if "FAKESLURM_REJECT" in content:
+        sys.stderr.write(
+            "SBATCH ERROR: \n"
+            " Walltime must be at least 15 minutes (except on the debug partition)\n"
+            "SBATCH: Job not submitted because of this error.\n"
+        )
+        sys.exit(64)
+    # #SBATCH directives are lower priority than command-line flags.
+    directives = {}
+    for line in content.splitlines():
+        m = re.match(r"^#SBATCH\s+(.*)$", line.strip())
+        if m:
+            parse_flags(m.group(1).split(), directives)
+    directives.update(opts)
+    opts = directives
+
+    cwd = os.getcwd()
+    with fs.locked_state() as state:
+        jid = state["next_id"]
+        state["next_id"] = jid + 1
+        out = opts.get("output") or "slurm-%j.out"
+        out = out.replace("%j", str(jid)).replace("%J", str(jid))
+        if not os.path.isabs(out):
+            out = os.path.join(cwd, out)
+        err = opts.get("error") or ""
+        if err:
+            err = err.replace("%j", str(jid)).replace("%J", str(jid))
+            if not os.path.isabs(err):
+                err = os.path.join(cwd, err)
+        state["jobs"][str(jid)] = {
+            "id": jid,
+            "name": opts.get("name") or os.path.basename(script),
+            "state": "PENDING",
+            "state_raw": "PENDING",
+            "submit_time": fs.time.time(),
+            "submit_tick": state["tick"],
+            "start_time": None,
+            "end_time": None,
+            "user": fs.user(),
+            "partition": opts.get("partition") or "debug",
+            "account": opts.get("account") or "rrg-fake",
+            "time_limit": opts.get("time_limit") or "00:03:00",
+            "workdir": cwd,
+            "stdout": out,
+            "stderr": err,
+            "script": os.path.abspath(script),
+            "exit_code": "0:0",
+            "nodelist": "",
+            "fail": "FAKESLURM_FAIL" in content,
+        }
+    sys.stdout.write(f"{jid}\n")
+
+
+if __name__ == "__main__":
+    main()

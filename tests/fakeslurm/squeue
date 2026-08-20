@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""FakeSlurm squeue: ``squeue -h -o <fmt> [--me | -u user | -j ids] [-t states]``."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _fakeslurm as fs  # noqa: E402
+
+
+def field(code, job):
+    pending = job["state"] == "PENDING"
+    if code == "i":
+        return str(job["id"])
+    if code == "j":
+        return job["name"]
+    if code == "T":
+        return job["state"]
+    if code == "r":
+        return "Priority" if pending else "None"
+    if code == "P":
+        return job["partition"]
+    if code == "a":
+        return job["account"]
+    if code == "M":
+        return fs.mss(fs.elapsed_seconds(job))
+    if code == "l":
+        return job["time_limit"]
+    if code == "D":
+        return "1"
+    if code == "R":
+        return "(Priority)" if pending else job["nodelist"]
+    if code == "V":
+        return fs.ts(job["submit_time"])
+    if code == "S":
+        return fs.ts(job["start_time"]) if job["start_time"] else "N/A"
+    if code == "Z":
+        return job["workdir"]
+    if code == "u":
+        return job["user"]
+    return ""
+
+
+def render(fmt, job):
+    out = []
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c == "%" and i + 1 < len(fmt):
+            out.append(field(fmt[i + 1], job))
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def main():
+    args = sys.argv[1:]
+    fmt = "%i|%j|%T|%r|%P|%a|%M|%l|%D|%R|%V|%S|%Z|%u"
+    ids = None
+    users = None
+    states = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-h" or a == "--noheader" or a == "--me":
+            pass
+        elif a == "-o" or a == "--format":
+            i += 1
+            fmt = args[i]
+        elif a.startswith("--format="):
+            fmt = a.split("=", 1)[1]
+        elif a == "-j" or a == "--jobs":
+            i += 1
+            ids = fs.lookup_ids(args[i])
+        elif a == "-u" or a == "--user":
+            i += 1
+            users = args[i].split(",")
+        elif a == "-t" or a == "--states":
+            i += 1
+            states = [s.upper() for s in args[i].split(",")]
+        i += 1
+    if users is None and ids is None:
+        users = [fs.user()]
+
+    with fs.locked_state() as state:
+        jobs = state["jobs"]
+        if ids is not None:
+            missing = [j for j in ids if j not in jobs]
+            if missing:
+                fs.advance(state)
+                fs.die(fs.INVALID_JOB)
+            rows = [jobs[j] for j in ids]
+        else:
+            rows = [j for j in jobs.values() if j["user"] in users]
+        lines = []
+        for job in sorted(rows, key=lambda j: j["id"]):
+            if fs.is_terminal(job):
+                continue
+            if states is not None and job["state"] not in states and "ALL" not in states:
+                continue
+            lines.append(render(fmt, job))
+        fs.advance(state)
+    sys.stdout.write("".join(line + "\n" for line in lines))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""FakeSlurm scontrol: ``scontrol -o show job <id>``."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _fakeslurm as fs  # noqa: E402
+
+
+def render(job):
+    pending = job["state"] == "PENDING"
+    kv = [
+        ("JobId", str(job["id"])),
+        ("JobName", job["name"]),
+        ("UserId", f"{job['user']}(1000)"),
+        ("GroupId", f"{job['user']}(1000)"),
+        ("Priority", "1000"),
+        ("Nice", "0"),
+        ("Account", job["account"]),
+        ("QOS", "normal"),
+        ("JobState", job["state"]),
+        ("Reason", "Priority" if pending else "None"),
+        ("Dependency", "(null)"),
+        ("Requeue", "0"),
+        ("Restarts", "0"),
+        ("BatchFlag", "1"),
+        ("ExitCode", job["exit_code"]),
+        ("RunTime", fs.hms(fs.elapsed_seconds(job))),
+        ("TimeLimit", job["time_limit"]),
+        ("TimeMin", "N/A"),
+        ("SubmitTime", fs.ts(job["submit_time"])),
+        ("StartTime", fs.ts(job["start_time"]) if job["start_time"] else "Unknown"),
+        ("EndTime", fs.ts(job["end_time"]) if job["end_time"] else "Unknown"),
+        ("Partition", job["partition"]),
+        ("NodeList", job["nodelist"] or "(null)"),
+        ("NumNodes", "1"),
+        ("NumCPUs", "1"),
+        ("Command", job["script"]),
+        ("WorkDir", job["workdir"]),
+        ("StdErr", job["stderr"]),
+        ("StdIn", "/dev/null"),
+        ("StdOut", job["stdout"]),
+    ]
+    return " ".join(f"{k}={v}" for k, v in kv)
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a not in ("-o", "--oneliner")]
+    if len(args) < 2 or args[0] != "show":
+        fs.die("scontrol: unsupported invocation: " + " ".join(sys.argv[1:]))
+    what = args[1]
+    if what != "job":
+        fs.die("scontrol: fake only supports 'show job'")
+    if len(args) < 3:
+        fs.die("scontrol: job id required")
+    jid = fs.lookup_ids(args[2])[0]
+    with fs.locked_state() as state:
+        job = state["jobs"].get(jid)
+        visible = job is not None and fs.scontrol_visible(job, state)
+        line = render(job) if visible else None
+        fs.advance(state)
+        if line is None:
+            fs.die(fs.INVALID_JOB)
+    sys.stdout.write(line + "\n")
+
+
+if __name__ == "__main__":
+    main()

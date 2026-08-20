@@ -1,0 +1,3 @@
+SBATCH ERROR: 
+ Walltime must be at least 15 minutes (except on the debug partition)
+SBATCH: Job not submitted because of this error.

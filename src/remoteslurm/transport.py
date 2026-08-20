@@ -198,7 +198,8 @@ class SSHTransport(Transport):
             "D='';"
             f"for c in {dir_expr}; do "
             'if mkdir -p "$c" 2>/dev/null && [ -w "$c" ]; then D="$c"; break; fi; done;'
-            'if [ -z "$D" ]; then echo "REMOTESLURM-ERROR no writable install dir" >&2; exit 97; fi;'
+            'if [ -z "$D" ]; then echo "REMOTESLURM-ERROR no writable install dir" >&2; '
+            "exit 97; fi;"
             f'P="$D/{name}";'
             'if [ ! -f "$P" ]; then '
             f'head -c {len(stub_source().encode("utf-8"))} > "$P.tmp.$$" && '

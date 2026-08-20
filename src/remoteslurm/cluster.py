@@ -8,6 +8,7 @@ from typing import Any
 
 from .config import Config, HostConfig
 from .errors import InvalidArgument, PermissionDenied
+from .jobs import SlurmOps
 from .session import DEFAULT_TIMEOUT, Session
 from .transport import LocalTransport, SSHTransport, Transport
 
@@ -15,18 +16,21 @@ _registry_lock = threading.Lock()
 _clusters: dict[str, Cluster] = {}
 
 
-class Cluster:
+class Cluster(SlurmOps):
     """A view onto one remote login node.
 
     Construct with :meth:`Cluster.connect` (uses config + ssh) or :meth:`Cluster.local`
     (runs the stub locally; used by tests).
     """
 
-    def __init__(self, host: HostConfig, transport: Transport) -> None:
+    def __init__(self, host: HostConfig, transport: Transport, session: Any = None) -> None:
         self.host = host
         self.transport = transport
-        self.session = Session(transport)
+        self.session = session if session is not None else Session(transport)
         self._info: dict[str, Any] | None = None
+        self._squeue_cache = None
+        self._squeue_lock = threading.Lock()
+        self._registry = None
 
     # -- constructors --------------------------------------------------------------------
     @classmethod
@@ -45,7 +49,8 @@ class Cluster:
     @staticmethod
     def _transport_for(host: HostConfig) -> Transport:
         if host.ssh == "local" or host.extra.get("transport") == "local":
-            return LocalTransport()
+            env = host.extra.get("env")
+            return LocalTransport(env={str(k): str(v) for k, v in env.items()} if env else None)
         return SSHTransport(
             alias=host.ssh,
             mfa=host.mfa,

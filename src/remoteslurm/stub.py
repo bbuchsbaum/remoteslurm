@@ -687,6 +687,8 @@ def op_scontrol(args):
     ident = args.get("id")
     if what not in ("job", "partition", "node", "config"):
         raise StubError("invalid_arg", "unsupported scontrol entity")
+    if what == "job" and (ident is None or not re.match(r"^\d+(_\d+)?$", str(ident))):
+        raise StubError("invalid_arg", "scontrol show job requires a single job id", id=ident)
     argv = ["scontrol", "-o", "show", what]
     if ident is not None:
         argv.append(str(ident))

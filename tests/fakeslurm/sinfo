@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""FakeSlurm sinfo: prints the recorded ``tests/fixtures/slurm/sinfo.txt`` verbatim."""
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FIXTURE = os.path.join(HERE, "..", "fixtures", "slurm", "sinfo.txt")
+
+if __name__ == "__main__":
+    with open(FIXTURE, encoding="utf-8") as f:
+        sys.stdout.write(f.read())

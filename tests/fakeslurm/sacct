@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""FakeSlurm sacct: ``sacct -n -P --format=F1,F2 [-j ids] [-S since] [-u user] [-X]``."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _fakeslurm as fs  # noqa: E402
+
+
+def row(job, fields, step=None):
+    """Values for the main row (``step is None``) or a ``.batch``/``.extern`` step row."""
+    jid = str(job["id"]) + ("." + step if step else "")
+    elapsed = fs.hms(fs.elapsed_seconds(job))
+    start = fs.ts(job["start_time"]) if job["start_time"] else ""
+    end = fs.ts(job["end_time"]) if job["end_time"] else ""
+    vals = {
+        "jobid": jid,
+        "jobname": step if step else job["name"],
+        "state": job["state_raw"] if step is None else job["state"],
+        "exitcode": job["exit_code"],
+        "elapsed": elapsed,
+        "maxrss": "15848K" if step == "batch" else "",
+        "nodelist": job["nodelist"] or "None assigned",
+        "start": start or "Unknown",
+        "end": end or "Unknown",
+        "submit": fs.ts(job["submit_time"]) if step is None else (start or ""),
+        "partition": job["partition"] if step is None else "",
+        "account": job["account"],
+        "alloccpus": "1",
+        "reqmem": "1000M" if step is None else "",
+        "workdir": job["workdir"] if step is None else "",
+        "timelimit": job["time_limit"] if step is None else "",
+        "user": job["user"] if step is None else "",
+    }
+    return "|".join(vals.get(f.lower(), "") for f in fields)
+
+
+def main():
+    args = sys.argv[1:]
+    fields = ["JobID", "JobName", "State", "ExitCode"]
+    ids = None
+    users = None
+    steps = True
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-n", "--noheader", "-P", "--parsable2", "-a", "--allusers"):
+            pass
+        elif a == "-X" or a == "--allocations":
+            steps = False
+        elif a.startswith("--format="):
+            fields = a.split("=", 1)[1].split(",")
+        elif a == "--format" or a == "-o":
+            i += 1
+            fields = args[i].split(",")
+        elif a == "-j" or a == "--jobs":
+            i += 1
+            ids = fs.lookup_ids(args[i])
+        elif a == "-u" or a == "--user":
+            i += 1
+            users = args[i].split(",")
+        elif a in ("-S", "--starttime", "-E", "--endtime"):
+            i += 1  # accepted, ignored
+        i += 1
+    if users is None and ids is None:
+        users = [fs.user()]
+
+    with fs.locked_state() as state:
+        jobs = state["jobs"]
+        if ids is not None:
+            rows = [jobs[j] for j in ids if j in jobs]
+        else:
+            rows = [j for j in jobs.values() if j["user"] in users]
+        lines = []
+        for job in sorted(rows, key=lambda j: j["id"]):
+            if not fs.accounting_visible(job, state):
+                continue
+            lines.append(row(job, fields))
+            if steps and fs.is_terminal(job) and job["start_time"]:
+                lines.append(row(job, fields, "batch"))
+                lines.append(row(job, fields, "extern"))
+        fs.advance(state)
+    sys.stdout.write("".join(line + "\n" for line in lines))
+
+
+if __name__ == "__main__":
+    main()
