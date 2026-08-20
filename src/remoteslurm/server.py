@@ -217,6 +217,53 @@ async def write(
     return await _guard(host, f)
 
 
+@mcp.tool()
+async def edit(
+    path: str,
+    old: str,
+    new: str,
+    expect: int = 1,
+    all: bool = False,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Replace an exact string in a remote text file — use ``edit`` instead of read+write
+    for small changes.
+
+    The occurrence count of ``old`` must equal ``expect`` (default 1) unless ``all`` is
+    true, which replaces every occurrence. On ``error: not_found`` check ``closest`` for
+    near-matching lines; on too many matches the error lists their line numbers — make
+    ``old`` more specific (include surrounding lines) or pass ``all=true``. Returns
+    ``replacements``, ``first_line`` and a unified-diff ``preview``. Line endings and
+    file mode are preserved; the replace is atomic.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.edit(path, old, new, expect=expect, all=all)
+
+    return await _guard(host, f)
+
+
+@mcp.tool()
+async def diff(
+    path: str,
+    content: str,
+    context: int = 3,
+    max_lines: int = 500,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Unified diff of a remote text file against ``content`` (what you expect it to say).
+
+    Returns ``identical`` (bool), ``diff`` (unified diff text, ``context`` lines of
+    context, at most ``max_lines`` lines — ``truncated`` flags the cut). Cheap way to
+    check whether a remote file matches a local version before overwriting it.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.diff(path, content, context=context, max_lines=max_lines)
+
+    return await _guard(host, f)
+
+
 # -- commands ---------------------------------------------------------------------------------
 @mcp.tool()
 async def run(
@@ -399,6 +446,69 @@ async def connection(host: str | None = None) -> dict[str, Any]:
         return e.to_dict()
     except Exception as e:  # noqa: BLE001
         return {"error": "internal", "message": f"{type(e).__name__}: {e}"}
+
+
+# -- project sync -----------------------------------------------------------------------------
+@mcp.tool()
+async def sync(
+    project: str | None = None,
+    direction: str = "push",
+    dry_run: bool = False,
+    delete: bool = False,
+    force: bool = False,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """rsync a configured project between the local machine and the cluster.
+
+    Projects come from ``[hosts.X.projects.NAME]`` in the config (``projects`` lists them).
+    Omit ``project`` to pick the one containing the current directory. ``direction`` is
+    ``"push"`` (default) or ``"pull"``. ``dry_run=True`` shows what would change without
+    touching anything. ``delete=True`` removes remote files missing locally, and only works
+    when the project also sets ``delete = true`` (double opt-in). Oversized pushes are
+    refused (``error: too_large``) unless ``force=True``. rsync runs locally in the server
+    process; a ``.remoteslurm-sync.json`` marker is written after each successful push.
+    """
+    from pathlib import Path
+
+    from . import sync as sync_mod
+    from .errors import InvalidArgument
+
+    def f(c: Cluster) -> dict[str, Any]:
+        if direction not in ("push", "pull"):
+            raise InvalidArgument(
+                f"direction must be 'push' or 'pull', not {direction!r}",
+            )
+        p = sync_mod.resolve_project(c.host, project, Path.cwd())
+        return sync_mod.sync(
+            c,
+            p,
+            pull=direction == "pull",
+            dry_run=dry_run,
+            delete=delete,
+            force=force,
+        )
+
+    return await _guard(host, f)
+
+
+@mcp.tool()
+async def projects(host: str | None = None) -> dict[str, Any]:
+    """List the host's configured sync projects (name, local, remote, excludes)."""
+
+    def f(c: Cluster) -> dict[str, Any]:
+        rows = [
+            {
+                "name": name,
+                "local": p.local,
+                "remote": p.remote,
+                "exclude": p.exclude,
+                "delete": p.delete,
+            }
+            for name, p in sorted(c.host.projects.items())
+        ]
+        return {"projects": rows, "count": len(rows), "host": c.host.name}
+
+    return await _guard(host, f)
 
 
 # -- entry points ------------------------------------------------------------------------------

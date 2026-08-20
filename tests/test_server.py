@@ -20,6 +20,8 @@ EXPECTED_TOOLS = {
     "grep",
     "glob",
     "write",
+    "edit",
+    "diff",
     "run",
     "submit",
     "jobs",
@@ -28,6 +30,8 @@ EXPECTED_TOOLS = {
     "sinfo",
     "info",
     "connection",
+    "sync",
+    "projects",
 }
 
 

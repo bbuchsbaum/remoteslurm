@@ -38,6 +38,31 @@ def state_dir() -> Path:
 
 
 @dataclass
+class ProjectConfig:
+    """A local↔remote directory pair kept in sync with rsync (``rslurm sync``)."""
+
+    name: str
+    local: str
+    remote: str
+    exclude: list[str] = field(default_factory=list)  # rsync filter patterns
+    delete: bool = False  # allow --delete on push (still needs delete=True on the call)
+
+    @classmethod
+    def from_dict(cls, name: str, d: dict[str, Any]) -> ProjectConfig:
+        known = {f for f in cls.__dataclass_fields__ if f != "name"}
+        unknown = set(d) - known
+        if unknown:
+            raise ConfigError(f"unknown key(s) in project {name!r}: {sorted(unknown)}")
+        try:
+            return cls(name=name, **d)
+        except TypeError as e:
+            raise ConfigError(f"bad config for project {name!r}: {e}") from e
+
+    def local_path(self) -> Path:
+        return Path(os.path.expandvars(self.local)).expanduser()
+
+
+@dataclass
 class HostConfig:
     name: str
     ssh: str  # ssh alias / hostname as understood by the user's ssh config
@@ -54,13 +79,22 @@ class HostConfig:
     defaults: dict[str, Any] = field(
         default_factory=dict
     )  # default sbatch args, e.g. {"time": "1:00:00"}
+    projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    max_sync_files: int = 50_000  # sync guard: max files on a non-dry push
+    max_sync_bytes: int = 2 * 1024**3  # sync guard: max bytes on a non-dry push
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, name: str, d: dict[str, Any]) -> HostConfig:
-        known = {f for f in cls.__dataclass_fields__ if f not in ("name", "extra")}
+        known = {f for f in cls.__dataclass_fields__ if f not in ("name", "extra", "projects")}
         kw = {k: v for k, v in d.items() if k in known}
-        extra = {k: v for k, v in d.items() if k not in known}
+        extra = {k: v for k, v in d.items() if k not in known and k != "projects"}
+        projects: dict[str, ProjectConfig] = {}
+        for pname, pd in (d.get("projects") or {}).items():
+            if not isinstance(pd, dict):
+                raise ConfigError(f"[hosts.{name}.projects.{pname}] must be a table")
+            projects[pname] = ProjectConfig.from_dict(pname, pd)
+        kw["projects"] = projects
         kw.setdefault("ssh", name)
         try:
             return cls(name=name, extra=extra, **kw)
@@ -122,4 +156,11 @@ account = "rrg-someone"     # default --account for sbatch
 # allow_run = true          # enable the `run` (arbitrary command) tool
 # [hosts.trillium.defaults]
 # time = "1:00:00"
+
+# A project is a local<->remote directory pair for `rslurm sync` (rsync):
+# [hosts.trillium.projects.mvpa]
+# local   = "~/code/mvpa"
+# remote  = "$PROJECT/mvpa"        # expanded on the remote side
+# exclude = [".git", "__pycache__", "*.nii.gz", "results/"]
+# delete  = false                  # allow --delete on push (still needs --delete on the call)
 """

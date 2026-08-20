@@ -182,6 +182,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         check("host", False, e.message, e.action or "")
         return EXIT_ERROR
     check("host", True, f"{host.name} (ssh alias {host.ssh!r}, mfa={host.mfa})")
+    from . import sync as sync_mod
+
+    found_rsync = sync_mod.find_rsync()
+    if found_rsync and found_rsync[1] >= sync_mod.MIN_RSYNC:
+        v = found_rsync[1]
+        check("rsync", True, f"{found_rsync[0]} ({v[0]}.{v[1]})")
+    else:
+        detail = (
+            f"{found_rsync[0]} is {found_rsync[1][0]}.{found_rsync[1][1]} (need >= 3.1)"
+            if found_rsync
+            else "not found"
+        )
+        # Only fail doctor when the host actually has sync projects configured.
+        check(
+            "rsync",
+            False if host.projects else None,
+            detail,
+            "brew install rsync (needed for `rslurm sync`)",
+        )
     if host.ssh != "local":
         check("ssh binary", ssh_available(), shutil.which("ssh") or "not found")
         try:
@@ -416,29 +435,162 @@ def cmd_get(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _str_or_file(inline: str | None, file: str | None, what: str) -> str:
+    if (inline is None) == (file is None):
+        raise InvalidArgument(f"exactly one of --{what} or --{what}-file is required")
+    if file is not None:
+        p = Path(file).expanduser()
+        if not p.is_file():
+            raise InvalidArgument(f"local file not found: {p}")
+        return p.read_text(encoding="utf-8")
+    assert inline is not None
+    return inline
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    host, path = split_target(args.target, args.host)
+    old = _str_or_file(args.old, args.old_file, "old")
+    new = _str_or_file(args.new, args.new_file, "new")
+    c = get_cluster(args, host)
+    r = c.edit(path, old, new, expect=args.expect, all=args.all)
+
+    def human(r: dict[str, Any]) -> None:
+        print(f"edited {r['path']}: {r['replacements']} replacement(s) at line {r['first_line']}")
+        if r.get("preview"):
+            print(r["preview"])
+
+    emit(args, r, human)
+    return EXIT_OK
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    host, path = split_target(args.target, args.host)
+    if (args.localfile is None) == (args.remote is None):
+        raise InvalidArgument("give a LOCALFILE or --remote PATH_B (not both)")
+    c = get_cluster(args, host)
+    if args.localfile is not None:
+        local = Path(args.localfile).expanduser()
+        if not local.is_file():
+            raise InvalidArgument(f"local file not found: {local}")
+        r = c.diff(path, local.read_bytes(), context=args.context, max_lines=args.max_lines)
+        r["path_b"] = str(local)
+    else:
+        r = c.diff(path, path_b=args.remote, context=args.context, max_lines=args.max_lines)
+
+    def human(r: dict[str, Any]) -> None:
+        if r["diff"]:
+            print(r["diff"])
+        if r["truncated"]:
+            print(f"[diff truncated at {r['lines']} lines; use --max-lines]", file=sys.stderr)
+
+    emit(args, r, human)
+    return EXIT_OK if r["identical"] else EXIT_ERROR
+
+
 def _rsync(c: Cluster, src: str, dest: str, *, to_remote: bool, args: argparse.Namespace) -> int:
+    from . import sync as sync_mod
+
     if not isinstance(c.transport, SSHTransport):
         raise InvalidArgument("rsync transfer requires an ssh host")
-    if not shutil.which("rsync"):
-        raise InvalidArgument("rsync not found locally")
+    found = sync_mod.find_rsync()
+    if found is None:
+        raise InvalidArgument("rsync not found locally", action="brew install rsync")
     alias = c.transport.alias
     # expand ~ and $VARS remotely without interpolating into a shell string; -s protects args
     target = dest if to_remote else src
-    remote = c.run(["sh", "-c", 'eval "printf %s $1"', "_", target.replace('"', "")])["stdout"]
-    remote = remote or target
+    remote = sync_mod.expand_remote(c, target)
     rs = [
-        "rsync",
+        found[0],
         "-az",
         "-s",
         "--info=progress2",
         "-e",
-        "ssh -o ControlMaster=no -o BatchMode=yes",
+        sync_mod.DEFAULT_SSH,
     ]
     rs += [src, f"{alias}:{remote}"] if to_remote else [f"{alias}:{remote}", dest]
     if not args.json:
         print(" ".join(shlex.quote(x) for x in rs), file=sys.stderr)
     r = subprocess.run(rs)
     return r.returncode
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    from . import sync as sync_mod
+
+    c = get_cluster(args)
+    project = sync_mod.resolve_project(c.host, args.project, Path.cwd())
+    r = sync_mod.sync(
+        c,
+        project,
+        pull=args.pull,
+        dry_run=args.dry_run,
+        delete=args.delete,
+        force=args.force,
+        timeout=args.timeout,
+    )
+    c.registry.audit(
+        "sync",
+        project=r["project"],
+        direction=r["direction"],
+        dry_run=r["dry_run"],
+        delete=args.delete,
+        files=r["files"],
+        bytes=r["bytes"],
+    )
+
+    def human(r: dict[str, Any]) -> None:
+        arrow = "<-" if r["direction"] == "pull" else "->"
+        pre = "[dry-run] " if r["dry_run"] else "✓ "
+        print(f"{pre}{r['project']}: {r['local']} {arrow} {c.host.name}:{r['remote']}")
+        if r["counts"]:
+            cnt = r["counts"]
+            print(
+                f"  created {cnt['created']}, updated {cnt['updated']}, "
+                f"deleted {cnt['deleted']} ({cnt['files']} file(s), "
+                f"{fmt_size(cnt['bytes'])} transferred)"
+            )
+        else:
+            print("  (could not parse rsync output; transfer completed with rc 0)")
+
+    emit(args, r, human)
+    return EXIT_OK
+
+
+def cmd_projects(args: argparse.Namespace) -> int:
+    from . import sync as sync_mod
+
+    cfg = Config.load(Path(args.config) if getattr(args, "config", None) else None)
+    host = cfg.host(args.host)
+    rows: list[dict[str, Any]] = []
+    c: Cluster | None = get_cluster(args) if (args.verbose and host.projects) else None
+    for name, p in sorted(host.projects.items()):
+        row: dict[str, Any] = {
+            "name": name,
+            "local": p.local,
+            "remote": p.remote,
+            "delete": p.delete,
+            "exclude": p.exclude,
+        }
+        if c is not None:
+            row["marker"] = sync_mod.read_marker(c, p)
+        rows.append(row)
+
+    def human(d: dict[str, Any]) -> None:
+        if not d["projects"]:
+            print(f"no projects configured for host {host.name}")
+            return
+        for r in d["projects"]:
+            line = f"{r['name']:16} {r['local']} -> {r['remote']}"
+            if r["delete"]:
+                line += "  [delete allowed]"
+            print(line)
+            if marker := r.get("marker"):
+                rev = (marker.get("local_git_rev") or "?")[:12]
+                dirty = " (dirty)" if marker.get("local_dirty") else ""
+                print(f"{'':16} last push {marker.get('pushed_at')} rev {rev}{dirty}")
+
+    emit(args, {"projects": rows, "host": host.name, "count": len(rows)}, human)
+    return EXIT_OK
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
@@ -493,6 +645,7 @@ def _print_jobs(rows: list[dict[str, Any]]) -> None:
         print("no jobs")
         return
     cols = ["job_id", "name", "state", "elapsed", "time_limit", "nodelist", "reason", "exit_code"]
+
     def cell(r: dict[str, Any], k: str) -> str:
         v = r.get(k)
         return "" if v is None else str(v)
@@ -776,6 +929,43 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("src", help="[HOST:]PATH")
     sp.add_argument("dest", nargs="?", default=".")
     sp.add_argument("--rsync", action="store_true")
+
+    sp = add("edit", cmd_edit, "replace an exact string in a remote text file (atomic)")
+    sp.add_argument("target", help="[HOST:]PATH")
+    sp.add_argument("--old", help="exact string to replace")
+    sp.add_argument("--new", help="replacement string")
+    sp.add_argument("--old-file", metavar="FILE", help="read OLD from a local file (multi-line)")
+    sp.add_argument("--new-file", metavar="FILE", help="read NEW from a local file (multi-line)")
+    sp.add_argument("--all", action="store_true", help="replace every occurrence")
+    sp.add_argument("--expect", type=int, default=1, help="required occurrence count (default 1)")
+
+    sp = add(
+        "diff", cmd_diff, "unified diff of a remote file vs a local file (exit 1 if different)"
+    )
+    sp.add_argument("target", help="[HOST:]PATH")
+    sp.add_argument("localfile", nargs="?", help="local file to compare against")
+    sp.add_argument(
+        "--remote", metavar="PATH_B", help="compare against another remote path instead"
+    )
+    sp.add_argument("-C", "--context", type=int, default=3)
+    sp.add_argument("--max-lines", type=int, default=500)
+
+    sp = add("sync", cmd_sync, "rsync a configured project to (or from) the cluster")
+    sp.add_argument("project", nargs="?", help="project name (default: the one containing CWD)")
+    sp.add_argument("--pull", action="store_true", help="remote -> local instead of push")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="show changes without applying")
+    sp.add_argument(
+        "--delete",
+        action="store_true",
+        help="delete files missing from the source (project must also set delete = true)",
+    )
+    sp.add_argument("--force", action="store_true", help="skip the size guard")
+    sp.add_argument("--timeout", type=int, default=1800, help="rsync timeout in seconds")
+
+    sp = add("projects", cmd_projects, "list the host's configured sync projects")
+    sp.add_argument(
+        "-v", "--verbose", action="store_true", help="also read each remote sync marker (slower)"
+    )
 
     sp = add(
         "submit",

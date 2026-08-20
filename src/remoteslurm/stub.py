@@ -17,6 +17,7 @@
 # stray output from other sources is skipped.
 
 import base64
+import difflib
 import errno
 import fnmatch
 import getpass
@@ -52,6 +53,11 @@ DEFAULT_RUN_TIMEOUT = 60
 MAX_RUN_TIMEOUT = 3600
 DEFAULT_RUN_OUTPUT = 64 * 1024
 MAX_RUN_OUTPUT = 4 * 1024 * 1024
+MAX_EDIT_BYTES = 8 * 1024 * 1024
+EDIT_PREVIEW_BYTES = 4096
+DEFAULT_DIFF_LINES = 500
+MAX_DIFF_LINES = 5000
+DIFF_MAX_LINE = 2000
 
 
 class StubError(Exception):
@@ -397,16 +403,199 @@ def op_write(args):
             with io.open(p, "ab") as f:
                 f.write(data)
         else:
+            # Preserve the mode of an existing file across the atomic replace (the
+            # tmp file is created with the default umask, not the old mode).
+            prev_mode = None
+            try:
+                prev_mode = statmod.S_IMODE(os.stat(p).st_mode)
+            except OSError:
+                pass
             tmp = "%s.%d.tmp" % (p, os.getpid())
             with io.open(tmp, "wb") as f:
                 f.write(data)
             os.replace(tmp, p)
+            if mode is None and prev_mode is not None:
+                os.chmod(p, prev_mode)
         if mode is not None:
             os.chmod(p, int(mode))
         st = os.stat(p)
     except OSError as e:
         raise _os_error(e, p)
     return {"path": p, "size": st.st_size, "written": len(data)}
+
+
+def _read_all_text_bytes(p):
+    """Whole-file read for edit/diff: bounded to MAX_EDIT_BYTES, binaries refused."""
+    if os.path.isdir(p):
+        raise StubError("invalid_arg", "is a directory: %s" % p, path=p)
+    try:
+        size = os.path.getsize(p)
+        if size > MAX_EDIT_BYTES:
+            raise StubError(
+                "too_large", "file exceeds %d bytes: %s" % (MAX_EDIT_BYTES, p), path=p, size=size
+            )
+        with io.open(p, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise _os_error(e, p)
+    if _is_binary(data[:8192]):
+        raise StubError("invalid_arg", "binary file: %s" % p, path=p)
+    return data
+
+
+def _closest_lines(data, old_b):
+    """Up to 3 lines of the file that look like the (missing) old string."""
+    target_lines = _decode(old_b).splitlines()
+    target = target_lines[0].strip()[:200] if target_lines else ""
+    if not target:
+        return []
+    cands = []
+    seen = set()
+    for ln in _decode(data).splitlines()[:5000]:
+        s = ln.strip()[:200]
+        if s and s not in seen:
+            seen.add(s)
+            cands.append(s)
+    return difflib.get_close_matches(target, cands, n=3, cutoff=0.4)
+
+
+def _occurrence_lines(data, old_b, cap=20):
+    """1-based line numbers of each occurrence of old_b (at most cap)."""
+    lines = []
+    idx = data.find(old_b)
+    while idx != -1 and len(lines) < cap:
+        lines.append(data.count(b"\n", 0, idx) + 1)
+        idx = data.find(old_b, idx + len(old_b))
+    return lines
+
+
+def _diff_preview(a, b):
+    """Unified diff (context 3) of the change, bounded to EDIT_PREVIEW_BYTES chars."""
+    buf = []
+    n = 0
+    for ln in difflib.unified_diff(
+        _decode(a).splitlines(), _decode(b).splitlines(), n=3, lineterm=""
+    ):
+        buf.append(ln)
+        n += len(ln) + 1
+        if n > EDIT_PREVIEW_BYTES:
+            break
+    return "\n".join(buf)[:EDIT_PREVIEW_BYTES]
+
+
+def op_edit(args):
+    """Replace exact occurrences of `old` with `new` in a text file, atomically.
+
+    Byte-based replacement, so line endings are preserved by construction. The
+    file is replaced via `path.<pid>.tmp` + os.replace: the inode changes and
+    hard links are not preserved; the previous mode is restored with chmod.
+    """
+    p = _path(args.get("path"), must_exist=True)
+    old = args.get("old")
+    new = args.get("new")
+    if not isinstance(old, str) or not isinstance(new, str):
+        raise StubError("invalid_arg", "old and new must be strings")
+    if old == "":
+        raise StubError("invalid_arg", "old must not be empty", path=p)
+    if old == new:
+        raise StubError("invalid_arg", "old and new are identical", path=p)
+    replace_all = bool(args.get("all", False))
+    expect = args.get("expect", 1)
+    try:
+        expect = int(expect)
+    except (TypeError, ValueError):
+        raise StubError("invalid_arg", "expect must be an integer")
+    if expect < 1:
+        raise StubError("invalid_arg", "expect must be >= 1")
+    data = _read_all_text_bytes(p)
+    old_b = old.encode("utf-8")
+    new_b = new.encode("utf-8")
+    count = data.count(old_b)
+    if count == 0:
+        raise StubError(
+            "not_found",
+            "old string not found in %s" % p,
+            path=p,
+            closest=_closest_lines(data, old_b),
+        )
+    if not replace_all and count != expect:
+        raise StubError(
+            "invalid_arg",
+            "found %d occurrence(s) of old in %s, expected %d" % (count, p, expect),
+            path=p,
+            count=count,
+            expect=expect,
+            lines=_occurrence_lines(data, old_b),
+            action="pass all=true to replace every occurrence, or make old more specific",
+        )
+    first_idx = data.find(old_b)
+    first_line = data.count(b"\n", 0, first_idx) + 1
+    new_data = data.replace(old_b, new_b)
+    if len(new_data) > MAX_EDIT_BYTES:
+        raise StubError("too_large", "edited file would exceed %d bytes" % MAX_EDIT_BYTES, path=p)
+    try:
+        st = os.stat(p)
+        tmp = "%s.%d.tmp" % (p, os.getpid())
+        with io.open(tmp, "wb") as f:
+            f.write(new_data)
+        os.replace(tmp, p)
+        os.chmod(p, statmod.S_IMODE(st.st_mode))
+    except OSError as e:
+        raise _os_error(e, p)
+    return {
+        "path": p,
+        "replacements": count,
+        "first_line": first_line,
+        "preview": _diff_preview(data, new_data),
+    }
+
+
+def op_diff(args):
+    """Unified diff between a remote text file and given content (or another file)."""
+    p = _path(args.get("path"), must_exist=True)
+    a = _read_all_text_bytes(p)
+    label_b = "<content>"
+    if args.get("content_b64") is not None:
+        b = base64.b64decode(args["content_b64"])
+    elif args.get("content") is not None:
+        c = args["content"]
+        if not isinstance(c, str):
+            raise StubError("invalid_arg", "content must be a string")
+        b = c.encode("utf-8")
+    elif args.get("path_b"):
+        pb = _path(args["path_b"], must_exist=True)
+        b = _read_all_text_bytes(pb)
+        label_b = pb
+    else:
+        raise StubError("invalid_arg", "one of content, content_b64 or path_b is required")
+    if _is_binary(b[:8192]):
+        raise StubError("invalid_arg", "binary content")
+    context = _clamp(args.get("context"), 3, 100, lo=0)
+    max_lines = _clamp(args.get("max_lines"), DEFAULT_DIFF_LINES, MAX_DIFF_LINES)
+    identical = a == b
+    lines = []
+    truncated = False
+    if not identical:
+        for ln in difflib.unified_diff(
+            _decode(a).splitlines(),
+            _decode(b).splitlines(),
+            fromfile=p,
+            tofile=label_b,
+            n=context,
+            lineterm="",
+        ):
+            if len(lines) >= max_lines:
+                truncated = True
+                break
+            lines.append(ln[:DIFF_MAX_LINE])
+    return {
+        "path": p,
+        "path_b": label_b,
+        "diff": "\n".join(lines),
+        "lines": len(lines),
+        "identical": identical,
+        "truncated": truncated,
+    }
 
 
 def op_mkdir(args):
@@ -730,6 +919,8 @@ OPS = {
     "stat": op_stat,
     "read": op_read,
     "write": op_write,
+    "edit": op_edit,
+    "diff": op_diff,
     "mkdir": op_mkdir,
     "rm": op_rm,
     "glob": op_glob,

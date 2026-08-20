@@ -167,6 +167,42 @@ class Cluster(SlurmOps):
             args["content"] = content
         return self.call("write", _timeout=120, **args)
 
+    def edit(
+        self, path: str, old: str, new: str, *, expect: int = 1, all: bool = False
+    ) -> dict[str, Any]:
+        """Replace exact occurrences of ``old`` with ``new`` in a remote text file.
+
+        By default the occurrence count must equal ``expect`` (1); with ``all=True``
+        every occurrence is replaced. Returns ``replacements``, ``first_line`` and a
+        unified-diff ``preview``. Line endings and file mode are preserved; the
+        replacement is atomic (the inode changes, hard links are not preserved).
+        """
+        r = self.call("edit", path=path, old=old, new=new, expect=expect, all=all, _timeout=120)
+        self.registry.audit("edit", path=r["path"], replacements=r["replacements"])
+        return r
+
+    def diff(
+        self,
+        path: str,
+        content: str | bytes | None = None,
+        *,
+        path_b: str | None = None,
+        context: int = 3,
+        max_lines: int = 500,
+    ) -> dict[str, Any]:
+        """Unified diff of a remote text file against ``content`` or another remote file."""
+        args: dict[str, Any] = {
+            "path": path,
+            "path_b": path_b,
+            "context": context,
+            "max_lines": max_lines,
+        }
+        if isinstance(content, bytes):
+            args["content_b64"] = base64.b64encode(content).decode("ascii")
+        elif content is not None:
+            args["content"] = content
+        return self.call("diff", _timeout=120, **args)
+
     def mkdir(self, path: str) -> dict[str, Any]:
         return self.call("mkdir", path=path)
 
