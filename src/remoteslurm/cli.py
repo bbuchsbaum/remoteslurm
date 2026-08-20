@@ -87,7 +87,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             args,
             st,
             lambda d: print(
-                f"daemon pid {d['pid']} up {d['uptime']}s, {d['calls']} calls, socket {d['socket']}\n"
+                f"daemon pid {d['pid']} up {d['uptime']}s, {d['calls']} calls, "
+                f"socket {d['socket']}\n"
                 + "\n".join(
                     f"  {n}: {'alive' if h['alive'] else 'idle'} (remote pid {h['remote_pid']}, "
                     f"{h['spawns']} spawn(s), {h['transport']})"
@@ -572,7 +573,7 @@ def cmd_output(args: argparse.Namespace) -> int:
         max_bytes=args.max_bytes,
         stream="stderr" if args.stderr else "stdout",
     )
-    emit(args, r, lambda r: sys.stdout.write(r.get("content", "")))
+    emit(args, r, lambda r: print(r.get("content", ""), end=""))
     return EXIT_OK
 
 
@@ -637,7 +638,7 @@ def cmd_mcp_config(args: argparse.Namespace) -> int:
 
     host = args.host_name or args.host or Config.load().default_host
     snippet = mcp_config_snippet(host)
-    print(json.dumps(snippet, indent=2))
+    print(snippet if isinstance(snippet, str) else json.dumps(snippet, indent=2))
     if not args.json:
         print(
             "\nAdd to ~/.claude.json (Claude Code) or your agent's MCP config, or run:\n"

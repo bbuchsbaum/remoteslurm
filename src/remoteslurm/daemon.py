@@ -41,15 +41,15 @@ SPAWN_WAIT_SECONDS = 8.0
 
 
 def socket_path() -> Path:
-    if p := os.environ.get(ENV_SOCKET):
-        return Path(p).expanduser()
+    if env := os.environ.get(ENV_SOCKET):
+        return Path(env).expanduser()
     # unix socket paths are length-limited (~104 bytes); prefer a short runtime dir.
     run = os.environ.get("XDG_RUNTIME_DIR")
     base = Path(run) if run else state_dir()
-    p = base / "remoteslurm.sock"
-    if len(str(p).encode()) > 90:
-        p = Path(tempfile.gettempdir()) / f"remoteslurm-{os.getuid()}.sock"
-    return p
+    sock = base / "remoteslurm.sock"
+    if len(str(sock).encode()) > 90:
+        sock = Path(tempfile.gettempdir()) / f"remoteslurm-{os.getuid()}.sock"
+    return sock
 
 
 def _error_payload(e: RemoteSlurmError) -> dict[str, Any]:

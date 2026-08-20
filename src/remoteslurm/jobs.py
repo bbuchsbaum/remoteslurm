@@ -140,7 +140,15 @@ class SlurmOps:
     ) -> Any:  # pragma: no cover
         raise NotImplementedError
 
-    def read(self, path: str, **kw: Any) -> dict[str, Any]:  # pragma: no cover
+    def read(  # pragma: no cover
+        self,
+        path: str,
+        *,
+        max_bytes: int = 65536,
+        offset: int = 0,
+        head: int | None = None,
+        tail: int | None = None,
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     @property
