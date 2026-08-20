@@ -84,8 +84,15 @@ class Cluster(SlurmOps):
         self.close()
 
     # -- low level -------------------------------------------------------------------------
-    def call(self, op: str, *, _timeout: float | None = DEFAULT_TIMEOUT, **args: Any) -> Any:
-        return self.session.call(op, args, timeout=_timeout)
+    def call(
+        self,
+        op: str,
+        *,
+        _timeout: float | None = DEFAULT_TIMEOUT,
+        _cancel_on_timeout: bool = False,
+        **args: Any,
+    ) -> Any:
+        return self.session.call(op, args, timeout=_timeout, cancel_on_timeout=_cancel_on_timeout)
 
     # -- basics ------------------------------------------------------------------------------
     def ping(self) -> dict[str, Any]:
@@ -274,10 +281,13 @@ class Cluster(SlurmOps):
         stdin: str | None = None,
         login: bool = False,
         max_output: int = 65536,
+        cancel_on_timeout: bool = True,
     ) -> dict[str, Any]:
         """Run a command on the login node (bounded output).
 
-        ``cmd`` may be an argv list or a shell string.
+        ``cmd`` may be an argv list or a shell string. When ``cancel_on_timeout`` (the default)
+        the remote process group is killed if the client-side call times out (or is
+        interrupted), so nothing lingers on the login node.
         """
         if not self.host.allow_run:
             raise PermissionDenied(
@@ -296,7 +306,7 @@ class Cluster(SlurmOps):
             args["login"] = login
         else:
             args["argv"] = list(cmd)
-        return self.call("run", _timeout=timeout + 15, **args)
+        return self.call("run", _timeout=timeout + 15, _cancel_on_timeout=cancel_on_timeout, **args)
 
     # -- diagnose -------------------------------------------------------------------------------
     def _safe_user(self) -> str | None:

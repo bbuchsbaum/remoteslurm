@@ -154,19 +154,31 @@ _COLLAPSED_ARRAY_RE = re.compile(r"^(\d+)_\[([\d,\-:%]+)\]$")
 _TASK_ARRAY_RE = re.compile(r"^(\d+)_(\d+)$")
 
 
+MAX_ARRAY_EXPAND = 100_000  # cap task ids materialized from one bracket (guards a huge squeue line)
+
+
 def expand_array_tasks(spec: str) -> list[int]:
     """Expand a Slurm array bracket spec into task ids (order-preserving, deduplicated).
 
     Accepts the bracket form with or without the surrounding ``[...]`` and strips the
     ``%N`` concurrency suffix: ``"[5-9%4]"`` -> ``[5,6,7,8,9]``, ``"5,7,9"`` -> ``[5,7,9]``,
-    ``"0-6:2"`` (step) -> ``[0,2,4,6]``.
+    ``"0-6:2"`` (step) -> ``[0,2,4,6]``. The total is capped at ``MAX_ARRAY_EXPAND`` so a
+    pathological ``0-100000000`` in one squeue row cannot exhaust memory.
     """
     s = spec.strip()
     if s.startswith("[") and s.endswith("]"):
         s = s[1:-1]
     if "%" in s:  # trailing concurrency throttle, e.g. 5-9%4
         s = s.split("%", 1)[0]
-    out: list[int] = []
+    seen: set[int] = set()
+    uniq: list[int] = []
+
+    def add(t: int) -> bool:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+        return len(uniq) < MAX_ARRAY_EXPAND
+
     for part in s.split(","):
         part = part.strip()
         if not part:
@@ -178,15 +190,13 @@ def expand_array_tasks(spec: str) -> list[int]:
                 step = int(step_s)
         if "-" in part.lstrip("-"):  # a range lo-hi (task ids are non-negative)
             lo_s, _, hi_s = part.partition("-")
-            out.extend(range(int(lo_s), int(hi_s) + 1, step))
-        else:
-            out.append(int(part))
-    seen: set[int] = set()
-    uniq: list[int] = []
-    for t in out:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
+            lo, hi = int(lo_s), int(hi_s)
+            hi = min(hi, lo + MAX_ARRAY_EXPAND * step)  # bound the range before iterating
+            for t in range(lo, hi + 1, step):
+                if not add(t):
+                    return uniq
+        elif not add(int(part)):
+            return uniq
     return uniq
 
 
@@ -217,8 +227,10 @@ def parse_squeue(stdout: str) -> list[dict[str, str]]:
                 pseudo["job_id"] = f"{base}_{t}"
                 pseudo["array_base"] = base
                 pseudo["array_task"] = str(t)
+                pseudo["array_collapsed"] = "1"
                 rows.append(pseudo)
             continue
+        row["array_collapsed"] = ""
         m2 = _TASK_ARRAY_RE.match(jid)
         if m2:
             row["array_base"] = m2.group(1)
@@ -249,12 +261,24 @@ def aggregate_array(
         b, sep, t = key.partition("_")
         if sep and b == base_id and t.isdigit():
             task_states[int(t)] = normalize_state(rec.get("state", "UNKNOWN"))
-    for r in squeue_rows:  # squeue overrides: a task shown here is currently active
-        if r.get("array_base") == base_id and r.get("array_task"):
+
+    # squeue overrides sacct for active tasks. Apply explicit rows first, then collapsed-pending
+    # pseudo-rows only for tasks not already seen, so a `123_[4-9]` pending bracket cannot
+    # downgrade a `123_4` that squeue also lists as RUNNING.
+    def apply(rows: list[dict[str, str]], collapsed: bool) -> None:
+        for r in rows:
+            if r.get("array_base") != base_id or not r.get("array_task"):
+                continue
             try:
-                task_states[int(r["array_task"])] = normalize_state(r["state"])
+                t = int(r["array_task"])
             except (TypeError, ValueError):
                 continue
+            if collapsed and t in task_states:
+                continue
+            task_states[t] = normalize_state(r["state"])
+
+    apply([r for r in squeue_rows if r.get("array_collapsed") != "1"], collapsed=False)
+    apply([r for r in squeue_rows if r.get("array_collapsed") == "1"], collapsed=True)
     tasks: dict[str, int] = {}
     for s in task_states.values():
         tasks[s] = tasks.get(s, 0) + 1

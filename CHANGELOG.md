@@ -19,6 +19,9 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
 - Parameter sweeps: `rslurm sweep -P k=v1,v2 …` / `Cluster.sweep` / MCP `sweep` — one array job
   with a params table injected as `RS_PARAM_*`; failed tasks' params shown in status/diagnose.
 - Faster `jobs()`: batched `sacct` (allocations-only by default; steps opt-in).
+- Cancellable long ops: the stub runs `run`/`srun`/`sbatch` in a separate pool (so `ping`/`ls`
+  stay instant), a `cancel` op kills the process group, and a client-side `run` timeout or Ctrl-C
+  cancels the remote process instead of leaking it. Request ids are client-generated (survive the daemon).
 
 ## 0.1.0 — 2026-08-20
 

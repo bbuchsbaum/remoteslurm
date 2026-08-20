@@ -313,3 +313,73 @@ def test_sweep_failed_task_params_surface(make_cluster) -> None:
 def test_sweep_tool_registered_in_all_not_core() -> None:
     assert "sweep" in server.ALL_TOOLS
     assert "sweep" not in server.CORE_TOOLS
+
+
+def test_expand_array_tasks_is_bounded():
+    from remoteslurm.slurm import MAX_ARRAY_EXPAND, expand_array_tasks
+
+    big = expand_array_tasks("0-100000000")
+    assert len(big) <= MAX_ARRAY_EXPAND
+    assert expand_array_tasks("0-5")[:3] == [0, 1, 2]
+    assert expand_array_tasks("0-6:2") == [0, 2, 4, 6]
+    assert expand_array_tasks("1,3,5%2") == [1, 3, 5]
+
+
+def test_collapsed_pending_does_not_override_running_task():
+    """A `123_[4-9]` pending bracket must not downgrade a `123_4` that squeue lists RUNNING."""
+    from remoteslurm.slurm import aggregate_array, parse_squeue
+
+    fmt = "%(job_id)s|n|%(state)s|None|debug|acc|0:00|1:00|1|node|s|t|/w|me"
+    rows = parse_squeue(
+        "\n".join(
+            [
+                fmt % {"job_id": "123_4", "state": "RUNNING"},
+                fmt % {"job_id": "123_[4-9]", "state": "PENDING"},
+            ]
+        )
+    )
+    agg = aggregate_array("123", rows, {})
+    assert agg["task_states"][4] == "RUNNING"  # explicit running wins over collapsed pending
+    assert agg["task_states"][9] == "PENDING"
+    assert agg["state"] == "RUNNING"
+
+
+def test_sweep_wrapper_json_matches_env_for_quoted_values(cluster, sandbox, tmp_path):
+    """RS_PARAM_<name> and RS_PARAMS_JSON must agree even for values containing quotes."""
+    import json as _json
+    import subprocess as _sp
+
+    from remoteslurm import jobs
+
+    names = ["arg", "n"]
+    rows = [{"arg": '--flag="hi there"', "n": "3"}]
+    tsv = jobs.params_tsv(names, rows)
+    (sandbox / "params.tsv").write_text(tsv)
+    wrapper = jobs.sweep_wrapper(
+        str(sandbox / "params.tsv"), "t", body='echo "$RS_PARAM_arg"; echo "$RS_PARAMS_JSON"'
+    )
+    (sandbox / "w.sh").write_text(wrapper)
+    env = {**__import__("os").environ, "SLURM_ARRAY_TASK_ID": "0"}
+    out = _sp.run(["bash", str(sandbox / "w.sh")], capture_output=True, text=True, env=env).stdout
+    param_line, json_line = out.splitlines()[0], out.splitlines()[1]
+    assert param_line == '--flag="hi there"'
+    assert _json.loads(json_line)["arg"] == '--flag="hi there"'
+    assert _json.loads(json_line)["n"] == "3"
+
+
+def test_sweep_size_guard(cluster):
+    import pytest as _pytest
+
+    from remoteslurm.errors import InvalidArgument
+
+    with _pytest.raises(InvalidArgument):
+        cluster.sweep({"a": list(range(40)), "b": list(range(40))}, script="echo hi\n")
+
+
+def test_output_path_expansion_single_pass(cluster):
+    """A job name containing %a or / must not re-expand or redirect the read path."""
+    from remoteslurm import slurm
+
+    st = slurm.JobStatus(job_id="9", state="COMPLETED", source="sacct", name="weird%a/name")
+    out = cluster._expand_output_path("/logs/%x-%A_%a.out", "9", "3", st)
+    assert out == "/logs/weird_a_name-9_3.out"  # %a inside the name was NOT re-expanded

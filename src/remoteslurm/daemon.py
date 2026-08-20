@@ -7,9 +7,13 @@ spawned on demand and exits after an idle period. All higher-level logic (job st
 registry, ...) stays in the client — the daemon only multiplexes ``Cluster.call``.
 
 Wire format: one JSON object per line in each direction.
-  -> {"host": str|null, "op": str, "args": {...}, "timeout": float|null}
+  -> {"host": str|null, "op": str, "args": {...}, "timeout": float|null,
+      "id": str|null, "cancel_on_timeout": bool}
   <- {"ok": true, "result": ...} | {"ok": false, "error": {"code", "message", "action", ...}}
-Control ops start with an underscore: ``_status``, ``_stop``, ``_close`` (drop one host).
+Control ops start with an underscore: ``_status``, ``_stop``, ``_close`` (drop one host),
+``_cancel`` ({host, id}: kill the slow op running under that client-generated id). The request
+``id`` is generated client-side so it survives the daemon hop and a later ``_cancel`` (sent on
+a second connection when the first call times out or is interrupted) can name the same op.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -170,11 +175,25 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
             if c:
                 c.close()
             return {"closed": bool(c)}
+        if op == "_cancel":
+            from .cluster import _clusters
+
+            rid = str(req.get("id"))
+            c = _clusters.get(str(host))
+            if c is None:
+                return {"cancelled": False, "id": rid, "reason": "no session"}
+            return c.session.cancel(rid)
         if op == "_host":
             c = self._cluster(host)
             return {k: v for k, v in c.host.__dict__.items()}
         c = self._cluster(host)
-        return c.session.call(op, args, timeout=timeout if timeout is not None else 60.0)
+        return c.session.call(
+            op,
+            args,
+            timeout=timeout if timeout is not None else 60.0,
+            cancel_on_timeout=bool(req.get("cancel_on_timeout")),
+            request_id=req.get("id"),
+        )
 
     def serve(self) -> None:
         watchdog = threading.Thread(target=self._idle_watch, daemon=True)
@@ -336,13 +355,48 @@ class DaemonSession:
         return None
 
     def call(
-        self, op: str, args: dict[str, Any] | None = None, *, timeout: float | None = 60.0
+        self,
+        op: str,
+        args: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = 60.0,
+        cancel_on_timeout: bool = False,
+        request_id: str | None = None,
     ) -> Any:
-        return _request(
-            self.path,
-            {"host": self.host, "op": op, "args": args or {}, "timeout": timeout},
-            timeout,
-        )
+        # The id is generated client-side so it survives the hop to the daemon-side session;
+        # if this call times out or the user interrupts it, `_cancel` (a second connection)
+        # can name the same op and kill it.
+        rid = request_id or uuid.uuid4().hex[:12]
+        req = {
+            "host": self.host,
+            "op": op,
+            "args": args or {},
+            "timeout": timeout,
+            "id": rid,
+            "cancel_on_timeout": cancel_on_timeout,
+        }
+        try:
+            return _request(self.path, req, timeout)
+        except RemoteTimeout:
+            if cancel_on_timeout:
+                self.cancel(rid)
+            raise
+        except KeyboardInterrupt:
+            self.cancel(rid)
+            raise
+
+    def cancel(self, request_id: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Kill the slow op running under ``request_id`` (best effort, never raises)."""
+        try:
+            return dict(
+                _request(
+                    self.path,
+                    {"host": self.host, "op": "_cancel", "id": request_id},
+                    timeout,
+                )
+            )
+        except Exception:
+            return {"cancelled": False, "id": request_id}
 
 
 def connect_via_daemon(

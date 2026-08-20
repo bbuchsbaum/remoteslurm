@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat as statmod
 import subprocess
@@ -37,7 +38,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 PROTOCOL = 1
 RS = "\x1e"
-WORKERS = 4
+# Two pools so a long `run` (slow) can never queue behind a `ping`/`ls` (fast). Only the
+# escape-hatch ops that spawn a genuinely long-lived subprocess go to the slow pool; they
+# register their Popen so `cancel` can reach them. Everything else (including the short,
+# bounded Slurm queries) stays in the responsive fast pool. `cancel` itself is a fast op so
+# it can never deadlock behind the very ops it is meant to interrupt.
+FAST_WORKERS = 8
+SLOW_WORKERS = 4
+SLOW_OPS = frozenset(("run", "srun", "sbatch"))
+KILL_GRACE = 0.5  # seconds between SIGTERM and SIGKILL when cancelling a process group
 
 DEFAULT_READ_BYTES = 64 * 1024
 MAX_READ_BYTES = 4 * 1024 * 1024
@@ -178,8 +187,32 @@ def _tail_bytes(f, size, nlines, max_bytes):
     return out, size - len(out)
 
 
+def _kill_group(proc, sig):
+    """Signal ``proc``'s whole process group (spawned with ``start_new_session=True``).
+
+    Falls back to signalling just the process if the group can't be resolved. Swallows the
+    races where the process/group has already gone away.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+        return True
+    except (ProcessLookupError, OSError):
+        try:
+            proc.send_signal(sig)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+
+
 def _run(
-    argv, timeout=DEFAULT_RUN_TIMEOUT, cwd=None, env=None, stdin=None, max_output=DEFAULT_RUN_OUTPUT
+    argv,
+    timeout=DEFAULT_RUN_TIMEOUT,
+    cwd=None,
+    env=None,
+    stdin=None,
+    max_output=DEFAULT_RUN_OUTPUT,
+    on_spawn=None,
+    new_session=False,
 ):
     if not isinstance(argv, (list, tuple)) or not argv or not all(isinstance(a, str) for a in argv):
         raise StubError("invalid_arg", "argv must be a non-empty list of strings")
@@ -192,6 +225,8 @@ def _run(
             full_env[str(k)] = str(v)
     t0 = time.time()
     try:
+        # ``start_new_session=True`` puts the child in its own process group so that a cancel
+        # (or a timeout) can kill the whole tree with ``killpg``, not just the immediate child.
         proc = subprocess.Popen(
             list(argv),
             cwd=cwd,
@@ -199,17 +234,28 @@ def _run(
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=new_session,
         )
     except FileNotFoundError:
         raise StubError("not_found", "command not found: %s" % argv[0], command=argv[0])
     except PermissionError:
         raise StubError("permission", "cannot execute: %s" % argv[0], command=argv[0])
+    if on_spawn is not None:
+        # Register the live process so `cancel` can find it; must happen before we block in
+        # communicate(). Registration failure must never take the command down.
+        try:
+            on_spawn(proc)
+        except Exception:  # pragma: no cover - defensive
+            pass
     try:
         out, err = proc.communicate(
             input=stdin.encode("utf-8") if stdin is not None else None, timeout=timeout
         )
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if new_session:
+            _kill_group(proc, signal.SIGKILL)
+        else:
+            proc.kill()
         out, err = proc.communicate()
         raise StubError(
             "timeout",
@@ -818,15 +864,25 @@ def op_run(args):
         env=args.get("env"),
         stdin=args.get("stdin"),
         max_output=max_output,
+        on_spawn=args.get("_register"),
+        new_session=True,
     )
 
 
-def _slurm(argv, timeout=60, cwd=None, stdin=None):
+def _slurm(argv, timeout=60, cwd=None, stdin=None, on_spawn=None, new_session=False):
     if not _which(argv[0]):
         raise StubError(
             "slurm_error", "%s not found on PATH (is this a Slurm login node?)" % argv[0]
         )
-    return _run(argv, timeout=timeout, cwd=cwd, stdin=stdin, max_output=MAX_RUN_OUTPUT)
+    return _run(
+        argv,
+        timeout=timeout,
+        cwd=cwd,
+        stdin=stdin,
+        max_output=MAX_RUN_OUTPUT,
+        on_spawn=on_spawn,
+        new_session=new_session,
+    )
 
 
 def op_sbatch(args):
@@ -866,7 +922,13 @@ def op_sbatch(args):
     else:
         raise StubError("invalid_arg", "either script or path is required")
     argv = ["sbatch", "--parsable"] + extra + [path]
-    res = _slurm(argv, timeout=120, cwd=cwd or os.path.expanduser("~"))
+    res = _slurm(
+        argv,
+        timeout=120,
+        cwd=cwd or os.path.expanduser("~"),
+        on_spawn=args.get("_register"),
+        new_session=True,
+    )
     res["script_path"] = path
     res["argv"] = argv
     return res
@@ -985,8 +1047,12 @@ OPS = {
 class Server(object):
     def __init__(self, out):
         self.out = out
-        self.lock = threading.Lock()
-        self.pool = ThreadPoolExecutor(max_workers=WORKERS)
+        self.lock = threading.Lock()  # serialises writes to stdout
+        self.fast = ThreadPoolExecutor(max_workers=FAST_WORKERS)
+        self.slow = ThreadPoolExecutor(max_workers=SLOW_WORKERS)
+        self.reg_lock = threading.Lock()  # protects `running` and `cancelled`
+        self.running = {}  # request id -> live Popen for cancellable slow ops
+        self.cancelled = set()  # request ids that `cancel` has just killed
         self.alive = True
 
     def send(self, payload):
@@ -998,19 +1064,75 @@ class Server(object):
             except (BrokenPipeError, OSError):
                 self.alive = False
 
+    # -- cancellation registry ------------------------------------------------------------
+    def _register(self, rid, proc):
+        with self.reg_lock:
+            self.running[rid] = proc
+
+    def _unregister(self, rid):
+        with self.reg_lock:
+            self.running.pop(rid, None)
+
+    def _take_cancelled(self, rid):
+        with self.reg_lock:
+            if rid in self.cancelled:
+                self.cancelled.discard(rid)
+                return True
+            return False
+
+    def _cancel(self, args):
+        """Kill the process group of a running slow op and mark it cancelled.
+
+        Returns ``{cancelled: bool, id}``; ``cancelled`` is false (with ``reason``) when the
+        target op is unknown or has already finished (the finish/cancel race).
+        """
+        target = args.get("id")
+        if not isinstance(target, str) or not target:
+            raise StubError("invalid_arg", "cancel requires a string request id")
+        with self.reg_lock:
+            proc = self.running.get(target)
+            if proc is None or proc.poll() is not None:
+                return {"cancelled": False, "id": target, "reason": "not running"}
+            self.cancelled.add(target)
+        _kill_group(proc, signal.SIGTERM)
+        deadline = time.time() + KILL_GRACE
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.02)
+        if proc.poll() is None:
+            _kill_group(proc, signal.SIGKILL)
+        return {"cancelled": True, "id": target}
+
     def handle(self, req):
         rid = req.get("id")
         op = req.get("op")
         args = req.get("args") or {}
         try:
+            if not isinstance(args, dict):
+                raise StubError("invalid_arg", "args must be an object")
+            if op == "cancel":
+                self.send({"id": rid, "ok": True, "result": self._cancel(args), "done": True})
+                return
             fn = OPS.get(op)
             if fn is None:
                 raise StubError("invalid_arg", "unknown op: %r" % (op,))
-            if not isinstance(args, dict):
-                raise StubError("invalid_arg", "args must be an object")
-            result = fn(args)
+            registered = op in SLOW_OPS
+            if registered:
+                # Give the op a callback to register its Popen; copy args so the caller's dict
+                # is never mutated and the internal key can't leak back out.
+                args = dict(args)
+                args["_register"] = lambda proc, _rid=rid: self._register(_rid, proc)
+            try:
+                result = fn(args)
+            finally:
+                if registered:
+                    self._unregister(rid)
+            if registered and self._take_cancelled(rid) and isinstance(result, dict):
+                # The op returned partial output after cancel killed its process group.
+                result["cancelled"] = True
             self.send({"id": rid, "ok": True, "result": result, "done": True})
         except StubError as e:
+            if op in SLOW_OPS:
+                self._take_cancelled(rid)
             self.send({"id": rid, "ok": False, "error": e.to_dict(), "done": True})
         except Exception as e:  # pragma: no cover - defensive
             self.send(
@@ -1045,11 +1167,14 @@ class Server(object):
                     }
                 )
                 continue
-            if req.get("op") == "shutdown":
+            op = req.get("op")
+            if op == "shutdown":
                 self.send({"id": req.get("id"), "ok": True, "result": {"bye": True}, "done": True})
                 break
-            self.pool.submit(self.handle, req)
-        self.pool.shutdown(wait=True)
+            pool = self.slow if op in SLOW_OPS else self.fast
+            pool.submit(self.handle, req)
+        self.fast.shutdown(wait=True)
+        self.slow.shutdown(wait=True)
 
 
 def main():

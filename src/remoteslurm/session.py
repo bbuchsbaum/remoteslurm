@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import itertools
 import json
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import Future
 from typing import Any
 
@@ -33,7 +33,6 @@ class Session:
         self._stderr_thread: threading.Thread | None = None
         self._pending: dict[str, Future[Any]] = {}
         self._lock = threading.Lock()  # protects _pending, _proc and stdin writes
-        self._ids = itertools.count(1)
         self._ready = threading.Event()
         self._ready_error: str | None = None
         self.preamble: list[str] = []  # noise printed before READY (rc files, MOTD)
@@ -203,13 +202,22 @@ class Session:
         self._proc.stdin.write(data)
         self._proc.stdin.flush()
 
-    def submit(self, op: str, args: dict[str, Any] | None = None) -> Future[Any]:
+    @staticmethod
+    def new_request_id() -> str:
+        """A short, client-side request id that survives the daemon hop."""
+        return uuid.uuid4().hex[:12]
+
+    def submit(
+        self, op: str, args: dict[str, Any] | None = None, request_id: str | None = None
+    ) -> Future[Any]:
         with self._lock:
             if not self.alive:
                 if self._proc is not None and self._proc.poll() is not None:
                     self._kill_locked()
                 self._start_locked()
-            rid = str(next(self._ids))
+            rid = str(request_id) if request_id is not None else self.new_request_id()
+            if rid in self._pending:  # collision (or a re-used explicit id): keep ids unique
+                rid = self.new_request_id()
             fut: Future[Any] = Future()
             self._pending[rid] = fut
             try:
@@ -227,19 +235,51 @@ class Session:
         args: dict[str, Any] | None = None,
         *,
         timeout: float | None = DEFAULT_TIMEOUT,
+        cancel_on_timeout: bool = False,
+        request_id: str | None = None,
     ) -> Any:
         if op != "ping" and self.alive and time.time() - self.last_used > STALE_SECONDS:
             self._probe()
-        fut = self.submit(op, args)
+        rid = str(request_id) if request_id is not None else self.new_request_id()
+        fut = self.submit(op, args, request_id=rid)
         try:
             return fut.result(timeout=timeout)
         except TimeoutError as e:
-            with self._lock:
-                for rid, f in list(self._pending.items()):
-                    if f is fut:
-                        self._pending.pop(rid, None)
+            self._forget(fut)
+            if cancel_on_timeout:
+                self.cancel(rid)
             self._raise_if_master_dead()
             raise RemoteTimeout(f"{op} did not complete within {timeout}s", op=op) from e
+        except KeyboardInterrupt:
+            # The user interrupted a blocking call (e.g. Ctrl-C during `run`); make sure the
+            # remote process does not linger before the interrupt propagates.
+            self._forget(fut)
+            if cancel_on_timeout:
+                try:
+                    self.cancel(rid)
+                except Exception:
+                    pass
+            raise
+
+    def _forget(self, fut: Future[Any]) -> None:
+        with self._lock:
+            for rid, f in list(self._pending.items()):
+                if f is fut:
+                    self._pending.pop(rid, None)
+
+    def cancel(self, request_id: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Ask the stub to kill the (slow) op running under ``request_id``.
+
+        Best effort: a dead session or a slow reply yields ``{cancelled: False}`` rather than
+        raising, since the caller is already on an error/interrupt path.
+        """
+        if not self.alive:
+            return {"cancelled": False, "id": request_id, "reason": "session not alive"}
+        try:
+            fut = self.submit("cancel", {"id": request_id})
+            return dict(fut.result(timeout=timeout))
+        except Exception:
+            return {"cancelled": False, "id": request_id}
 
     def _probe(self) -> None:
         """Cheap ping before reusing a session that sat idle (laptop sleep, dead master)."""

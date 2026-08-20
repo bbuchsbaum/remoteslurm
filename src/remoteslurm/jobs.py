@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 SQUEUE_CACHE_SECONDS = 10.0
 ACCOUNTING_GRACE_SECONDS = 600.0  # how long after last sighting we report "accounting_pending"
+MAX_SWEEP_TASKS = 1000  # guard: refuse sweeps larger than a typical Slurm MaxArraySize
 LEARNED_NOTES_CAP = 50
 
 
@@ -181,8 +182,11 @@ export RS_PARAMS_JSON="$(python3 -c 'import sys,json,csv
 tsv=sys.argv[1]
 idx=int(sys.argv[2])
 with open(tsv) as f:
-    rows=list(csv.reader(f,delimiter="\t"))
-print(json.dumps(dict(zip(rows[0],rows[idx+1]))))' "$RS_PARAMS_TSV" "$RS_TASK_ID")"
+    rows=list(csv.reader(f,delimiter="\t",quoting=csv.QUOTE_NONE))
+if 0 <= idx+1 < len(rows):
+    print(json.dumps(dict(zip(rows[0],rows[idx+1]))))
+else:
+    print("{}")' "$RS_PARAMS_TSV" "$RS_TASK_ID")"
 # ---- user body ----
 __BODY__
 """
@@ -681,11 +685,15 @@ class SlurmOps:
         """Roll an array's tasks up into one :class:`slurm.JobStatus` (state + ``extra``)."""
         sacct_jobs = self.sacct([base])  # per-task allocations (states); steps not needed
         agg = slurm.aggregate_array(base, squeue_rows, sacct_jobs)
+        # No task visible in squeue or sacct: the array has aged out of accounting. Report it as
+        # unknown (not a perpetual non-terminal "array") so wait() stops instead of looping.
+        source = "array" if agg["task_states"] else "unknown"
+        terminal = agg["terminal"] or source == "unknown"
         st = slurm.JobStatus(
             job_id=base,
             state=agg["state"],
-            source="array",
-            terminal=agg["terminal"],
+            source=source,
+            terminal=terminal,
             extra={
                 "array": True,
                 "n_tasks": len(agg["task_states"]),
@@ -727,7 +735,7 @@ class SlurmOps:
         rowlist = self._sweep_params_cache.get(path)
         if rowlist is None:
             try:
-                text = self.read(path, max_bytes=1_000_000).get("content", "")
+                text = self.read(path, max_bytes=8 * 1024 * 1024).get("content", "")
             except SlurmError:
                 return None
             lines = [ln for ln in str(text).splitlines() if ln != ""]
@@ -883,19 +891,20 @@ class SlurmOps:
             user = str(self.user)  # type: ignore[attr-defined]
         except (RemoteSlurmError, AttributeError):
             user = ""
-        repl = [
-            ("%A", base),
-            ("%J", f"{base}_{task}" if task is not None else base),
-            ("%j", base),
-            ("%x", st.name or ""),
-            ("%u", user),
-            ("%N", node),
-        ]
-        if task is not None:
-            repl.append(("%a", task))
-        for k, v in repl:
-            path = path.replace(k, v)
-        return path
+        # A job name may itself contain "%" or "/"; sanitize so it cannot inject another
+        # specifier or redirect the read to a different path.
+        jobname = re.sub(r"[%/]", "_", st.name or "")
+        mapping = {
+            "A": base,
+            "J": f"{base}_{task}" if task is not None else base,
+            "j": base,
+            "x": jobname,
+            "u": user,
+            "N": node,
+            "a": task if task is not None else "%a",
+        }
+        # single pass: each %X is replaced exactly once, from the original string
+        return re.sub(r"%([AaJjxuN])", lambda m: mapping[m.group(1)], path)
 
     # -- sweeps -------------------------------------------------------------------------------
     def sweep(
@@ -923,6 +932,14 @@ class SlurmOps:
             raise InvalidArgument("provide exactly one of script= or path=")
         names, rows = sweep_rows(params)
         n = len(rows)
+        if n == 0:
+            raise InvalidArgument("sweep has no parameter rows")
+        if n > MAX_SWEEP_TASKS:
+            raise InvalidArgument(
+                f"sweep would create {n} tasks (limit {MAX_SWEEP_TASKS}); "
+                "Slurm's MaxArraySize is typically ~1000",
+                action="reduce the parameter grid or split the sweep",
+            )
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:48] or "sweep"
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base_dir = (self.host.script_dir or "~/.remoteslurm/sweeps").rstrip("/")
