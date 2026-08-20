@@ -358,7 +358,7 @@ def test_stub_death_midstream_wakes_consumer():
     try:
         pid = s.remote_pid
         gen = s.call_stream("follow", {"path": logf, "idle_timeout": 3600})
-        got = next(gen)  # keepalive or first read; ensures the stream is live
+        next(gen)  # keepalive or first read; ensures the stream is live
 
         def killer():
             _t.sleep(0.3)
