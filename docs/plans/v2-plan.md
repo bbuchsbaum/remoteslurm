@@ -2,22 +2,23 @@
 
 ## Context
 
-v1 (committed, verified live on trillium) delivers the plumbing: persistent-ssh transport, remote
+v1 (committed and verified on the primary development cluster) delivers the plumbing:
+persistent-SSH transport, remote
 stub, bounded filesystem/Slurm ops, CLI, MCP server, session daemon. The gap analysis showed the
 remaining friction is at the *workflow* level: an agent still moves files by hand, rewrites whole
 files to edit them, knows cluster rules only from memory, and needs 3–5 round trips to understand a
 failed job. v2 closes those gaps so an agent can take a project from laptop to a finished, explained
 Slurm job, then hardens the rough edges (long `run`s, protected paths, housekeeping, portability).
 
-User decisions (2026-08-20): ship **all six work packages**; second cluster for portability =
-**Nibi** (`nibi.alliancecan.ca`); trillium keeps **`allow_run = true`** (full shell, audited).
-Verified on trillium: `diskusage_report`, `sshare -P`, `sacctmgr -P show qos` all available; GNU
-coreutils `head` 9.3.
+User decisions (2026-08-20): ship **all six work packages**; validate portability on a second,
+independent cluster; keep **`allow_run = true`** only in the developer's local configuration
+(full shell, audited). The primary validation site provided a quota helper, `sshare -P`,
+`sacctmgr -P show qos`, and GNU coreutils `head` 9.3.
 
 Invariants carried over from v1 (do not break): stub stdlib-only & py3.6 syntax; every op bounded
 and paged; no shell in stub ops except the explicit `run`/`srun` escape hatches; logic lives in the
 client — the daemon only multiplexes stub calls; structured errors with `action`; all features
-testable locally with `LocalTransport` + FakeSlurm; live-verified on trillium (debug partition)
+testable locally with `LocalTransport` + FakeSlurm; live-verified using a locally configured host
 before a WP is called done. `allow_run`/safety rails are enforced client-side: the daemon socket is
 same-user trust (documented).
 
@@ -36,10 +37,10 @@ same-user trust (documented).
 | 9 | **F1** | queue intelligence (`queue`, `quota`, start estimates) | feeds `diagnose` PENDING hints |
 | 10 | **F2** | `watch`/notifications (CLI foreground) + bounded MCP `wait` | no daemon logic |
 | 11 | **E3** | streaming (`run --stream`, `follow`) — protocol v2 across stub/session/daemon | largest protocol change; last so everything else ships first |
-| 12 | **F4** | portability: Nibi fixtures, older-Slurm fixtures, bootstrap/shell matrix, macOS CI | needs Nibi access (MFA) |
+| 12 | **F4** | portability: second-site fixtures, older-Slurm fixtures, bootstrap/shell matrix, macOS CI | needs second-site access |
 
 Each WP: implement → `uv run --no-sync pytest -q` + ruff + mypy + vermin(stub) green → live check on
-trillium → fresh-context review subagent → fix → commit → README + CHANGELOG entry.
+the configured validation host → fresh-context review → fix → commit → README + CHANGELOG entry.
 
 ---
 
@@ -47,9 +48,9 @@ trillium → fresh-context review subagent → fix → commit → README + CHANG
 
 **Config** (`config.py`: new `ProjectConfig`; `HostConfig.projects: dict[str, ProjectConfig]`):
 ```toml
-[hosts.trillium.projects.mvpa]
-local   = "~/code/mvpa"
-remote  = "$PROJECT/mvpa"          # expanded remotely
+[hosts.mycluster.projects.analysis]
+local   = "~/code/analysis"
+remote  = "$WORK/analysis"         # expanded remotely
 exclude = [".git", "__pycache__", "*.nii.gz", "results/"]   # rsync filter syntax
 delete  = false                    # may --delete on push (still needs --delete on the call)
 ```
@@ -83,7 +84,7 @@ force) -> dict`:
 one `updated` on rsync 3.x output, and `counts: null` on recorded 2.6.9 output. Then: e2e with a fake
 `ssh` script (`exec "$@"` locally) against tmp trees — excludes, pull, dry-run has no side effects,
 `--delete` double opt-in, guard trips, marker written with git rev. Live: push a fixture project to
-`$SCRATCH/rs_sync_test`, pull back, marker present.
+the configured project's disposable remote directory, pull back, marker present.
 
 ---
 
@@ -110,7 +111,8 @@ one `updated` on rsync 3.x output, and `counts: null` on recorded 2.6.9 output. 
 
 **Tests (first):** CRLF file without trailing newline, `old` occurs twice, `expect=1` → refused,
 bytes identical, mode identical. Then 0/1/many/`all`, unicode, binary refusal, preview bound,
-`diff` vs content and vs another file. vermin still ≥3.6. Live: edit a scratch file on trillium.
+`diff` vs content and vs another file. vermin still ≥3.6. Live: edit a disposable file on the
+configured validation host.
 
 ---
 
@@ -118,16 +120,16 @@ bytes identical, mode identical. Then 0/1/many/`all`, unicode, binary refusal, p
 
 ### C1. Notes & templates
 ```toml
-[hosts.trillium]
-notes = """Walltime >= 15 min except on `debug` (max 1 h, 1 job). Default account rrg-brad.
-Login nodes: no heavy compute. Software: `module load StdEnv/2023 python/3.11`."""
+[hosts.mycluster]
+notes = """Use the short partition only for jobs under 30 minutes.
+Login nodes: no heavy compute. Software: `module load python/3.11`."""
 
-[hosts.trillium.templates.cpu]
-partition = "compute"; time = "01:00:00"; cpus_per_task = 4; mem = "16G"
-preamble = "module load StdEnv/2023 python/3.11\nsource $PROJECT/venvs/mvpa/bin/activate\n"
+[hosts.mycluster.templates.cpu]
+partition = "standard"; time = "01:00:00"; cpus_per_task = 4; mem = "16G"
+preamble = "module load python/3.11\nsource $WORK/venvs/project/bin/activate\n"
 
-[hosts.trillium.templates.debug]
-inherit = "cpu"; partition = "debug"; time = "00:10:00"
+[hosts.mycluster.templates.short]
+inherit = "cpu"; partition = "short"; time = "00:10:00"
 ```
 - `Template` dataclass: sbatch options + `preamble` + `epilogue` + `inherit` (one level, cycle
   error). `HostConfig.notes: str`, `templates: dict[str, Template]`.
@@ -245,12 +247,12 @@ fake queue wait; `FAKESLURM_SRUN_QUEUE=never` to test queue timeout). Live: 4-ta
 - `HostConfig.protected_paths: list[str]` (globs; default `~/.ssh/**`, `~/.bashrc`,
   `~/.bash_profile`, `~/.cache/remoteslurm/**`): `write/edit/rm/put` and `sync --delete` refuse
   with `permission` + action; `--force` overrides in CLI, `force=True` in MCP/library.
-- `rm -r` refuses path depth < 3 and the `$HOME`/`$SCRATCH`/`$PROJECT` roots (stub-side, using
-  `info` env) in addition to today's checks.
+- `rm -r` refuses path depth < 3, home, and locally configured storage roots in addition to the
+  ordinary protected-path checks.
 - `HostConfig.confirm: list[str]` (e.g. `["rm", "cancel", "sync_delete", "sweep"]`): CLI prompts
   y/N unless `--yes`; MCP/library require a plain **`confirm=True`** argument (no token machinery)
   and otherwise return `{needs_confirmation: true, what: "<summary>"}`.
-- `allow_run`: `true` (default, trillium) | `false` | `"safe"` (argv only + executable allow-list
+- `allow_run`: `true` | `false` | `"safe"` (argv only + executable allow-list
   `run_allowlist`, default python*/Rscript/git/ls/cat/head/tail/wc/du/df/rsync/module/squeue/sacct/
   sinfo/scontrol). `srun` obeys the same setting. Enforcement is client-side; README states the
   daemon socket is same-user trust.
@@ -283,13 +285,13 @@ ordering, `follow` delivers appended lines and stops on idle.
 - Stub ops return raw text; parsing in `slurm.py`: `squeue_start(jobs)` (`squeue --start -h -o
   "%i|%S|%r" -j`), `sshare()` (`sshare -U -P`), `qos()` (`sacctmgr -P -n show qos
   format=name,maxwall,maxjobspu,maxtresperuser,priority`), `assoc()` (`sacctmgr -P -n show assoc
-  user=$USER format=account,partition,qos,grptres,maxjobs`), `quota()` → host `quota_command`
-  (trillium/Alliance: `diskusage_report --per_user`) else `df -h` of home/scratch/project.
+  user=$USER format=account,partition,qos,grptres,maxjobs`), `quota()` → optional host
+  `quota_command`, else `df -h` over locally configured paths.
 - `Cluster.queue_info()` (partitions + my accounts/QOS + fair-share + pending jobs with estimates),
   `Cluster.estimate_start(job)`, `Cluster.quota()`. CLI `rslurm queue`, `rslurm quota`; MCP
   `queue_info`, `quota` (in the `all` set). `diagnose` adds the estimate to PENDING verdicts.
 - Every parser tolerates missing columns/formats: unknown → `null`, never an error (site formats
-  vary; fixtures recorded from trillium and Nibi).
+  vary; use recorded fixtures plus synthesized older-version fixtures).
 
 ### F2. Watch & notifications (no daemon logic)
 - CLI `rslurm watch JOB… [--all] [--notify] [--poll 30]`: foreground loop via the daemon; prints
@@ -310,9 +312,9 @@ ordering, `follow` delivers appended lines and stops on idle.
 - Bootstrap snippet removes `stub-*.py` not matching the current sha (after the new one is in place).
 
 ### F4. Portability
-- Nibi: add `[hosts.nibi]` (user does `remoteslurm connect nibi` once); record
-  squeue/sacct/scontrol/sinfo/sshare/sacctmgr fixtures with a throwaway debug job; parser tests
-  parameterised over `{trillium-25.11, nibi-<ver>}` plus hand-built Slurm 20.x fixtures from docs.
+- Second site: add a host only to the developer's local config; record
+  squeue/sacct/scontrol/sinfo/sshare/sacctmgr fixtures with a throwaway short job; parameterize
+  parser tests over newer and second-site output plus hand-built Slurm 20.x fixtures from docs.
 - `squeue --me` → `-u $(getpass.getuser())`.
 - Bootstrap: detect BusyBox head (`head --version` lacks "coreutils") → `dd bs=1 count=N`; test the
   snippet under `sh`, `bash`, `dash`, `zsh`, `tcsh` (skip-if-missing) via a fake `ssh` that runs the
@@ -332,7 +334,7 @@ fixture sets, `watch` transitions + events file, bounded MCP `wait`, shell matri
 
 - New: `sync.py`, `docs/agent-guide.md`, `CHANGELOG.md`, `tests/test_sync.py`, `tests/test_edit.py`,
   `tests/test_templates.py`, `tests/test_diagnose.py`, `tests/test_arrays.py`, `tests/test_cancel.py`,
-  `tests/test_safety.py`, `tests/test_queue.py`, `tests/fixtures/slurm/nibi/*`, `tests/fakeslurm/srun`.
+  `tests/test_safety.py`, `tests/test_queue.py`, second-site parser fixtures, `tests/fakeslurm/srun`.
 - Modified: `config.py` (ProjectConfig, Template, notes, protected_paths, confirm, allow_run modes,
   quota_command, notify_command), `stub.py` (edit/diff, pools, request registry, cancel, srun,
   follow, array-safe scancel), `session.py` (client ids, cancel, multi-frame in E3), `daemon.py`
@@ -342,11 +344,11 @@ fixture sets, `watch` transitions + events file, bounded MCP `wait`, shell matri
 
 ## Verification (end-to-end, at the end of v2)
 1. Local: full suite green on macOS + ubuntu (CI), ruff/mypy/vermin clean, `uv build`.
-2. Live on trillium, from a fresh Claude Code session using only the MCP tools: `info` → read notes →
+2. Live on the configured primary host, from a fresh agent session using only MCP tools: `info` → read notes →
    `sync` the fixture project → `edit` a parameter → `submit --template debug` → `jobs` →
    `diagnose` a deliberately failing job → `sweep` 3 params → `run --compute` hostname →
    `cancel` a running task → `queue`/`quota`. No hand-written ssh anywhere.
-3. Live on Nibi: `doctor` green; a debug job lifecycle; fixtures recorded.
+3. Live on a second independent host: `doctor` green; a short job lifecycle; fixtures recorded.
 
 ## Explicitly out of v2
 Windows; async Python API; non-OpenSSH transports; daemon-side job watching; MCP progress

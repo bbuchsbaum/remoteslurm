@@ -244,7 +244,7 @@ def test_project_config_parsing(tmp_path: Path) -> None:
     cfg = tmp_path / "c.toml"
     cfg.write_text(
         '[hosts.hpc]\nssh = "hpc"\nmax_sync_files = 10\n'
-        '[hosts.hpc.projects.mvpa]\nlocal = "~/code/mvpa"\nremote = "$PROJECT/mvpa"\n'
+        '[hosts.hpc.projects.mvpa]\nlocal = "~/code/mvpa"\nremote = "$WORK/mvpa"\n'
         'exclude = [".git", "*.nii.gz"]\ndelete = true\n'
     )
     from remoteslurm.config import Config
@@ -252,7 +252,7 @@ def test_project_config_parsing(tmp_path: Path) -> None:
     host = Config.load(cfg).host("hpc")
     assert host.max_sync_files == 10 and host.max_sync_bytes == 2 * 1024**3
     p = host.projects["mvpa"]
-    assert p.remote == "$PROJECT/mvpa" and p.delete is True and p.exclude == [".git", "*.nii.gz"]
+    assert p.remote == "$WORK/mvpa" and p.delete is True and p.exclude == [".git", "*.nii.gz"]
     assert "projects" not in host.extra
     cfg.write_text('[hosts.hpc]\n[hosts.hpc.projects.x]\nlocal = "~/x"\nremote = "/x"\nbogus = 1\n')
     with pytest.raises(ConfigError):
@@ -529,7 +529,22 @@ def test_mcp_sync_unknown_project(mcp_sync) -> None:
     assert r["error"] == "config_error" and "demo" in r["action"]
 
 
+@rsync31
+def test_mcp_sync_force_overrides_protected_delete(mcp_sync) -> None:
+    cluster, project, local, remote = mcp_sync
+    project.delete = True
+    cluster.host.protected_paths = [str(remote)]
+    _call("sync", project="demo")
+    (remote / "obsolete.txt").write_text("old\n")
+    r = _call("sync", project="demo", delete=True, force=True)
+    assert r["rc"] == 0
+    assert not (remote / "obsolete.txt").exists()
+
+
 def test_mcp_projects(mcp_sync) -> None:
     r = _call("projects")
     assert r["count"] == 1 and r["projects"][0]["name"] == "demo"
     assert r["projects"][0]["delete"] is False
+
+    info = _call("info")
+    assert info["projects"]["demo"]["remote"] == mcp_sync[1].remote

@@ -172,6 +172,18 @@ def test_run_ok(mcp_cluster: Cluster) -> None:
     assert r["stderr"].strip() == "err"
 
 
+def test_run_safe_accepts_argv_over_mcp(mcp_cluster: Cluster) -> None:
+    mcp_cluster.host.allow_run = "safe"
+    try:
+        r = call("run", cmd=["python3", "-c", "print('safe-ok')"])
+    finally:
+        mcp_cluster.host.allow_run = True
+    assert r["rc"] == 0
+    assert r["stdout"].strip() == "safe-ok"
+    audit = (mcp_cluster.registry.path.parent / "audit.log").read_text()
+    assert '"event": "run"' in audit
+
+
 def test_internal_error_is_dict(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*a: Any, **k: Any) -> Any:
         raise RuntimeError("kaboom")
@@ -196,13 +208,13 @@ def test_connection_ssh_not_alive(mcp_cluster: Cluster, monkeypatch: pytest.Monk
     from remoteslurm.config import HostConfig
     from remoteslurm.transport import SSHTransport
 
-    hc = HostConfig(name="trillium", ssh="trillium", mfa=True)
+    hc = HostConfig(name="mycluster", ssh="mycluster", mfa=True)
     monkeypatch.setattr("remoteslurm.config.Config.load", classmethod(lambda cls, p=None: _H(hc)))
     monkeypatch.setattr("remoteslurm.cluster._clusters", {})
     monkeypatch.setattr(SSHTransport, "master_alive", lambda self: False)
-    r = call("connection", host="trillium")
+    r = call("connection", host="mycluster")
     assert r["master_alive"] is False and r["stub_alive"] is False
-    assert r["action"] == "run in a terminal: remoteslurm connect trillium"
+    assert r["action"] == "run in a terminal: remoteslurm connect mycluster"
     assert "ssh" in r["connect_cmd"]
 
 
@@ -307,7 +319,7 @@ def test_sinfo_and_info(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_mcp_config_snippet() -> None:
-    d = json.loads(server.mcp_config_snippet("trillium"))
+    d = json.loads(server.mcp_config_snippet("mycluster"))
     srv = d["mcpServers"]["remoteslurm"]
     assert srv["command"] == "remoteslurm-mcp"
-    assert srv["env"]["REMOTESLURM_DEFAULT_HOST"] == "trillium"
+    assert srv["env"]["REMOTESLURM_DEFAULT_HOST"] == "mycluster"

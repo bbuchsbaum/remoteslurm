@@ -1,14 +1,14 @@
 """User configuration: ``~/.config/remoteslurm/config.toml``.
 
-A host that is not in the config is still usable: it is treated as a bare ssh alias with
-``mfa = false`` semantics *disabled* (we assume MFA-less hosts can auto-connect) — except that
-we only auto-connect when the alias is not obviously an MFA host. Users can always run
-``remoteslurm connect <host>`` explicitly.
+A host that is not in the config is still usable: it is treated as a bare SSH alias with the
+conservative ``mfa = true`` default. Users can run ``remoteslurm connect <host>`` explicitly to
+establish any authentication or ControlMaster session required by their site.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +19,8 @@ from .errors import ConfigError
 ENV_CONFIG = "REMOTESLURM_CONFIG"
 ENV_DEFAULT_HOST = "REMOTESLURM_DEFAULT_HOST"
 ENV_STATE_DIR = "REMOTESLURM_STATE_DIR"
+QUOTA_FORMATS = {"raw", "pairs", "df"}
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def config_path() -> Path:
@@ -195,8 +197,15 @@ class HostConfig:
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     notes: str = ""  # free-form cluster rules shown by `info`/`notes` (agents read this first)
     templates: dict[str, Template] = field(default_factory=dict)
-    # F1: how to report disk usage (Alliance: "diskusage_report --per_user"); else df fallback.
+    # Extra login-environment variables to expose through `info` (e.g. WORK or LAB_STORAGE).
+    env_vars: list[str] = field(default_factory=list)
+    # Remote paths used by the portable `df -h` quota fallback. Expanded on the remote host.
+    quota_paths: list[str] = field(default_factory=lambda: ["~"])
+    # Optional site command and parser: raw (default), pairs (<used>/<limit>), or df.
     quota_command: str | None = None
+    quota_format: str = "raw"
+    # Extra remote roots that recursive `rm` must never remove wholesale. Home is always guarded.
+    protected_roots: list[str] = field(default_factory=list)
     # F2: command run by `watch --notify` on a job's terminal state (MSG is substituted with the
     # message). None -> a platform default at runtime (osascript on macOS, notify-send on Linux).
     notify_command: str | None = None
@@ -208,6 +217,28 @@ class HostConfig:
     confirm: list[str] = field(default_factory=list)
     run_allowlist: list[str] = field(default_factory=lambda: list(DEFAULT_RUN_ALLOWLIST))
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.quota_format, str) or self.quota_format not in QUOTA_FORMATS:
+            raise ConfigError(
+                f"[hosts.{self.name}] quota_format must be one of {sorted(QUOTA_FORMATS)}, "
+                f"not {self.quota_format!r}"
+            )
+        for field_name in ("env_vars", "quota_paths", "protected_roots"):
+            values = getattr(self, field_name)
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                raise ConfigError(f"[hosts.{self.name}] {field_name} must be a list of strings")
+            if any(not v.strip() or "\x00" in v for v in values):
+                raise ConfigError(
+                    f"[hosts.{self.name}] {field_name} entries must be non-empty and contain no NUL"
+                )
+        if len(self.env_vars) > 64:
+            raise ConfigError(f"[hosts.{self.name}] env_vars cannot contain more than 64 names")
+        bad_env = [name for name in self.env_vars if not _ENV_NAME.fullmatch(name)]
+        if bad_env:
+            raise ConfigError(
+                f"[hosts.{self.name}] env_vars contains invalid environment names: {bad_env}"
+            )
 
     @classmethod
     def from_dict(cls, name: str, d: dict[str, Any]) -> HostConfig:
@@ -328,49 +359,53 @@ class Config:
 
 EXAMPLE_CONFIG = """\
 # ~/.config/remoteslurm/config.toml
-default_host = "trillium"
+default_host = "mycluster"
 
-[hosts.trillium]
-ssh = "trillium"            # alias from ~/.ssh/config (ControlMaster recommended)
-mfa = true                  # Duo/MFA: you must run `remoteslurm connect trillium` once
-account = "rrg-someone"     # default --account for sbatch
-# partition = "compute"
+[hosts.mycluster]
+ssh = "mycluster"           # alias from ~/.ssh/config (ControlMaster recommended)
+mfa = true                  # interactive auth: run `remoteslurm connect mycluster` once
+# account = "research"      # optional default --account for sbatch
+# partition = "standard"   # optional default --partition for sbatch
 # python = "python3"        # remote interpreter for the stub
 # control_persist = "12h"
 # allow_run = true          # true | false | "safe" (argv-only + run_allowlist) for `run`/srun
-# quota_command = "diskusage_report --per_user"   # `rslurm quota` (Alliance); else df -h fallback
+# env_vars = ["WORK", "LAB_STORAGE"]              # extra variables returned by `info`
+# quota_paths = ["~", "$WORK", "$LAB_STORAGE"]  # portable `df -h` fallback
+# protected_roots = ["$WORK", "$LAB_STORAGE"]    # recursive rm refuses these roots
+# quota_command = "my-quota-command --user"        # optional site-specific command
+# quota_format = "raw"                             # raw | pairs | df
 # notify_command = "osascript -e 'display notification \\"MSG\\" with title \\"remoteslurm\\"'"
 
 # Safety rails (all optional; sensible defaults shown):
 # protected_paths = ["~/.ssh/**", "~/.bashrc", "~/.bash_profile", "~/.cache/remoteslurm/**"]
 # confirm = ["rm", "cancel"]   # ops needing --yes (CLI) / confirm=true (library, MCP)
 # run_allowlist = ["python*", "Rscript", "git", "ls", "cat"]   # only used when allow_run = "safe"
-# [hosts.trillium.defaults]
+# [hosts.mycluster.defaults]
 # time = "1:00:00"
 
 # Cluster rules an agent should read before submitting (shown by `info`/`rslurm notes`).
 # Use a single-line string, or TOML's triple-quoted multi-line string for several lines:
-# notes = "Walltime >= 15 min except on `debug`. Default account rrg-someone."
+# notes = "Use the short partition only for jobs under 30 minutes."
 
 # Submit templates bundle sbatch options + a script preamble/epilogue; use with
 # `rslurm submit --template cpu` or MCP submit(template="cpu"). `inherit` layers one on
 # another. Any key other than preamble/epilogue/inherit is an sbatch option.
-# [hosts.trillium.templates.cpu]
-# partition = "compute"
+# [hosts.mycluster.templates.cpu]
+# partition = "standard"
 # time = "01:00:00"
 # cpus_per_task = 4
 # mem = "16G"
-# preamble = "module load StdEnv/2023 python/3.11\\nsource $PROJECT/venvs/mvpa/bin/activate\\n"
+# preamble = "module load python/3.11\\nsource $WORK/venvs/project/bin/activate\\n"
 #
-# [hosts.trillium.templates.debug]
+# [hosts.mycluster.templates.short]
 # inherit = "cpu"           # take cpu's options + preamble, then override below
-# partition = "debug"
+# partition = "short"
 # time = "00:10:00"
 
 # A project is a local<->remote directory pair for `rslurm sync` (rsync):
-# [hosts.trillium.projects.mvpa]
-# local   = "~/code/mvpa"
-# remote  = "$PROJECT/mvpa"        # expanded on the remote side
+# [hosts.mycluster.projects.analysis]
+# local   = "~/code/analysis"
+# remote  = "$WORK/analysis"       # expanded on the remote side
 # exclude = [".git", "__pycache__", "*.nii.gz", "results/"]
 # delete  = false                  # allow --delete on push (still needs --delete on the call)
 """

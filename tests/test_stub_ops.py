@@ -16,6 +16,13 @@ def test_ping_and_info(cluster: Cluster, sandbox: Path) -> None:
     assert "python" in info
 
 
+def test_info_exposes_only_configured_extra_env(make_cluster, sandbox: Path) -> None:
+    c = make_cluster({"WORK": str(sandbox / "work"), "SITE_SECRET": "hidden"}, env_vars=["WORK"])
+    env = c.info()["env"]
+    assert env["WORK"] == str(sandbox / "work")
+    assert "SITE_SECRET" not in env
+
+
 def test_ls_basic_and_pagination(cluster: Cluster, sandbox: Path) -> None:
     r = cluster.ls("~/proj")
     names = [e["name"] for e in r["entries"]]

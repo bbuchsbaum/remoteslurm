@@ -1,6 +1,7 @@
 """WP-F4: parsers must produce correct structured output across Slurm versions.
 
-The same delimited/`-o` invocations are parsed for both the trillium fixtures (Slurm 25.11, in
+The same delimited/`-o` invocations are parsed for both the recorded newer fixtures (Slurm 25.11,
+in
 ``tests/fixtures/slurm/``) and hand-synthesized older-Slurm fixtures (~20.02, in
 ``tests/fixtures/slurm/slurm20/`` — see that dir's README; they are NOT from a real cluster). Each
 parser is parameterized over both sets so a version-specific format difference (e.g. the old
@@ -19,7 +20,7 @@ FX = Path(__file__).parent / "fixtures" / "slurm"
 
 # One entry per Slurm generation. ``dir`` is where that generation's fixtures live.
 CASES = {
-    "trillium-25.11": {
+    "recorded-25.11": {
         "dir": FX,
         "squeue": {
             "job_id": "2166954",

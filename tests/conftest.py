@@ -11,6 +11,14 @@ from remoteslurm.cluster import Cluster
 FAKESLURM = Path(__file__).parent / "fakeslurm"
 
 
+@pytest.fixture(autouse=True)
+def isolated_remoteslurm_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Never let a test read or write the developer's real remoteslurm state."""
+    state = tmp_path / "remoteslurm-state"
+    monkeypatch.setenv("REMOTESLURM_STATE_DIR", str(state))
+    return state
+
+
 @pytest.fixture
 def sandbox(tmp_path: Path) -> Path:
     """A scratch tree with a few files of known content."""

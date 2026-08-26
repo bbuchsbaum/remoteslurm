@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Made the public package cluster-neutral: the generated config, README, agent guide, and live
+  test no longer contain a built-in site, account, partition, storage path, or walltime.
+- Added per-host `env_vars`, `quota_paths`, and `protected_roots` so sites can expose their own
+  storage conventions without teaching the core about `$SCRATCH`, `$PROJECT`, or other names.
+- Added `quota_format = "raw" | "pairs" | "df"`. Custom quota commands now remain raw by default;
+  sites opt into a generic parser explicitly.
+- Removed the site-specific scratch fallback from remote stub installation. The portable fallback
+  chain is now the configured `install_dir`, remote home cache, then owner-only `/tmp` storage.
+- Made real-cluster tests generic and fully opt-in through `REMOTESLURM_LIVE_*` variables.
+
 ## 0.2.0 — 2026-08-20
 
 v2 "workflow layer" — see docs/plans/v2-plan.md.
@@ -27,7 +39,7 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
   queue-wait timeout); distinguishes "still queued" from "ran".
 - Safety rails: `allow_run = false | "safe"` (safe = argv-only, executable allow-list, no `bash -c`);
   `protected_paths` block write/edit/rm/put/sync-delete unless forced; `confirm` list gates rm/cancel
-  behind an explicit confirmation; recursive `rm` refuses `$SCRATCH`/`$PROJECT` roots and shallow paths.
+  behind an explicit confirmation; recursive `rm` refuses configured storage roots and shallow paths.
 - Queue intelligence: `rslurm queue` (partitions, my accounts/QOS/limits, fair-share, pending jobs
   with scheduler start estimates) and `rslurm quota`; MCP `queue_info`/`quota`. `diagnose` shows the
   start estimate for a PENDING job.
@@ -43,8 +55,8 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
 - Streaming robustness: `follow`/`tail -f` runs in a dedicated stub pool (never starves
   run/srun/sbatch) and emits keepalive frames so an abandoned tail is reclaimed within ~20 s.
 - Queue intelligence: `rslurm queue` (partitions with idle nodes, my accounts/QOS + limits,
-  fair-share, my pending jobs with scheduler start estimates) and `rslurm quota` (Alliance
-  `diskusage_report` via `quota_command`, else `df -h`); `Cluster.queue_info`/`estimate_start`/
+  fair-share, my pending jobs with scheduler start estimates) and `rslurm quota` (a configured
+  site command or `df -h` fallback); `Cluster.queue_info`/`estimate_start`/
   `quota`; MCP `queue_info`/`quota` (in the `all` set). `diagnose` now adds the start estimate to a
   PENDING verdict. Parsers tolerate missing tools/columns (a missing `sshare`/`sacctmgr` degrades
   to empty, never an error).
@@ -63,14 +75,14 @@ v2 "workflow layer" — see docs/plans/v2-plan.md.
   Slurm < 20.02). The bootstrap snippet detects non-GNU `head` (e.g. BusyBox) and falls back to
   `dd bs=1` so it never over-reads the protocol stream, and discovers the interpreter through a
   fallback chain (configured → `python3` → `python` → `module load python`). Parsers are tested
-  against synthesized older-Slurm (~20.02) fixtures alongside the trillium ones, including the old
+  against synthesized older-Slurm (~20.02) fixtures alongside recorded newer fixtures, including the old
   `ReqMem` `4Gn`/`4Gc` suffix form. Per-host `ssh_opts` (e.g. `ProxyJump`) flow through both the ssh
   transport and rsync. CI runs the test matrix on macOS as well as Linux and executes the stub under
-  Python 3.7 (closest proxy for the 3.6 floor). *Live Nibi fixtures/validation still pending — see
-  the plan's F4.*
+  Python 3.7 (closest proxy for the 3.6 floor). Live validation on a second independent cluster
+  remained pending.
 
 ## 0.1.0 — 2026-08-20
 
 Initial release: persistent-ssh transport (ControlMaster, MFA-safe), stdlib-only remote stub,
 bounded filesystem/Slurm operations, job registry, CLI (`remoteslurm`/`rslurm`), MCP server,
-local session daemon. Verified live on trillium.alliancecan.ca (Slurm 25.11).
+local session daemon. Verified live on the primary development cluster (Slurm 25.11).

@@ -4,7 +4,10 @@
 
 A local coding agent (Claude Code / Codex on a Mac) needs a fast, turnkey, robust window onto a remote Slurm login node: browse directories, read small files, grep, tail logs, submit/monitor/cancel jobs. Today the agent would have to hand-craft `ssh host '...'` strings and pay a full connection + Duo MFA round-trip per command, which is unusable.
 
-Exemplary target: `brad@trillium.alliancecan.ca` (Duo MFA, Python 3.11 remote, Slurm 25.11, NFS/VAST home+scratch, `~/.ssh/config` already has `Host trillium` with ControlMaster/ControlPersist 12h and a live master). Design must stay general: other clusters may lack MFA, have older Slurm/Python (3.6), or no `squeue --json`.
+The initial validation target used interactive MFA, Python 3.11, Slurm 25.11, shared home/storage,
+and an SSH alias with ControlMaster/ControlPersist. The design must stay general: other clusters
+may lack MFA, use different storage variables, have older Slurm/Python (3.6), or no
+`squeue --json`.
 
 Decisions already agreed with the user: Python; system OpenSSH + ControlMaster as transport (MFA forces this); a remote stub speaking JSON; core library → CLI → MCP server, all three in v1.
 
@@ -28,7 +31,7 @@ Decisions already agreed with the user: Python; system OpenSSH + ControlMaster a
 - `LocalTransport`: runs the stub via `subprocess` with no ssh. Used for the whole test suite and CI.
 
 ### Remote stub (`stub.py`, single file, stdlib only, Python ≥3.6 syntax)
-- Launch in one round trip: `test -f $P || { cat > $P.tmp && mv $P.tmp $P; }; exec python3 -u $P` (stub source on stdin when missing; filename is content-hashed so local/remote skew is impossible by construction). Install dir: `~/.cache/remoteslurm`, fallback `$SCRATCH/.remoteslurm`, then `/tmp/$USER`.
+- Launch in one round trip: `test -f $P || { cat > $P.tmp && mv $P.tmp $P; }; exec python3 -u $P` (stub source on stdin when missing; filename is content-hashed so local/remote skew is impossible by construction). Install dir: `~/.cache/remoteslurm`, then `/tmp/$USER`; a site may configure another directory locally.
 - Handshake: first line `REMOTESLURM-READY <proto> <sha> <pyver>`; client discards everything before it (rc-file/module noise). Every response line is prefixed `\x1e` (RS); anything else is logged and skipped.
 - Protocol: JSON-lines, `{"id", "op", "args"}` → `{"id", "ok", "result"|"error", "done"}`; streaming ops send multiple `done:false` frames. Stub serves with a small thread pool (4) + `cancel` op; traps EPIPE and exits quietly.
 - Ops (all with hard caps + timeouts, argv lists only, never `shell=True`, paths `expanduser`+`realpath`, reject NUL):
@@ -41,10 +44,10 @@ Decisions already agreed with the user: Python; system OpenSSH + ControlMaster a
 - Job registry: `~/.local/state/remoteslurm/<host>/jobs.json` so a fresh agent session can recover handles. Audit log of every `run`/`write`/`scancel` in the same dir.
 - Config: `~/.config/remoteslurm/config.toml`:
   ```toml
-  [hosts.trillium]
-  ssh = "trillium"          # alias in ~/.ssh/config
+  [hosts.mycluster]
+  ssh = "mycluster"         # alias in ~/.ssh/config
   mfa = true
-  account = "rrg-brad"
+  account = "research"
   python = "python3"        # optional override
   allow_run = true
   ```
@@ -63,7 +66,7 @@ Eight tools, all returning dicts with `truncated`/`next_token` fields and "how t
 pyproject.toml            # hatchling, py>=3.11 local, mcp[cli]>=1.8,<2, ruff, mypy, pytest
 src/remoteslurm/{__init__,errors,config,transport,stub,session,cluster,slurm,jobs,cli,server}.py
 src/remoteslurm/py.typed
-tests/{conftest.py, test_stub_ops.py, test_session.py, test_slurm_parsing.py, test_jobs.py, test_cli.py, test_server.py, live/test_trillium.py}
+tests/{conftest.py, test_stub_ops.py, test_session.py, test_slurm_parsing.py, test_jobs.py, test_cli.py, test_server.py, live/test_cluster.py}
 tests/fakeslurm/{sbatch,squeue,sacct,scancel,scontrol}   # PATH-shadowed scripts driven by JSON fixtures
 tests/fixtures/slurm/*.txt                                # recorded outputs (25.11 now; add others later)
 README.md, docs/plans/v1-design.md (this plan, copied into repo), .github/workflows/ci.yml
@@ -72,15 +75,15 @@ README.md, docs/plans/v1-design.md (this plan, copied into repo), .github/workfl
 ## Milestones (each verified before the next)
 
 1. **Scaffold + stub + local transport** — pyproject, stub with handshake/framing/`ping`/`ls`/`stat`/`read`/`write`/`grep`/`glob`/`run`; `LocalTransport`; `Session`. Verify: pytest over local transport (tmp dirs, binary files, truncation, concurrency with 20 pipelined requests, stub crash → `SessionDied`). `python3.6`-syntax check of stub via `ruff --target-version py36` / `vermin` if available.
-2. **SSH transport + connect/doctor** — liveness state machine, stub bootstrap in one RTT, `remoteslurm connect/doctor`. Verify live on trillium: `doctor` passes; `ls ~/scratch` < 100 ms after warm-up; kill stub remotely → auto-respawn; `ssh -O exit trillium` → clean `not_connected` error with action text.
-3. **Slurm layer** — parsers (squeue/sacct/scontrol), `Job`, registry, status merge with accounting-lag grace, `wait`, `cancel` ownership check. Verify: parsing tests against fixtures + FakeSlurm; live: submit a 30 s `sleep` job on trillium, poll to COMPLETED, read its `.out`, confirm registry persists across processes.
+2. **SSH transport + connect/doctor** — liveness state machine, stub bootstrap in one RTT, `remoteslurm connect/doctor`. Verify live on the configured validation host: `doctor` passes; a home-directory listing is fast after warm-up; kill stub remotely → auto-respawn; close the SSH master → clean `not_connected` error with action text.
+3. **Slurm layer** — parsers (squeue/sacct/scontrol), `Job`, registry, status merge with accounting-lag grace, `wait`, `cancel` ownership check. Verify: parsing tests against fixtures + FakeSlurm; live: submit a short job on the configured host, poll to COMPLETED, read its `.out`, confirm registry persists across processes.
 4. **CLI** — all subcommands, `--json`. Verify: CLI tests via local transport + FakeSlurm; live smoke script.
 5. **MCP server** — 8 tools, caps, `asyncio.to_thread`, `mcp-config`. Verify: in-process FastMCP client tests; register in Claude Code and drive a real session (ls → read → submit → jobs).
 6. **Docs + CI** — README (purpose, install, connect flow, tools list, safety defaults, troubleshooting, env knobs, validation commands), CI (lint + test matrix 3.11–3.13, `uv build`). Fresh-context review subagent pass before calling v1 done.
 
 ## Verification (end-to-end)
 - `uv run --extra dev pytest` green; `ruff check && ruff format --check && mypy` clean.
-- Live on trillium (gated `REMOTESLURM_LIVE=1`): doctor → ls/read/grep latency numbers → sleep-job lifecycle → socket kill/recovery.
+- Live on an explicitly configured host (gated `REMOTESLURM_LIVE=1`): doctor → ls/read/grep latency numbers → short-job lifecycle → socket recovery.
 - MCP: `remoteslurm mcp-config` snippet added to Claude Code; agent completes the ls/read/submit/status loop without hand-written ssh.
 
 ## Explicitly out of v1
@@ -88,7 +91,7 @@ Quotas/usage reporting, MCP streaming `follow`, sqlite registry, heterogeneous j
 
 ## Implementation notes (2026-08-20, post-review)
 
-- **Added: local session daemon** (`daemon.py`). Measured: every new ssh channel to trillium costs ~2 s
+- **Added: local session daemon** (`daemon.py`). Measured: every new SSH channel on the primary validation cluster costs ~2 s
   even over a live master (PAM + rc files), so a per-invocation CLI would never be fast. The CLI now
   talks to a per-user unix-socket daemon that keeps stub sessions warm (auto-spawned, flock-guarded,
   idle exit 4 h). Warm CLI calls: ~150 ms. `--no-daemon` / `REMOTESLURM_NO_DAEMON` bypass it.

@@ -187,7 +187,6 @@ class SSHTransport(Transport):
         dirs = [self.install_dir] if self.install_dir else []
         dirs += [
             "$HOME/.cache/remoteslurm",
-            "${SCRATCH:-/nonexistent}/.remoteslurm",
             "/tmp/$USER/.remoteslurm",
         ]
         dir_expr = " ".join(

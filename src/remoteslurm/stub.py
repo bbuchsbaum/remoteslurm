@@ -414,7 +414,14 @@ def op_ping(args):
 
 
 def op_info(args):
-    env_keys = ["SCRATCH", "PROJECT", "HOME", "USER", "SLURM_CLUSTER_NAME", "CC_CLUSTER", "TMPDIR"]
+    requested = args.get("env_vars") or []
+    valid_names = isinstance(requested, (list, tuple)) and all(
+        isinstance(k, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k) for k in requested
+    )
+    if not valid_names or len(requested) > 64:
+        raise StubError("invalid_arg", "env_vars must contain at most 64 environment names")
+    env_keys = ["HOME", "USER", "SLURM_CLUSTER_NAME", "TMPDIR"]
+    env_keys.extend(k for k in requested if k not in env_keys)
     env = {k: os.environ[k] for k in env_keys if k in os.environ}
     slurm_version = None
     if _which("sinfo"):
@@ -587,7 +594,7 @@ def _atomic_write(p, data, keep_mode=True, mode=None):
 def op_expandpath(args):
     """Expand ``~``/``~user``/``$VARS`` in a path using the *remote* environment, shell-free.
 
-    Used by sync/put/get so remote paths like ``$SCRATCH/proj`` resolve correctly without ever
+    Used by sync/put/get so remote paths like ``$WORK/proj`` resolve correctly without ever
     interpolating user input into a shell (no command substitution, no word splitting, no globbing).
     """
     raw = args.get("path")
@@ -598,12 +605,12 @@ def op_expandpath(args):
     expanded = os.path.expanduser(os.path.expandvars(raw))
     if "$" in expanded:
         # A variable that isn't set on the remote survives expandvars unchanged; producing a
-        # path anyway would silently target the wrong place (e.g. $PROJECT unset -> "/mvpa").
+        # path anyway would silently target the wrong place (e.g. $WORK unset -> "/analysis").
         raise StubError(
             "invalid_arg",
             "path contains an environment variable that is not set on the remote: %s" % raw,
             path=raw,
-            action="check the variable is exported on the login node (e.g. echo $SCRATCH)",
+            action="check the variable is exported on the login node (e.g. echo $WORK)",
         )
     if not os.path.isabs(expanded):
         expanded = os.path.join(os.path.expanduser("~"), expanded)
@@ -820,13 +827,25 @@ def op_mkdir(args):
     return {"path": p}
 
 
-def _rm_roots():
-    """Directories a recursive `rm` must never take out wholesale: home + the big shared roots."""
+def _rm_roots(configured):
+    """Directories recursive ``rm`` must never remove wholesale: home + configured roots."""
+    valid_roots = isinstance(configured, (list, tuple)) and all(
+        isinstance(v, str) for v in configured
+    )
+    if not valid_roots:
+        raise StubError("invalid_arg", "protected_roots must be a list of strings")
     roots = set()
-    for name in ("HOME", "SCRATCH", "PROJECT"):
-        v = os.environ.get(name)
+    for raw in configured:
+        v = os.path.expanduser(os.path.expandvars(raw))
+        if "$" in v:
+            raise StubError(
+                "invalid_arg",
+                "protected root contains an environment variable that is not set: %s" % raw,
+                path=raw,
+                action="fix protected_roots or export the variable on the login node",
+            )
         if v:
-            roots.add(os.path.normpath(os.path.expanduser(os.path.expandvars(v))))
+            roots.add(os.path.normpath(v))
     roots.add(os.path.normpath(os.path.expanduser("~")))
     return roots
 
@@ -838,10 +857,10 @@ def op_rm(args):
     if p in ("/", home) or p == os.path.dirname(home):
         raise StubError("invalid_arg", "refusing to remove %s" % p, path=p)
     if recursive:
-        # A recursive delete is the dangerous one: refuse the shared roots themselves
-        # ($HOME/$SCRATCH/$PROJECT) and anything shallower than three path components
+        # A recursive delete is the dangerous one: refuse home/configured roots themselves
+        # and anything shallower than three path components
         # (e.g. /scratch/<user>), which are almost always a fat-fingered target.
-        if p in _rm_roots():
+        if p in _rm_roots(args.get("protected_roots") or []):
             raise StubError(
                 "invalid_arg",
                 "refusing to recursively remove the root directory %s" % p,
@@ -1454,10 +1473,8 @@ def op_quota(args):
     ``df -h`` is run over the given ``paths`` (``~``/``$VARS`` expanded here, non-existent paths
     dropped). A missing tool yields a soft ``rc != 0`` (``available: false`` on the client).
     """
-    # The configured quota_command is run in a LOGIN shell: on Alliance clusters
-    # `diskusage_report` is a module-provided shell function, and the bare binary reports
-    # different numbers, so we must let the login profile define it. This is a user-configured,
-    # trusted command (not stub-internal input), so the shell here is intentional.
+    # A configured quota_command runs in a login shell so site-provided functions and modules
+    # resolve. It is a trusted local configuration value, not request-controlled shell input.
     shell_cmd = args.get("command_shell")
     if shell_cmd is not None:
         if not isinstance(shell_cmd, str) or not shell_cmd.strip():

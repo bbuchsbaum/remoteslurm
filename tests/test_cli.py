@@ -36,10 +36,10 @@ def run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, str]:
 
 
 def test_split_target() -> None:
-    assert cli.split_target("trillium:~/x", None) == ("trillium", "~/x")
+    assert cli.split_target("mycluster:~/x", None) == ("mycluster", "~/x")
     assert cli.split_target("~/x", "h") == ("h", "~/x")
     assert cli.split_target("/abs:weird", "h") == ("h", "/abs:weird")
-    assert cli.split_target("trillium:", "h") == ("trillium", "~")
+    assert cli.split_target("mycluster:", "h") == ("mycluster", "~")
     assert cli.split_target(None, "h") == ("h", "~")
 
 

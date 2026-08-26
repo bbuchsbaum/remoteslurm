@@ -17,12 +17,14 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
 ## Start here
 - Call `info` first and **read its `notes`** — they hold the cluster's rules (walltime
   minimums, default account, which partitions exist, how to load software). Also read
-  `templates` (ready-made submit configs) and `learned_notes` (policy rejections seen before).
+  `templates` (ready-made submit configs), `projects` (configured sync roots), and
+  `learned_notes` (policy rejections seen before).
 - Don't guess account/partition/walltime. Use a template or the values from `notes`.
 
 ## Moving code and files
 - Use `sync` to push a whole project (rsync, respects excludes), not repeated `put`s.
-  `sync(dry_run=true)` first if unsure; `projects` lists what's configured.
+  `sync(dry_run=true)` first if unsure; `info.projects` lists what's configured (the optional
+  `projects` tool returns the same contracts in the full MCP tool set).
 - To change one file remotely, use `edit` (exact string replace) — do **not** `read` the
   whole file and `write` it back. `diff` checks a remote file against what you expect.
 
@@ -45,5 +47,6 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
 - Read `notes` before submitting; obey the cluster's walltime/account/partition rules.
 - `sync`, not `put`. `edit`, not read+write. `diagnose`, not log spelunking. Templates, not
   hand-tuned flags.
-- Paths are on the *cluster*, not your laptop. `~`/`$SCRATCH`/`$PROJECT` expand remotely.
+- Paths are on the *cluster*, not your laptop. `~` and configured variables such as `$WORK`
+  expand remotely.
 """

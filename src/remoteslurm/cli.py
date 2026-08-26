@@ -256,11 +256,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         c.rm(w["path"], force=True)
         check("home writable", True, info["home"])
         env = info.get("env", {})
+        configured_env = {k: env.get(k) for k in host.env_vars}
+        missing_env = [k for k, v in configured_env.items() if v is None]
         check(
-            "env",
-            True,
-            ", ".join(f"{k}={v}" for k, v in env.items() if k in ("SCRATCH", "PROJECT"))
-            or "no SCRATCH/PROJECT",
+            "configured env",
+            not missing_env,
+            ", ".join(f"{k}={v}" for k, v in configured_env.items() if v is not None)
+            or "none configured",
+            f"missing on remote: {missing_env}" if missing_env else "",
         )
         if not missing:
             q = c.squeue(refresh=True)
@@ -399,7 +402,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         login=args.login,
         max_output=args.max_output,
     )
-    c.registry.audit("run", cmd=cmd, rc=r["rc"])
 
     def human(r: dict[str, Any]) -> None:
         sys.stdout.write(r["stdout"])
@@ -435,7 +437,6 @@ def _cmd_run_stream(
     except KeyboardInterrupt:
         # The stream generator already sent a cancel on the way out; just exit 130.
         return 130
-    c.registry.audit("run", cmd=cmd, rc=r.get("rc"))
     if r.get("stdout_truncated") or r.get("stderr_truncated"):
         print("[output truncated; use --max-output]", file=sys.stderr)
     return int(r.get("rc") or 0)
@@ -1667,7 +1668,7 @@ def build_parser() -> argparse.ArgumentParser:
         "queue intelligence: partitions, my accounts/QOS, fair-share, pending start estimates",
     )
 
-    add("quota", cmd_quota, "disk usage/quota (diskusage_report, else df -h)")
+    add("quota", cmd_quota, "disk usage/quota (configured command, else df -h)")
 
     sp = add(
         "watch",

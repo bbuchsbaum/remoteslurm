@@ -37,9 +37,9 @@ def fake_state(sandbox: Path) -> dict:
 # -- config parsing -------------------------------------------------------------------------
 def test_config_parses_notes_and_templates() -> None:
     hc = HostConfig.from_dict(
-        "trillium",
+        "mycluster",
         {
-            "ssh": "trillium",
+            "ssh": "mycluster",
             "notes": "walltime >= 15 min",
             "templates": {
                 "cpu": {

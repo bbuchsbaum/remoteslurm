@@ -466,8 +466,8 @@ def parse_sinfo(stdout: str) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- queue intelligence
-# Every parser here is deliberately tolerant: site formats vary (trillium vs Nibi vs older
-# Slurm), so an unknown/short/missing column becomes ``None`` rather than raising.
+# Every parser here is deliberately tolerant: site formats and Slurm versions vary, so an
+# unknown/short/missing column becomes ``None`` rather than raising.
 
 
 def parse_squeue_start(stdout: str) -> list[dict[str, Any]]:
@@ -614,11 +614,11 @@ def parse_df(stdout: str) -> list[dict[str, Any]]:
     return out
 
 
-# A ``<used>/<limit>`` quota pair from ``diskusage_report``. The real output is a fixed-width
-# table (NOT pipe-separated), and a value may carry an internal space (``0  B``) or spaces around
+# A ``<used>/<limit>`` quota pair from a fixed-width site quota command. A value may carry an
+# internal space (``0  B``) or spaces around
 # the slash (``88GiB/ 100GiB``, ``7 /2000K``) — hence the ``\s*`` inside and around each value.
 # used side must start with a digit (so it never grabs a word from the description); the limit
-# side may be non-numeric (`unlimited`, `inf`) as Alliance reports for some project quotas.
+# side may be non-numeric (``unlimited``, ``inf``), as some sites report for project quotas.
 _DU_PAIR = re.compile(r"([\d.]+\s*[A-Za-z]*)\s*/\s*([\d.]+\s*[A-Za-z]*|unlimited|inf|N/A)")
 
 
@@ -630,8 +630,8 @@ def _du_norm(v: str | None) -> str | None:
     return s or None
 
 
-def parse_diskusage_report(stdout: str) -> list[dict[str, Any]]:
-    """Parse Alliance ``diskusage_report --per_user`` (a fixed-width table) into rows.
+def parse_quota_pairs(stdout: str) -> list[dict[str, Any]]:
+    """Parse a fixed-width site quota table containing ``<used>/<limit>`` pairs.
 
     Columns are ``Description``, ``Space`` (``<used>/<limit>``), ``# of files``
     (``<used>/<limit>``). The description ends at its ``)`` (e.g. ``/home (user brad)``); the two
@@ -672,6 +672,11 @@ def parse_diskusage_report(stdout: str) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def parse_diskusage_report(stdout: str) -> list[dict[str, Any]]:
+    """Backward-compatible alias for the generic :func:`parse_quota_pairs` parser."""
+    return parse_quota_pairs(stdout)
 
 
 def exit_code_int(code: str | None) -> int | None:

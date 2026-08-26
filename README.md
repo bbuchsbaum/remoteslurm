@@ -1,245 +1,259 @@
 # remoteslurm
 
-Fast, agent-friendly control of a remote Slurm login node from your laptop — a Python
-library, a CLI (`remoteslurm` / `rslurm`), and an MCP server for Claude Code, Codex and
-other coding agents.
+`remoteslurm` gives a local program or coding agent a bounded, structured way to work with a
+remote Slurm cluster over OpenSSH. It includes a Python library, the `rslurm` CLI, and an MCP
+server. The package is cluster-neutral: SSH aliases, accounts, partitions, storage variables,
+quota commands, templates, and policy notes all live in the user's local configuration.
 
-You keep your agent session local (your repo, your context, your tools); remoteslurm gives
-it a low-latency, bounded, structured window onto the cluster: browse directories, read
-small files, grep, tail logs, submit jobs, watch them, read their output, cancel them.
+The remote side is a small, standard-library-only Python stub installed automatically over the
+existing SSH connection. It can inspect files, make bounded edits, submit and monitor jobs,
+retrieve output, diagnose failures, and synchronize configured projects.
 
-## What this is for
+[Changelog](CHANGELOG.md) · [Agent guide](docs/agent-guide.md) ·
+[Issue tracker](https://github.com/bbuchsbaum/remoteslurm/issues)
 
-- **MFA clusters.** Login nodes behind Duo/YubiKey can't be scripted with a fresh `ssh` per
-  command. remoteslurm rides on an OpenSSH `ControlMaster` connection you authenticate
-  **once**; everything after that is ~20–50 ms per operation.
-- **Agents.** Every operation has hard output caps, pagination tokens and structured errors
-  with an `action` field ("run in a terminal: `remoteslurm connect trillium`"). An agent
-  can't accidentally `cat` a 40 GB file into its context or hang on an MFA prompt.
-- **Turnkey.** `remoteslurm doctor` checks the whole chain; `remoteslurm connect` does the
-  one interactive step; a tiny stdlib-only stub is installed on the login node
-  automatically (content-hashed, so local/remote versions can never drift).
+## Status and scope
 
-## When not to use it
+Version 0.2.0 is a source preview. Install it from a checkout; it is not currently advertised as
+a PyPI release. Local tests use a fake Slurm installation, while real-cluster tests are optional
+and configured entirely through environment variables.
 
-- Bulk data movement — use `rsync`/Globus (`remoteslurm put/get --rsync` just shells out).
-- Interactive shells or TUIs on the cluster.
-- Running things *on compute nodes* — remoteslurm talks to the **login node** and Slurm.
+The intended target is any Slurm login node that is reachable with system OpenSSH and has:
+
+- Python 3.6 or newer on the remote login node;
+- the standard Slurm command-line tools (`sbatch`, `squeue`, `sacct`, and friends);
+- Python 3.11 or newer on the local machine; and
+- `rsync` 3.1 or newer only when project sync or large transfers are needed.
+
+Slurm versions and site policies vary. Queue/account information therefore degrades gracefully
+when optional commands are missing, and nonstandard quota output is raw unless a parser is
+selected in local config.
 
 ## Install
 
+From a checkout:
+
 ```bash
-uv tool install remoteslurm          # or: pipx install remoteslurm / pip install remoteslurm
+uv tool install .
 remoteslurm --version
 ```
 
-Requires Python ≥ 3.11 locally, OpenSSH, and `python3` (≥ 3.6) on the login node.
+For development:
 
-## Setup (once per cluster)
-
-1. Make sure `ssh <alias>` works and uses a persistent master. In `~/.ssh/config`:
-
-   ```
-   Host trillium
-     HostName trillium.alliancecan.ca
-     User brad
-     ControlMaster auto
-     ControlPath ~/.ssh/sockets/%r@%h-%p
-     ControlPersist 12h
-   ```
-
-2. Write the config (`remoteslurm config --init` creates `~/.config/remoteslurm/config.toml`):
-
-   ```toml
-   default_host = "trillium"
-
-   [hosts.trillium]
-   ssh = "trillium"         # ssh alias
-   mfa = true               # never try to authenticate non-interactively
-   account = "rrg-someone"  # default --account for sbatch
-   # partition = "compute"
-   # [hosts.trillium.defaults]
-   # time = "1:00:00"
-   ```
-
-   Hosts without MFA (`mfa = false`) are connected automatically; hosts not in the config
-   are treated as bare ssh aliases with `mfa = true` (safe default).
-
-3. Authenticate once, then check everything:
-
-   ```bash
-   remoteslurm connect trillium     # Duo prompt happens here, in your terminal
-   remoteslurm doctor
-   ```
-
-When the master expires (laptop sleep, `ControlPersist` timeout) every command returns
-`not_connected` with the exact command to run; nothing ever blocks on a hidden MFA prompt.
-
-### Jump hosts / bastions
-
-If the cluster is only reachable through a bastion, the cleanest place for it is your
-`~/.ssh/config` — a `ProxyJump` there is transparent to remoteslurm (and to the rsync that
-`sync` runs):
-
+```bash
+uv venv
+uv pip install -e '.[dev]'
+uv run --no-sync pytest -q
 ```
-Host trillium
-  HostName trillium.internal
-  ProxyJump bastion.example.org
+
+## Configure a cluster
+
+First make a normal SSH alias. A persistent master is strongly recommended and is required for
+clusters whose authentication cannot be completed non-interactively.
+
+```sshconfig
+Host mycluster
+  HostName login.hpc.example.edu
+  User alice
   ControlMaster auto
   ControlPath ~/.ssh/sockets/%r@%h-%p
+  ControlPersist 12h
 ```
 
-Alternatively set it per host in the config with `ssh_opts`; these are passed through to every
-`ssh` remoteslurm spawns and included in rsync's transport, so both traverse the same jump host:
+Run `remoteslurm config --init`, then edit `~/.config/remoteslurm/config.toml`:
 
 ```toml
-[hosts.trillium]
-ssh = "trillium"
-ssh_opts = ["-o", "ProxyJump=bastion.example.org"]
+default_host = "mycluster"
+
+[hosts.mycluster]
+ssh = "mycluster"
+mfa = true
+account = "research"
+partition = "standard"
+env_vars = ["WORK", "LAB_STORAGE"]
+quota_paths = ["~", "$WORK", "$LAB_STORAGE"]
+protected_roots = ["$WORK", "$LAB_STORAGE"]
+notes = "Use the short partition only for jobs under 30 minutes."
+
+[hosts.mycluster.defaults]
+time = "01:00:00"
+
+[hosts.mycluster.templates.cpu]
+partition = "standard"
+time = "01:00:00"
+cpus_per_task = 4
+mem = "16G"
+preamble = "module load python/3.11\nsource $WORK/venvs/project/bin/activate\n"
+
+[hosts.mycluster.templates.short]
+inherit = "cpu"
+partition = "short"
+time = "00:10:00"
+
+[hosts.mycluster.projects.analysis]
+local = "~/code/analysis"
+remote = "$WORK/analysis"
+exclude = [".git", "__pycache__", "results/"]
+delete = false
 ```
 
-## CLI
+Only `ssh` is needed for basic use. The other values are examples, not package defaults. In
+particular, do not copy account, partition, storage, or module settings without adapting them to
+your site.
 
-Paths may be `HOST:PATH`; otherwise `--host`, `default_host` or `$REMOTESLURM_DEFAULT_HOST`
-is used. `~` and `$SCRATCH`-style variables are expanded on the remote side. Every command
-accepts `--json`.
+For a site-specific quota command:
+
+```toml
+[hosts.mycluster]
+quota_command = "site-quota --user"
+quota_format = "raw" # raw | pairs | df
+```
+
+`raw` is the safe default. `pairs` recognizes fixed-width `<used>/<limit>` pairs; `df` parses
+`df -h`-style output. Without `quota_command`, `rslurm quota` runs `df -h` on `quota_paths`.
+
+Authenticate and verify the connection:
 
 ```bash
-rslurm ls -l '$SCRATCH/proj'                 # paged; --limit/--token
-rslurm cat proj/run.log --tail 50           # bounded reads; --head/--offset/--max-bytes
-rslurm tail -f proj/run.log                 # follow
-rslurm grep 'Error' proj -g '*.log' -C 2    # bounded regex search
-rslurm find proj '*.nii.gz' --type file
-rslurm run 'module load python; python -V' --login
-rslurm put local.py trillium:proj/          # small files via the stub, large/dirs via rsync
-rslurm get trillium:proj/results.csv .
-
-rslurm submit job.sh -p debug -t 00:10:00 -n test    # local script file
-printf '#!/bin/bash\nhostname\n' | rslurm submit - --cwd '$SCRATCH'
-rslurm submit --remote '$SCRATCH/proj/job.sh' -o gpus-per-node=1 -o mem=16G
-rslurm jobs                                 # queue + recently submitted (with final state)
-rslurm status 2166996
-rslurm wait 2166996 --poll 10
-rslurm watch 2166996 --notify               # foreground: print transitions, notify on finish
-rslurm events                               # job-finish events recorded by watch (unseen)
-rslurm output 2166996 -n 100                # the job's stdout file
-rslurm cancel 2166996                       # only your own jobs; ownership is verified
-rslurm sinfo
-rslurm queue                                # partitions, my accounts/QOS, fair-share, ETA
-rslurm quota                                # disk usage (diskusage_report, else df -h)
-rslurm jobs --prune                         # drop long-finished registry records
-rslurm forget 2166996                       # remove one job from the local registry
-rslurm clean --dry-run                      # remove generated scripts/sweeps past the cutoff
+remoteslurm connect mycluster
+remoteslurm doctor --host mycluster
 ```
 
-### Speed: the session daemon
+Every library-spawned SSH process uses batch mode, so an expired interactive connection fails
+with a structured `not_connected` error instead of hanging on a hidden prompt.
 
-Opening a new ssh channel costs ~2 s on many clusters (PAM session + rc files). The CLI
-therefore talks to a small per-user daemon that keeps stub sessions warm; it is started on
-demand and exits after 4 h idle. Warm CLI calls take ~150 ms end to end.
+### Jump hosts
+
+Put `ProxyJump` in `~/.ssh/config` when possible. Alternatively, configure SSH arguments locally:
+
+```toml
+[hosts.mycluster]
+ssh = "mycluster"
+ssh_opts = ["-o", "ProxyJump=bastion.example.edu"]
+```
+
+The same options are used by SSH and by project sync.
+
+## Use the CLI
+
+Paths are remote paths. `~` and variables exported by the remote login environment expand on the
+remote host. Commands accept `--json`; `HOST:PATH`, `--host`, `default_host`, and
+`REMOTESLURM_DEFAULT_HOST` select the cluster.
 
 ```bash
-rslurm daemon status|stop|start
-rslurm --no-daemon ls ~          # one-off direct session
+rslurm info
+rslurm ls '$WORK/analysis'
+rslurm cat '$WORK/analysis/run.log' --tail 50
+rslurm grep 'Error' '$WORK/analysis' -g '*.log' -C 2
+rslurm sync analysis --dry-run
+rslurm sync analysis
+
+rslurm submit scripts/fit.sh --template cpu -n fit
+rslurm jobs
+rslurm wait 12345 --poll 10
+rslurm output 12345 -n 100
+rslurm diagnose 12345
+rslurm cancel 12345
+rslurm queue
+rslurm quota
 ```
 
-## MCP server (Claude Code, Codex, …)
+Use `run` only for short login-node checks. `run --compute` uses `srun`; substantial work should
+normally be submitted with `submit`.
+
+## Give an agent access through MCP
+
+`remoteslurm-mcp` is a stdio MCP server. Generate a client configuration with:
 
 ```bash
-remoteslurm mcp-config                 # prints the mcpServers snippet
-claude mcp add remoteslurm -s user -e REMOTESLURM_DEFAULT_HOST=trillium -- remoteslurm-mcp
+remoteslurm mcp-config --host mycluster
 ```
 
-Tool sets are chosen with `REMOTESLURM_MCP_TOOLS=core|all` (default `core`). Core:
-`info`, `ls`, `read`, `edit`, `grep`, `write`, `run`, `submit`, `jobs`, `diagnose`, `sync`,
-`cancel`, `wait`, `connection`. The `all` set adds `glob`, `diff`, `job_output`, `sinfo`,
-`projects`, `sweep`, `queue_info`, `quota`, `events`. All return JSON with `truncated` /
-`next_token` hints; errors come back as `{"error": "<code>", "message": ..., "action": ...}`
-rather than exceptions. `wait` is *bounded* (returns `terminal:false` on timeout — loop as
-needed); `events` reports jobs that finished while you were away. `connection` never starts
-anything — it reports whether the ssh master is alive and what to run if not.
+The default `core` tool set includes `info`, bounded file operations, `run`, `submit`, `jobs`,
+`diagnose`, `sync`, `cancel`, `wait`, and `connection`. Set
+`REMOTESLURM_MCP_TOOLS=all` to add glob/diff, project and queue inspection, quota, sweeps, output,
+and event tools.
 
-Example prompts once registered:
+An agent should begin with `info`. Its `notes`, `templates`, `projects`, and `learned_notes` are
+the local policy contract: they let the same MCP tools work at a university cluster, a national
+facility, or a private Slurm installation without adding site logic to this repository. Install
+the full agent workflow with:
 
-```text
-List what's in $SCRATCH/proj on trillium and show me the last 30 lines of the newest .log.
-Submit scripts/fit.sh on the debug partition with 10 minutes, wait for it, and show the output.
-Why did job 2166996 fail? Check its state, exit code and stderr.
+```bash
+rslurm agent-guide
 ```
 
-## Library
+The guide is also exposed as the MCP resource `remoteslurm://guide`.
+
+## Python API
 
 ```python
 from remoteslurm import Cluster
 
-c = Cluster.connect("trillium")              # raises NotConnected with an action if needed
-c.ls("$SCRATCH")["entries"]
-c.read("~/proj/run.log", tail=50)["content"]
-c.grep(r"nan", "$SCRATCH/proj", glob="*.log")
+with Cluster.connect("mycluster") as cluster:
+    print(cluster.info()["slurm_version"])
+    print(cluster.ls("$WORK/analysis")["entries"])
 
-job = c.submit("#!/bin/bash\nhostname\n", name="hello", partition="debug", time="00:05:00")
-st = job.wait(poll=10)                       # JobStatus: state, exit_code, elapsed, max_rss, ...
-print(st.state, job.output(tail=20)["content"])
+    job = cluster.submit(
+        "#!/bin/bash\nhostname\n",
+        name="hello",
+        template="short",
+    )
+    status = job.wait(poll=10)
+    print(status.state, job.output(tail=20)["content"])
 ```
 
-## Safety defaults
+## Safety model
 
-- Library-spawned `ssh` always uses `BatchMode=yes` and `ControlMaster=no`: it can fail, never prompt.
-- The remote stub never uses a shell for its own operations (argv lists only); `run`/`run
-  --compute` (srun) are the explicit escape hatches. Per host, `allow_run = false` disables
-  them and `allow_run = "safe"` requires an argv list whose executable is in `run_allowlist`.
-  Enforcement is client-side; the daemon socket is same-user trust (`0600`, owner-only).
-- `scancel` only acts on jobs `squeue` attributes to you; `rm` refuses `/`, `$HOME` and its
-  parent, and a recursive `rm` also refuses the `$SCRATCH`/`$PROJECT` roots and any path
-  shallower than three components.
-- `protected_paths` (default `~/.ssh/**`, `~/.bashrc`, `~/.bash_profile`,
-  `~/.cache/remoteslurm/**`) block `write`/`edit`/`rm`/`put`/`sync --delete` unless you pass
-  `--force` (CLI) / `force=True` (library, MCP). Ops listed in `confirm` (e.g. `["rm",
-  "cancel"]`) prompt `y/N` in the CLI (`--yes` skips) and require `confirm=True` in the
-  library/MCP (otherwise a `ConfirmationRequired` / `{needs_confirmation: true}` reply).
-- Reads are capped (64 KB default, 4 MB max), writes at 8 MB, listings at 2000 entries,
-  grep at 50 MB/file; binary files are detected and returned base64-encoded.
-- Every `submit`, `run`, `cancel` is appended to `~/.local/state/remoteslurm/<host>/audit.log`.
+- Reads, directory listings, searches, and MCP results are bounded.
+- The stub uses argv execution for internal operations. `run` and site-configured quota commands
+  are explicit escape hatches.
+- `allow_run = false` disables `run`; `allow_run = "safe"` requires an argv list whose executable
+  matches `run_allowlist` and rejects shell `-c` forms.
+- `protected_paths` block writes, edits, removal, upload, and sync deletion unless explicitly
+  forced.
+- Recursive removal always refuses `/`, the remote home and its parent, shallow paths, and every
+  root in `protected_roots`.
+- Cancellation checks scheduler ownership before calling `scancel`.
+- Operations listed in `confirm`, such as `rm` or `cancel`, require explicit confirmation.
+- Submissions, runs, cancellations, edits, removals, and sync operations are recorded in local
+  per-host state.
+
+The daemon socket and the local configuration are same-user trust boundaries. This is an
+operator tool, not a privilege-separation or multi-tenant security boundary.
 
 ## Troubleshooting
 
-| Symptom | Fix |
+| Symptom | Action |
 |---|---|
-| `not_connected` / exit code 3 | `remoteslurm connect <host>` (MFA), then retry |
-| `ssh ControlMaster` check fails in `doctor` | add the `ControlMaster/ControlPath/ControlPersist` lines to `~/.ssh/config` |
-| `REMOTESLURM-ERROR python not found` | set `python = "/path/to/python3"` in the host config |
-| slow CLI (~2 s per call) | `remoteslurm daemon status` — the daemon should be running; `REMOTESLURM_NO_DAEMON` disables it |
-| job shows `accounting_pending` | Slurm's accounting lags a little after a job leaves the queue; retry in a few seconds |
-| `scancel` says *skipped* | the job is not yours or no longer exists |
+| `not_connected` | Run `remoteslurm connect <host>` in a terminal, then retry. |
+| ControlMaster check fails | Add `ControlMaster`, `ControlPath`, and `ControlPersist` to the SSH alias. |
+| Remote Python is missing | Set `python = "/path/to/python3"` for that host. |
+| A configured variable is absent | Ensure it is exported in the remote login environment. |
+| Project sync rejects local rsync | Install rsync 3.1 or newer or use bounded `put`/`get`. |
+| A finished job is temporarily unknown | Slurm accounting may lag; retry after a few seconds. |
 
-Set `REMOTESLURM_DEBUG=1` to print error details.
+Set `REMOTESLURM_DEBUG=1` for additional local error detail.
 
-## Environment knobs
-
-| Variable | Meaning |
-|---|---|
-| `REMOTESLURM_CONFIG` | alternate config file |
-| `REMOTESLURM_DEFAULT_HOST` | default host (overrides config) |
-| `REMOTESLURM_STATE_DIR` | registry/audit/daemon log dir (default `~/.local/state/remoteslurm`) |
-| `REMOTESLURM_SOCKET` | daemon socket path |
-| `REMOTESLURM_DAEMON_IDLE` | daemon idle exit, seconds (default 14400) |
-| `REMOTESLURM_NO_DAEMON` | never use/start the daemon |
-| `REMOTESLURM_MCP_MAX_CHARS` | cap on any string in an MCP result (default 200000) |
-
-## Development
+## Development and live validation
 
 ```bash
-uv venv && uv pip install -e '.[dev]'
-uv run --no-sync pytest -q              # runs the stub locally with FakeSlurm shims, no cluster needed
-uv run --no-sync ruff check src tests && uv run --no-sync ruff format --check src tests
+uv run --no-sync pytest -q
+uv run --no-sync ruff check src tests
+uv run --no-sync ruff format --check src tests
 uv run --no-sync mypy
-uvx vermin -t=3.6- --violations src/remoteslurm/stub.py   # the remote stub must stay 3.6-compatible
-REMOTESLURM_LIVE=1 uv run --no-sync pytest -q tests/live     # optional: against a real cluster
+uvx vermin -t=3.6- --violations src/remoteslurm/stub.py
+uv build
 ```
 
-Design notes: `docs/plans/v1-design.md`.
+Live tests have no built-in cluster, account, partition, path, or walltime:
 
-## Roadmap
+```bash
+REMOTESLURM_LIVE=1 \
+REMOTESLURM_LIVE_HOST=mycluster \
+REMOTESLURM_LIVE_TEMPLATE=short \
+uv run --no-sync pytest -q tests/live
+```
 
-Job templates per cluster, array-job helpers, `follow` streaming over MCP, usage/quota
-reporting, Windows support for the daemon (named pipes).
+Alternatively set any of `REMOTESLURM_LIVE_PARTITION`, `REMOTESLURM_LIVE_TIME`, or
+`REMOTESLURM_LIVE_CWD`. Omit them to use configured or scheduler defaults.

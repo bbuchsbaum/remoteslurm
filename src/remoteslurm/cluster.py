@@ -138,10 +138,19 @@ class Cluster(SlurmOps):
 
     def info(self, refresh: bool = False) -> dict[str, Any]:
         if self._info is None or refresh:
-            base = dict(self.call("info", _timeout=30))
+            base = dict(self.call("info", env_vars=list(self.host.env_vars), _timeout=30))
             # Local (client-side) facts an agent should read before submitting.
             base["notes"] = self.host.notes
             base["templates"] = self.host.template_summaries()
+            base["projects"] = {
+                name: {
+                    "local": project.local,
+                    "remote": project.remote,
+                    "exclude": list(project.exclude),
+                    "delete": project.delete,
+                }
+                for name, project in sorted(self.host.projects.items())
+            }
             base["learned_notes"] = read_learned_notes(self.host.name)
             self._info = base
         return self._info
@@ -352,12 +361,18 @@ class Cluster(SlurmOps):
 
         Refuses a configured protected path unless ``force=True``; when ``rm`` is listed in the
         host's ``confirm``, requires ``confirm=True`` (else raises ``ConfirmationRequired``). The
-        stub adds its own guards (shared roots, shallow recursive deletes).
+        stub adds its own guards (home, configured roots, and shallow recursive deletes).
         """
         self._check_protected(path, force=force, action="remove")
         what = f"remove {'-r ' if recursive else ''}{path}"
         self._require_confirm("rm", confirm, what)
-        r = self.call("rm", path=path, recursive=recursive, _timeout=300)
+        r = self.call(
+            "rm",
+            path=path,
+            recursive=recursive,
+            protected_roots=list(self.host.protected_roots),
+            _timeout=300,
+        )
         self.registry.audit("rm", path=path, recursive=recursive)
         return r
 
@@ -483,8 +498,13 @@ class Cluster(SlurmOps):
         else:
             args["argv"] = list(cmd)
         if stream or on_chunk is not None:
-            return self._run_stream(args, timeout=timeout, on_chunk=on_chunk)
-        return self.call("run", _timeout=timeout + 15, _cancel_on_timeout=cancel_on_timeout, **args)
+            result = self._run_stream(args, timeout=timeout, on_chunk=on_chunk)
+        else:
+            result = self.call(
+                "run", _timeout=timeout + 15, _cancel_on_timeout=cancel_on_timeout, **args
+            )
+        self.registry.audit("run", cmd=cmd, rc=result.get("rc"))
+        return result
 
     def _run_stream(
         self,
@@ -848,43 +868,46 @@ class Cluster(SlurmOps):
         }
 
     def _quota_paths(self) -> list[str]:
-        """Filesystems to ``df`` when there is no ``quota_command``: home + scratch/project."""
-        info: dict[str, Any] = {}
-        try:
-            info = self.info()
-        except RemoteSlurmError:
-            pass
-        env = info.get("env", {}) if info else {}
+        """Expand configured remote filesystems for the portable ``df -h`` fallback."""
         paths: list[str] = []
-        for key in ("HOME", "SCRATCH", "PROJECT"):
-            v = env.get(key)
-            if v and v not in paths:
-                paths.append(v)
-        home = info.get("home")
-        if not paths and home:
-            paths.append(home)
+        for raw in self.host.quota_paths:
+            try:
+                path = str(self.call("expandpath", path=raw, _timeout=30)["path"])
+            except RemoteSlurmError:
+                continue
+            if path not in paths:
+                paths.append(path)
+        if not paths:
+            try:
+                paths.append(self.home)
+            except RemoteSlurmError:
+                pass
         return paths
 
     def quota(self) -> dict[str, Any]:
-        """Disk usage/quota. Uses the host's ``quota_command`` (Alliance: ``diskusage_report
-        --per_user``) when set, else ``df -h`` of home/scratch/project.
+        """Disk usage/quota using a configured site command or portable ``df -h`` fallback.
 
-        Returns ``{available, source, usage, raw, ...}``; ``available`` is false when the tool is
-        missing (``usage`` empty) so an agent can fall back gracefully.
+        A custom command's output stays raw unless ``quota_format`` selects the generic
+        ``pairs`` or ``df`` parser. Returns ``{available, source, usage, raw, ...}``;
+        ``available`` is false when the command is missing so an agent can fall back gracefully.
         """
         cmd = self.host.quota_command
         if cmd:
-            # Run in a login shell so module-provided wrappers (Alliance's `diskusage_report`
-            # is a shell function) resolve; the bare binary can report different numbers.
+            # A trusted, locally configured command runs in a login shell so site-provided
+            # functions and modules resolve the same way they do in an interactive session.
             res = self.call("quota", command_shell=cmd, _timeout=120)
             available = res.get("rc") == 0 and not res.get("missing")
-            usage = slurm.parse_diskusage_report(res.get("stdout", "")) if available else []
+            raw = res.get("stdout", "")
+            parsers = {"pairs": slurm.parse_quota_pairs, "df": slurm.parse_df}
+            parser = parsers.get(self.host.quota_format)
+            usage = parser(raw) if available and parser is not None else []
             return {
                 "available": available,
                 "source": "command",
                 "command": cmd,
+                "format": self.host.quota_format,
                 "usage": usage,
-                "raw": res.get("stdout", ""),
+                "raw": raw,
                 "stderr": "" if available else res.get("stderr", ""),
             }
         paths = self._quota_paths()

@@ -1,4 +1,4 @@
-"""Live tests against a real cluster. Run with REMOTESLURM_LIVE=1 (and an established master)."""
+"""Live tests for any configured cluster with an established SSH session."""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("REMOTESLURM_LIVE"), reason="REMOTESLURM_LIVE not set"
 )
 HOST = os.environ.get("REMOTESLURM_LIVE_HOST")  # None -> default host
-PARTITION = os.environ.get("REMOTESLURM_LIVE_PARTITION", "debug")
+PARTITION = os.environ.get("REMOTESLURM_LIVE_PARTITION")
+TIME = os.environ.get("REMOTESLURM_LIVE_TIME")
+CWD = os.environ.get("REMOTESLURM_LIVE_CWD")
+TEMPLATE = os.environ.get("REMOTESLURM_LIVE_TEMPLATE")
 
 
 @pytest.fixture(scope="module")
@@ -28,14 +31,23 @@ def test_basics(cluster: Cluster) -> None:
 
 
 def test_job_lifecycle(cluster: Cluster) -> None:
+    options = {
+        key: value
+        for key, value in {
+            "partition": PARTITION,
+            "time": TIME,
+            "cwd": CWD,
+            "template": TEMPLATE,
+        }.items()
+        if value
+    }
     job = cluster.submit(
         "#!/bin/bash\necho live-ok\n",
         name="rs_live",
-        partition=PARTITION,
-        time="00:02:00",
-        cwd="$SCRATCH",
+        **options,
     )
     st = job.wait(poll=5, timeout=600)
     assert st.state == "COMPLETED" and st.exit_code == 0
     assert "live-ok" in job.output(tail=50)["content"]
-    cluster.rm(st.script_path)  # type: ignore[arg-type]
+    if st.script_path:
+        cluster.rm(st.script_path)

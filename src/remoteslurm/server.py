@@ -302,7 +302,7 @@ async def diff(
 
 # -- commands ---------------------------------------------------------------------------------
 async def run(
-    cmd: str,
+    cmd: str | list[str],
     cwd: str | None = None,
     timeout: int = 60,
     login: bool = False,
@@ -328,8 +328,9 @@ async def run(
     ``template`` then ``partition``/``time``/``cpus``/``mem``/``gpus`` (account from the host
     default). ``queue_timeout`` bounds the wait for an allocation; the result is
     ``{started: true, rc, stdout, stderr, node, elapsed}`` when a node was granted, else
-    ``{started: false, reason}``. Returns ``error: permission`` when ``allow_run`` forbids the
-    command (``false``, or ``"safe"`` for a non-allowlisted / shell-string command).
+    ``{started: false, reason}``. ``cmd`` may be a shell string or an argv list. The argv form is
+    required when the host uses ``allow_run = "safe"``. Returns ``error: permission`` when the
+    configured run policy forbids the command.
 
     Live streaming of output (``run --stream``) and ``tail -f`` are CLI-only: this MCP ``run``
     tool always returns the complete result in one response.
@@ -536,7 +537,7 @@ async def sinfo(host: str | None = None) -> dict[str, Any]:
 
 
 async def info(refresh: bool = False, host: str | None = None) -> dict[str, Any]:
-    """Remote facts: user, home, hostname, Slurm version, selected env vars (cached)."""
+    """Remote facts plus local policy: notes, templates, projects, and selected env vars."""
 
     def f(c: Cluster) -> dict[str, Any]:
         return dict(c.info(refresh=refresh))
@@ -549,7 +550,7 @@ async def connection(host: str | None = None) -> dict[str, Any]:
 
     Use this first after any ``not_connected``/``auth_required`` error. When not alive,
     ``action`` holds the exact command the *user* must run in a terminal (MFA hosts cannot be
-    authenticated by an agent), e.g. ``remoteslurm connect trillium``.
+    authenticated by an agent), e.g. ``remoteslurm connect mycluster``.
     """
 
     def work() -> dict[str, Any]:
@@ -626,6 +627,7 @@ async def sync(
             dry_run=dry_run,
             delete=delete,
             force=force,
+            force_protected=force,
         )
 
     return await _guard(host, f)
@@ -668,9 +670,10 @@ async def queue_info(host: str | None = None) -> dict[str, Any]:
 async def quota(host: str | None = None) -> dict[str, Any]:
     """Disk usage / quota for the user's filesystems.
 
-    Uses the host's configured ``quota_command`` (Alliance clusters: ``diskusage_report
-    --per_user``) when set, else ``df -h`` of home/scratch/project. Returns ``available`` (false
-    when the tool is missing), ``usage`` (parsed rows) and the ``raw`` text.
+    Uses the host's optional ``quota_command`` when set, else ``df -h`` over ``quota_paths``.
+    Custom output remains raw unless ``quota_format`` selects the generic ``pairs`` or ``df``
+    parser. Returns ``available`` (false when the tool is missing), parsed ``usage`` rows when
+    configured, and the ``raw`` text.
     """
 
     def f(c: Cluster) -> dict[str, Any]:

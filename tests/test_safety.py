@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from remoteslurm.cluster import Cluster
-from remoteslurm.config import DEFAULT_PROTECTED_PATHS, Config, HostConfig
+from remoteslurm.config import DEFAULT_PROTECTED_PATHS, EXAMPLE_CONFIG, Config, HostConfig
 from remoteslurm.errors import ConfigError, ConfirmationRequired, InvalidArgument, PermissionDenied
 
 
@@ -57,17 +57,17 @@ def test_unprotected_write_still_works(cluster: Cluster, sandbox: Path) -> None:
 
 
 # --------------------------------------------------------------------------- recursive rm guards
-def test_rm_recursive_refuses_scratch_root(
+def test_rm_recursive_refuses_configured_root(
     make_cluster: Callable[..., Cluster], tmp_path: Path
 ) -> None:
-    scratch = tmp_path / "scratch_root"
-    scratch.mkdir()
-    (scratch / "keep").write_text("x\n")
-    c = make_cluster({"SCRATCH": str(scratch)})
+    storage = tmp_path / "shared_storage"
+    storage.mkdir()
+    (storage / "keep").write_text("x\n")
+    c = make_cluster(protected_roots=[str(storage)])
     with pytest.raises(InvalidArgument) as ei:
-        c.rm(str(scratch), recursive=True, force=True)  # force skips the client check; stub refuses
+        c.rm(str(storage), recursive=True, force=True)  # force skips client check; stub refuses
     assert "root" in ei.value.message
-    assert scratch.exists()  # nothing was removed
+    assert storage.exists()  # nothing was removed
 
 
 def test_rm_recursive_refuses_shallow_path(cluster: Cluster) -> None:
@@ -81,6 +81,18 @@ def test_rm_recursive_refuses_shallow_path(cluster: Cluster) -> None:
         assert shallow.exists()  # guard fired before rmtree
     finally:
         shutil.rmtree(shallow, ignore_errors=True)
+
+
+def test_rm_recursive_fails_closed_when_protected_root_variable_is_unset(
+    make_cluster: Callable[..., Cluster], sandbox: Path
+) -> None:
+    target = sandbox / "deep" / "child"
+    target.mkdir(parents=True)
+    c = make_cluster(protected_roots=["$WORK"])
+    with pytest.raises(InvalidArgument) as ei:
+        c.rm(str(target), recursive=True, force=True)
+    assert "not set" in ei.value.message
+    assert target.exists()
 
 
 def test_rm_recursive_deep_path_ok(cluster: Cluster, sandbox: Path) -> None:
@@ -222,6 +234,52 @@ def test_config_safety_defaults() -> None:
     assert h.confirm == []
     assert "python*" in h.run_allowlist
     assert h.allow_run is True
+    assert h.env_vars == []
+    assert h.quota_paths == ["~"]
+    assert h.quota_format == "raw"
+    assert h.protected_roots == []
+
+
+def test_config_portable_site_fields_and_example(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(EXAMPLE_CONFIG)
+    h = Config.load(cfg).host("mycluster")
+    assert h.ssh == "mycluster"
+    assert "trillium" not in EXAMPLE_CONFIG.lower()
+    assert "alliance" not in EXAMPLE_CONFIG.lower()
+
+    cfg.write_text(
+        '[hosts.h]\nenv_vars = ["WORK"]\nquota_paths = ["~", "$WORK"]\n'
+        'protected_roots = ["$WORK"]\nquota_command = "site-quota"\n'
+        'quota_format = "pairs"\n'
+    )
+    h = Config.load(cfg).host("h")
+    assert h.env_vars == ["WORK"]
+    assert h.quota_paths == ["~", "$WORK"]
+    assert h.protected_roots == ["$WORK"]
+    assert h.quota_format == "pairs"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'quota_format = "site-magic"',
+        'env_vars = ["NOT-VALID!"]',
+        'env_vars = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", '
+        '"M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", '
+        '"A1", "B1", "C1", "D1", "E1", "F1", "G1", "H1", "I1", "J1", "K1", "L1", '
+        '"M1", "N1", "O1", "P1", "Q1", "R1", "S1", "T1", "U1", "V1", "W1", "X1", '
+        '"Y1", "Z1", "A2", "B2", "C2", "D2", "E2", "F2", "G2", "H2", "I2", "J2", '
+        '"K2", "L2", "M2"]',
+        'quota_paths = "$WORK"',
+        'protected_roots = [""]',
+    ],
+)
+def test_config_rejects_invalid_portability_fields(tmp_path: Path, body: str) -> None:
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(f"[hosts.h]\n{body}\n")
+    with pytest.raises(ConfigError):
+        Config.load(cfg)
 
 
 def test_safe_mode_rejects_bash_dash_c(make_cluster):

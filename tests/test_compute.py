@@ -98,7 +98,7 @@ def test_resolve_compute_resources_template_then_kwargs() -> None:
         name="cpu",
         options={"partition": "compute", "time": "01:00:00", "cpus_per_task": 4, "mem": "16G"},
     )
-    host = HostConfig(name="h", ssh="local", mfa=False, account="rrg-host", templates={"cpu": tmpl})
+    host = HostConfig(name="h", ssh="local", mfa=False, account="research", templates={"cpu": tmpl})
     c = Cluster.__new__(Cluster)  # no session needed for the pure resolver
     c.host = host
     res = c._resolve_compute_resources(
@@ -115,7 +115,7 @@ def test_resolve_compute_resources_template_then_kwargs() -> None:
     assert res["cpus"] == 4  # from cpus_per_task
     assert res["mem"] == "16G"
     assert res["gpus"] == 2
-    assert res["account"] == "rrg-host"  # host default fills in
+    assert res["account"] == "research"  # host default fills in
 
 
 def test_compute_respects_allow_run_false(cluster: Cluster) -> None:

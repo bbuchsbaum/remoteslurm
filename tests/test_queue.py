@@ -68,7 +68,7 @@ def test_parse_qos() -> None:
     names = {r["name"]: r for r in rows}
     assert names["normal"]["max_jobs_pu"] == "150"
     assert names["debug"]["max_jobs_pu"] == "1"  # debug allows 1 job/user
-    # Empty columns become None; a present "0" is kept as the string "0" (real trillium output).
+    # Empty columns become None; a present "0" is kept as the string "0" (recorded output).
     assert names["normal"]["max_wall"] is None
     assert names["normal"]["priority"] == "0"
     assert names["debug"]["priority"] == "0"
@@ -108,8 +108,8 @@ def test_parse_df_gnu_and_macos() -> None:
 
 
 def test_parse_diskusage_report() -> None:
-    # Real trillium output: fixed-width, spaced slashes, and an internal-space value ("0  B").
-    rows = slurm.parse_diskusage_report((FIX / "diskusage.txt").read_text())
+    # Recorded fixed-width output: spaced slashes and an internal-space value ("0  B").
+    rows = slurm.parse_quota_pairs((FIX / "diskusage.txt").read_text())
     assert len(rows) == 4  # header line dropped, 4 filesystems
     home = rows[0]
     assert home["description"] == "/home (user def-brad)"
@@ -164,10 +164,11 @@ def test_queue_info_shape(make_cluster: Callable[..., Cluster]) -> None:
 
 
 def test_quota_via_command(make_cluster: Callable[..., Cluster]) -> None:
-    c = make_cluster(quota_command="diskusage_report --per_user")
+    c = make_cluster(quota_command="diskusage_report --per_user", quota_format="pairs")
     q = c.quota()
     assert q["available"] is True
     assert q["source"] == "command"
+    assert q["format"] == "pairs"
     assert len(q["usage"]) == 4
     assert q["usage"][0]["used"] == "88GiB"
     assert q["usage"][0]["limit"] == "100GiB"
@@ -186,6 +187,15 @@ def test_quota_missing_command_is_unavailable(make_cluster: Callable[..., Cluste
     q = c.quota()
     assert q["available"] is False
     assert q["usage"] == []
+
+
+def test_quota_custom_command_is_raw_by_default(make_cluster: Callable[..., Cluster]) -> None:
+    c = make_cluster(quota_command="printf 'site-specific output\\n'")
+    q = c.quota()
+    assert q["available"] is True
+    assert q["format"] == "raw"
+    assert q["usage"] == []
+    assert q["raw"] == "site-specific output\n"
 
 
 def test_queue_info_degrades_when_tools_absent(make_cluster: Callable[..., Cluster]) -> None:
@@ -224,7 +234,7 @@ def test_mcp_queue_info(
 
 
 def test_mcp_quota(make_cluster: Callable[..., Cluster], monkeypatch: pytest.MonkeyPatch) -> None:
-    c = make_cluster(quota_command="diskusage_report --per_user")
+    c = make_cluster(quota_command="diskusage_report --per_user", quota_format="pairs")
     r = _mcp(c, monkeypatch, "quota")
     assert r["available"] is True
     assert len(r["usage"]) == 4
@@ -240,8 +250,7 @@ def test_queue_info_and_quota_in_all_set() -> None:
 
 
 def test_quota_runs_in_login_shell(make_cluster, tmp_path):
-    """quota_command runs via `bash -lc` so a login-defined shell function is used
-    (Alliance's diskusage_report is a function, not a bare binary)."""
+    """quota_command runs via `bash -lc` so a login-defined site function is available."""
     bashrc = tmp_path / "login.sh"
     bashrc.write_text(
         "diskusage_report() { printf '%s\\n' "
@@ -250,6 +259,7 @@ def test_quota_runs_in_login_shell(make_cluster, tmp_path):
     # BASH_ENV makes non-interactive `bash -lc`/`bash -c` source the file defining the function
     c = make_cluster(
         quota_command="diskusage_report --per_user",
+        quota_format="pairs",
         extra_env={"BASH_ENV": str(bashrc), "ENV": str(bashrc)},
     )
     q = c.quota()
