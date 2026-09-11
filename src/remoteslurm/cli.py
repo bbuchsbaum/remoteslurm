@@ -135,7 +135,14 @@ def cmd_connect(args: argparse.Namespace) -> int:
         extra_ssh_opts=list(host.ssh_opts),
     )
     if t.master_alive() and not args.force:
-        print(f"✓ ssh master for {host.ssh} is already alive")
+        lt = t.master_lifetime(host.session_lifetime)
+        up = f" (up {lt['age']})" if lt.get("age") else ""
+        print(f"✓ ssh master for {host.ssh} is already alive{up}")
+        if lt.get("expiring"):
+            print(
+                f"! it reaches the site's session_lifetime ({host.session_lifetime}) soon; "
+                f"run `remoteslurm connect --force {host.name}` for a fresh connection"
+            )
     else:
         if args.force:
             t.master_exit()
@@ -233,7 +240,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
         t = SSHTransport(alias=host.ssh, mfa=host.mfa, control_path=host.control_path)
         alive = t.master_alive()
-        check("ssh master alive", alive, "", f"run: remoteslurm connect {host.name}")
+        detail = ""
+        if alive:
+            lt = t.master_lifetime(host.session_lifetime)
+            detail = f"up {lt['age']}" if lt.get("age") else ""
+            if lt.get("expires_at"):
+                detail += f", site limit reached {lt['expires_at']}"
+        check("ssh master alive", alive, detail, f"run: remoteslurm connect {host.name}")
         if not alive:
             emit(args, {"ok": False, "checks": results}, lambda d: None)
             return EXIT_NOT_CONNECTED
@@ -391,6 +404,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     c = get_cluster(args)
     cmd = " ".join(args.cmd) if len(args.cmd) > 1 or not args.argv else args.cmd[0]
     command = list(args.cmd) if args.argv else cmd
+    if getattr(args, "detach", False):
+        return _cmd_run_detach(args, c, command)
     if args.compute:
         return _cmd_run_compute(args, c, command, cmd)
     if getattr(args, "stream", False):
@@ -412,6 +427,34 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     emit(args, r, human)
     return r["rc"] if not args.json else EXIT_OK
+
+
+def _cmd_run_detach(args: argparse.Namespace, c: Cluster, command: str | list[str]) -> int:
+    """`run --detach`: start the command in the background and print its handle."""
+    r = c.run(
+        command,
+        cwd=args.cwd,
+        login=args.login,
+        detach=True,
+        log=args.log,
+        compute=args.compute,
+        stream=args.stream,
+    )
+
+    def human(r: dict[str, Any]) -> None:
+        pid = r["pid"]
+        print(f"started pid {pid} on {r.get('host')} (process group {r.get('pgid')})")
+        print(f"log: {r.get('log')}")
+        if r.get("warning"):
+            print(f"warning: {r['warning']}", file=sys.stderr)
+        print(
+            f"  rslurm proc status {pid} | rslurm proc tail {pid} | rslurm proc kill {pid} | "
+            f"rslurm wait --pid {pid}",
+            file=sys.stderr,
+        )
+
+    emit(args, r, human)
+    return EXIT_OK
 
 
 def _cmd_run_stream(
@@ -1004,6 +1047,16 @@ def _print_array_status(d: dict[str, Any], extra: dict[str, Any], *, show_tasks:
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
+    if args.pid is not None or args.path is not None:
+        if args.job_id is not None:
+            raise InvalidArgument("give a JOB_ID or --pid/--path, not both")
+        return _cmd_wait_for(args)
+    if args.job_id is None:
+        raise InvalidArgument(
+            "wait needs a JOB_ID, --pid PID (a `run --detach` process) or --path PATH"
+        )
+    if args.pattern is not None:
+        raise InvalidArgument("--pattern needs --pid or --path")
     c = get_cluster(args)
 
     def cb(st: Any) -> None:
@@ -1030,6 +1083,100 @@ def cmd_wait(args: argparse.Namespace) -> int:
     else:
         ok = st.state == "COMPLETED"
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def _cmd_wait_for(args: argparse.Namespace) -> int:
+    """`wait --pid/--path [--pattern]`: block until a detached run exits or a file matches.
+
+    Exit 0 when a --path/--pattern condition held, or (--pid alone) when the process exited 0.
+    """
+    c = get_cluster(args)
+    r = c.wait_for(
+        pid=args.pid,
+        path=args.path,
+        pattern=args.pattern,
+        offset=args.offset,
+        timeout=args.timeout,
+    )
+
+    def human(r: dict[str, Any]) -> None:
+        if r.get("reason") == "matched":
+            print(r.get("line", ""))
+        else:
+            print(f"{r.get('reason')} after {r.get('waited')}s", file=sys.stderr)
+        if r.get("process"):
+            print(f"[{_proc_line(r['process'])}]", file=sys.stderr)
+
+    emit(args, r, human)
+    if args.pattern is not None or args.path is not None:
+        return EXIT_OK if r.get("met") else EXIT_ERROR
+    proc = r.get("process") or {}
+    return EXIT_OK if proc.get("state") == "exited" and proc.get("rc") == 0 else EXIT_ERROR
+
+
+def _proc_line(r: dict[str, Any]) -> str:
+    s = f"pid {r.get('pid')} {r.get('state')}"
+    if r.get("state") == "exited":
+        s += f" rc={r.get('rc')}"
+    if r.get("elapsed") is not None:
+        s += (" after " if r.get("state") == "exited" else " for ") + f"{r['elapsed']}s"
+    return s
+
+
+def _print_proc(r: dict[str, Any]) -> None:
+    print(_proc_line(r))
+    print(f"  cmd: {r.get('cmd')}")
+    print(f"  log: {r.get('log')}")
+    if r.get("note"):
+        print(f"  note: {r['note']}")
+
+
+def _print_proc_list(d: dict[str, Any]) -> None:
+    procs = d.get("procs") or []
+    if not procs:
+        print("no detached runs")
+        return
+    print(f"{'PID':>8}  {'STATE':<8} {'RC':>4}  {'STARTED':<16}  CMD")
+    for p in procs:
+        rc = "" if p.get("rc") is None else str(p["rc"])
+        cmd = str(p.get("cmd") or "")[:60]
+        started = fmt_time(p.get("started"))
+        print(f"{p.get('pid'):>8}  {str(p.get('state')):<8} {rc:>4}  {started:<16}  {cmd}")
+    if d.get("total", 0) > len(procs):
+        print(f"({len(procs)} of {d['total']} shown)")
+
+
+def cmd_proc(args: argparse.Namespace) -> int:
+    action, pid = args.action, args.pid
+    if action.isdigit() and pid is None:  # `rslurm proc 1234` = status of 1234
+        action, pid = "status", int(action)
+    if action not in ("status", "tail", "kill"):
+        raise InvalidArgument(f"unknown action {action!r}: use status, tail or kill")
+    if action != "status" and pid is None:
+        raise InvalidArgument(f"`proc {action}` needs a PID")
+    c = get_cluster(args)
+    if action == "status":
+        emit(args, c.proc_status(pid), _print_proc if pid is not None else _print_proc_list)
+        return EXIT_OK
+    if action == "tail":
+
+        def human_tail(r: dict[str, Any]) -> None:
+            sys.stdout.write(r.get("content", ""))
+            print(f"[{_proc_line(r)}]", file=sys.stderr)
+
+        emit(args, c.proc_tail(pid, lines=args.lines, max_bytes=args.max_bytes), human_tail)
+        return EXIT_OK
+    if not _confirm_gate(args, c, "proc_kill", f"kill detached process {pid}"):
+        print("aborted", file=sys.stderr)
+        return EXIT_ERROR
+    r = c.proc_kill(pid, signal=args.signal, grace=args.grace, confirm=True)
+
+    def human_kill(r: dict[str, Any]) -> None:
+        head = "killed" if r.get("killed") else f"not killed ({r.get('reason', 'still running')})"
+        print(f"{head}: {_proc_line(r)}")
+
+    emit(args, r, human_kill)
+    return EXIT_OK if r.get("state") != "running" else EXIT_ERROR
 
 
 def _confirm_gate(args: argparse.Namespace, c: Cluster, op: str, what: str) -> bool:
@@ -1493,6 +1640,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=600,
         help="--compute: seconds to wait for an allocation before giving up",
     )
+    sp.add_argument(
+        "--detach",
+        action="store_true",
+        help="start in the background, detached from the connection; prints the pid and log "
+        "(manage it with `rslurm proc`, wait for it with `rslurm wait --pid`)",
+    )
+    sp.add_argument("--log", help="--detach: remote log file (default: under ~/.cache/remoteslurm)")
 
     sp = add(
         "put", cmd_put, "upload a local file (small via stub; --rsync or large/dirs via rsync)"
@@ -1637,12 +1791,48 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add(
         "wait",
         cmd_wait,
-        "block until a job finishes (exit 0 only if it — or every array task — COMPLETED)",
+        "block until a job finishes (exit 0 only if it — or every array task — COMPLETED), "
+        "or until a detached run exits or a remote file matches (--pid/--path/--pattern)",
     )
-    sp.add_argument("job_id")
+    sp.add_argument("job_id", nargs="?")
+    sp.add_argument(
+        "--pid", type=int, help="a `run --detach` process: wait for it to exit (exit 0 iff rc 0)"
+    )
+    sp.add_argument("--path", help="remote file: wait until it exists (or matches --pattern)")
+    sp.add_argument(
+        "--pattern", help="regex: wait for a matching line in --path (default: the --pid's log)"
+    )
+    sp.add_argument(
+        "--offset",
+        type=int,
+        help="byte offset to start scanning at (negative = from end; default: start of file, "
+        "or where this run's output began in the --pid's own log)",
+    )
     sp.add_argument("--poll", type=float, default=15.0)
     sp.add_argument("--timeout", type=float)
     sp.add_argument("-q", "--quiet", action="store_true")
+
+    sp = add("proc", cmd_proc, "manage `run --detach` processes: proc [status|tail|kill] [PID]")
+    sp.add_argument(
+        "action", nargs="?", default="status", help="status (default; no PID lists), tail, kill"
+    )
+    sp.add_argument("pid", nargs="?", type=int)
+    sp.add_argument("-n", "--lines", type=int, default=50, help="tail: lines to show")
+    sp.add_argument("--max-bytes", type=int, default=65536)
+    sp.add_argument(
+        "-s",
+        "--signal",
+        default="TERM",
+        choices=["TERM", "INT", "HUP", "KILL"],
+        help="kill: first signal",
+    )
+    sp.add_argument("--grace", type=int, default=5, help="kill: seconds before escalating to KILL")
+    sp.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt (if host requires it)",
+    )
 
     sp = add("cancel", cmd_cancel, "cancel job(s) (only your own)", aliases=["scancel"])
     sp.add_argument("job_id", nargs="+")

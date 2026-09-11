@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Login-node `run` is now bounded in every case. It returns about 2 s after the command exits
+  even if a background child still holds stdout/stderr (the result is flagged `lingering`, with
+  a note), where it used to wait for the timeout; that child then dies of SIGPIPE at its next
+  write, so background work belongs in `run(detach=True)`. After a timeout kill it drains
+  leftover output for at most 2 s; previously a `setsid` child holding the pipes blocked one of the stub's four
+  slow-pool workers until that child exited. Non-streaming runs now use the streaming path's
+  bounded-memory reader, so a timeout error carries the first `max_output` bytes, not the last.
+- Detached runs: `run(detach=True)` / `rslurm run --detach` / MCP `run(detach=true)` start a
+  command in its own session, with output appended to a log, and return `{pid, pgid, log}` at
+  once. The exit status is recorded remotely, so it survives the connection. New
+  `proc_status`, `proc_tail` and `proc_kill` (library, MCP core tools, and
+  `rslurm proc status|tail|kill`); `proc_kill` signals the whole process group and escalates to
+  SIGKILL after a grace period.
+- Waiting on login-node state: `Cluster.wait_for(pid= | path= [, pattern=])`, MCP
+  `wait(pid=… | path=…, pattern=…)`, and `rslurm wait --pid/--path/--pattern`. The remote side
+  checks every 0.5 s and scans only newly appended log bytes; a timed-out pattern wait returns an
+  `offset` to resume from.
+- `connection` reports the ssh master's `connected_at` and `age`. With the new per-host
+  `session_lifetime` it also reports `expires_at`/`remaining_seconds`, and a `warning` plus
+  `action` once less than an hour remains. `connect` and `doctor` show the master's age.
 - Made the public package cluster-neutral: the generated config, README, agent guide, and live
   test no longer contain a built-in site, account, partition, storage path, or walltime.
 - Added per-host `env_vars`, `quota_paths`, and `protected_roots` so sites can expose their own

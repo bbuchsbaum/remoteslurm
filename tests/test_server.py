@@ -22,6 +22,9 @@ CORE_EXPECTED = {
     "grep",
     "write",
     "run",
+    "proc_status",
+    "proc_tail",
+    "proc_kill",
     "submit",
     "jobs",
     "diagnose",
@@ -316,6 +319,109 @@ def test_sinfo_and_info(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -
     assert r["count"] == 1 and r["partitions"][0]["partition"] == "debug"
     r = call("info")
     assert r["home"] == mcp_cluster.home
+
+
+def test_mcp_detach_proc_tools_and_wait(mcp_cluster: Cluster) -> None:
+    r = call("run", cmd="echo hello; sleep 0.3; echo READY; sleep 300", detach=True)
+    pid = r["pid"]
+    try:
+        w = call("wait", pid=pid, pattern="READY", timeout=20)
+        assert w["done"] and w["met"] and w["reason"] == "matched" and w["line"] == "READY"
+        assert call("proc_status", pid=pid)["state"] == "running"
+        assert "hello" in call("proc_tail", pid=pid, lines=5)["content"]
+        assert call("proc_status")["procs"][0]["pid"] == pid
+        k = call("proc_kill", pid=pid, grace=2)
+        assert k["killed"] and k["state"] == "exited" and k["rc"] == 143
+    finally:
+        mcp_cluster.proc_kill(pid, signal="KILL", grace=0)
+
+
+def test_mcp_wait_needs_exactly_one_kind_of_target(mcp_cluster: Cluster) -> None:
+    assert call("wait")["error"] == "invalid_arg"
+    assert call("wait", job_id="1", pid=2)["error"] == "invalid_arg"
+    assert call("proc_status", pid=99999999)["error"] == "not_found"
+
+
+def test_mcp_proc_kill_honours_confirm(mcp_cluster: Cluster) -> None:
+    mcp_cluster.host.confirm = ["proc_kill"]
+    r = call("run", cmd="sleep 300", detach=True)
+    try:
+        assert call("proc_kill", pid=r["pid"])["needs_confirmation"] is True
+        assert call("proc_status", pid=r["pid"])["state"] == "running"
+        assert call("proc_kill", pid=r["pid"], confirm=True, grace=1)["killed"] is True
+    finally:
+        mcp_cluster.host.confirm = []
+        mcp_cluster.proc_kill(r["pid"], signal="KILL", grace=0)
+
+
+def _lifetime_setup(monkeypatch: pytest.MonkeyPatch, hc: Any, age: int) -> None:
+    from remoteslurm.transport import SSHTransport
+
+    monkeypatch.setattr("remoteslurm.config.Config.load", classmethod(lambda cls, p=None: _H(hc)))
+    monkeypatch.setattr("remoteslurm.cluster._clusters", {})
+    monkeypatch.setattr(SSHTransport, "master_alive", lambda self: True)
+    monkeypatch.setattr(SSHTransport, "master_pid", lambda self: 4242)
+    monkeypatch.setattr("remoteslurm.transport.process_age", lambda pid: age)
+
+
+def test_connection_warns_before_session_lifetime(
+    mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from remoteslurm.config import HostConfig
+
+    hc = HostConfig(name="mycluster", ssh="mycluster", mfa=True, session_lifetime="5h30m")
+    _lifetime_setup(monkeypatch, hc, 5 * 3600 + 600)
+    r = call("connection", host="mycluster")
+    assert r["master_alive"] is True and r["master_pid"] == 4242
+    assert r["age"] == "5h10m" and r["age_seconds"] == 18600 and r["connected_at"]
+    assert r["remaining_seconds"] == 1200 and r["expires_at"] and r["expiring"] is True
+    assert "in 20m" in r["warning"] and "reconnect" in r["warning"]
+    assert r["action"] == "run in a terminal: remoteslurm connect --force mycluster"
+
+
+def test_connection_without_session_lifetime_reports_age_only(
+    mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from remoteslurm.config import HostConfig
+
+    hc = HostConfig(name="mycluster", ssh="mycluster", mfa=True)
+    _lifetime_setup(monkeypatch, hc, 3600)
+    r = call("connection", host="mycluster")
+    assert r["age"] == "1h00m" and r["expires_at"] is None and r["remaining_seconds"] is None
+    assert "warning" not in r and r["action"] is None
+    assert "idle timeout" in r["lifetime_note"]
+
+
+@pytest.mark.parametrize(
+    ("text", "secs"),
+    [
+        ("05:07", 307),
+        ("01:02:03", 3723),
+        ("2-03:04:05", 2 * 86400 + 3 * 3600 + 4 * 60 + 5),
+        ("  42:00\n", 2520),
+        ("", None),
+        ("abc", None),
+    ],
+)
+def test_parse_etime(text: str, secs: int | None) -> None:
+    from remoteslurm.transport import parse_etime
+
+    assert parse_etime(text) == secs
+
+
+def test_parse_duration_and_session_lifetime_validation() -> None:
+    from remoteslurm.config import HostConfig, parse_duration
+    from remoteslurm.errors import ConfigError
+
+    assert parse_duration("24h") == 86400
+    assert parse_duration("1h30m") == 5400
+    assert parse_duration("2D") == 172800
+    assert parse_duration(90) == 90
+    for bad in ("", "h", "1x", "soon", 0, -5, True):
+        with pytest.raises(ValueError):
+            parse_duration(bad)  # type: ignore[arg-type]
+    with pytest.raises(ConfigError):
+        HostConfig(name="x", ssh="x", session_lifetime="soon")
 
 
 def test_mcp_config_snippet() -> None:

@@ -177,6 +177,25 @@ class Template:
         }
 
 
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(v: str | int) -> int:
+    """Seconds in an OpenSSH-style time value: ``3600``, ``90m``, ``12h``, ``1h30m``, ``2d``."""
+    if isinstance(v, bool) or not isinstance(v, (int, str)):
+        raise ValueError(f"expected a duration like '24h', not {v!r}")
+    if isinstance(v, int):
+        secs = v
+    else:
+        s = v.strip().lower()
+        if not re.fullmatch(r"(\d+[smhdw]?)+", s):
+            raise ValueError(f"expected a duration like '24h' or '1h30m', not {v!r}")
+        secs = sum(int(n) * _DURATION_UNITS[u] for n, u in re.findall(r"(\d+)([smhdw]?)", s))
+    if secs <= 0:
+        raise ValueError(f"duration must be positive, not {v!r}")
+    return secs
+
+
 @dataclass
 class HostConfig:
     name: str
@@ -188,6 +207,9 @@ class HostConfig:
     install_dir: str | None = None
     control_path: str | None = None
     control_persist: str = "12h"
+    # The longest an ssh connection may live if the site cuts it after a fixed time (e.g. "24h").
+    # Lets `connection` report expires_at and warn before the cut; None = no known limit.
+    session_lifetime: str | int | None = None
     allow_run: bool | str = True  # true | false | "safe" (argv-only + run_allowlist)
     script_dir: str | None = None  # where generated sbatch scripts are written (remote)
     ssh_opts: list[str] = field(default_factory=list)
@@ -224,6 +246,11 @@ class HostConfig:
                 f"[hosts.{self.name}] quota_format must be one of {sorted(QUOTA_FORMATS)}, "
                 f"not {self.quota_format!r}"
             )
+        if self.session_lifetime is not None:
+            try:
+                parse_duration(self.session_lifetime)
+            except ValueError as e:
+                raise ConfigError(f"[hosts.{self.name}] session_lifetime: {e}") from e
         for field_name in ("env_vars", "quota_paths", "protected_roots"):
             values = getattr(self, field_name)
             if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
@@ -368,6 +395,7 @@ mfa = true                  # interactive auth: run `remoteslurm connect myclust
 # partition = "standard"   # optional default --partition for sbatch
 # python = "python3"        # remote interpreter for the stub
 # control_persist = "12h"
+# session_lifetime = "24h"  # only if the site cuts ssh connections after a fixed time
 # allow_run = true          # true | false | "safe" (argv-only + run_allowlist) for `run`/srun
 # env_vars = ["WORK", "LAB_STORAGE"]              # extra variables returned by `info`
 # quota_paths = ["~", "$WORK", "$LAB_STORAGE"]  # portable `df -h` fallback
@@ -378,7 +406,7 @@ mfa = true                  # interactive auth: run `remoteslurm connect myclust
 
 # Safety rails (all optional; sensible defaults shown):
 # protected_paths = ["~/.ssh/**", "~/.bashrc", "~/.bash_profile", "~/.cache/remoteslurm/**"]
-# confirm = ["rm", "cancel"]   # ops needing --yes (CLI) / confirm=true (library, MCP)
+# confirm = ["rm", "cancel", "proc_kill"]  # ops needing --yes (CLI) / confirm=true (lib, MCP)
 # run_allowlist = ["python*", "Rscript", "git", "ls", "cat"]   # only used when allow_run = "safe"
 # [hosts.mycluster.defaults]
 # time = "1:00:00"

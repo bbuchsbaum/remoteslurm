@@ -119,6 +119,7 @@ bounded log tails into a verdict with concrete next steps.
 | Inspect the remote workspace | `info`, `ls`, `cat`, `tail`, `grep`, `find`, `diff` |
 | Move or update work | `sync`, `put`, `get`, `edit` |
 | Run work through Slurm | `submit`, `sweep`, `run --compute` |
+| Keep login-node work running | `run --detach`, `proc`, `wait --pid`/`--path` |
 | Observe jobs | `jobs`, `status`, `wait`, `watch`, `events` |
 | Understand or stop a job | `output`, `diagnose`, `cancel` |
 | Inspect capacity and storage | `sinfo`, `queue`, `quota` |
@@ -127,7 +128,10 @@ Remote paths may use `~` and variables exported by the remote login environment.
 with `HOST:PATH`, `--host`, `default_host`, or `REMOTESLURM_DEFAULT_HOST`.
 
 Use `run` only for short login-node checks. `run --compute` requests an interactive allocation
-through `srun`; substantial work should normally go through `submit`.
+through `srun`; substantial work should normally go through `submit`. For login-node work that
+must outlive the call, such as a server, an install, or a setup script, `run --detach` returns the
+process id and log path at once. `proc status|tail|kill` manage the process, and
+`wait --pid PID [--pattern REGEX]` blocks until it exits or its log prints a marker.
 
 ## Coding agents and MCP
 
@@ -138,10 +142,10 @@ client registration snippet with:
 remoteslurm mcp-config --host mycluster
 ```
 
-The default `core` tool set covers cluster information, bounded file operations, execution,
-submission, job monitoring, diagnosis, synchronization, cancellation, waiting, and connection
-state. Set `REMOTESLURM_MCP_TOOLS=all` to add project and queue inspection, quota, sweeps, output,
-events, globbing, and diffs.
+The default `core` tool set covers cluster information, bounded file operations, execution
+(including detached login-node processes), submission, job monitoring, diagnosis,
+synchronization, cancellation, waiting, and connection state. Set `REMOTESLURM_MCP_TOOLS=all` to
+add project and queue inspection, quota, sweeps, output, events, globbing, and diffs.
 
 An agent should call `info` first. The returned `notes`, `templates`, `projects`, and
 `learned_notes` are its local policy contract: they say where work belongs and how it should be

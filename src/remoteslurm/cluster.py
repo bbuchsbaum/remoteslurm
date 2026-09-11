@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import fnmatch
 import json
+import math
 import os
 import re
 import threading
@@ -23,6 +24,9 @@ from .errors import (
 from .jobs import SlurmOps, read_learned_notes
 from .session import DEFAULT_TIMEOUT, Session
 from .transport import LocalTransport, SSHTransport, Transport
+
+# `wait_for` asks the stub to wait at most this long per call (a timed-out call is cancelled).
+WAIT_CHUNK = 600
 
 
 def _expand_home(path: str, home: str | None) -> str:
@@ -445,9 +449,11 @@ class Cluster(SlurmOps):
         gpus: int | None = None,
         account: str | None = None,
         queue_timeout: int = 600,
+        detach: bool = False,
+        log: str | None = None,
     ) -> dict[str, Any]:
         """Run a command on the login node (bounded output), or on a compute node with
-        ``compute=True`` (via ``srun``).
+        ``compute=True`` (via ``srun``), or in the background with ``detach=True``.
 
         ``cmd`` may be an argv list or a shell string. When ``cancel_on_timeout`` (the default)
         the remote process group is killed if the client-side call times out (or is
@@ -465,8 +471,24 @@ class Cluster(SlurmOps):
         ``{started: true, rc, stdout, stderr, node, elapsed}`` for a run that got a node, or
         ``{started: false, reason}`` if it never left the queue. ``allow_run`` is enforced
         exactly as for a login-node ``run``.
+
+        A login-node run returns about two seconds after its command exits, even when a
+        background child still holds stdout/stderr (the result then has ``lingering: true`` and
+        a ``note``; the stub stops reading, so that child dies of SIGPIPE at its next write).
+        For work that must outlive the call, use ``detach=True``: the command starts
+        in its own session, detached from the stub and the ssh connection, with stdout+stderr
+        appended to ``log`` (default: a new file under ``~/.cache/remoteslurm/procs``), and the
+        call returns at once with ``{pid, pgid, log, host, started}``. Follow up with
+        :meth:`proc_status`, :meth:`proc_tail`, :meth:`proc_kill` and :meth:`wait_for`.
         """
         self._enforce_run_policy(cmd)
+        if detach:
+            if compute or stream or on_chunk is not None or stdin is not None:
+                raise InvalidArgument(
+                    "detach=True cannot be combined with compute, stream or stdin",
+                    action="use submit for compute-node work; a detached run reads /dev/null",
+                )
+            return self._run_detached(cmd, cwd=cwd, env=env, login=login, log=log)
         if compute:
             return self._run_compute(
                 cmd,
@@ -569,6 +591,105 @@ class Cluster(SlurmOps):
                     yield data
         finally:
             gen.close()
+
+    # -- detached login-node runs ---------------------------------------------------------------
+    def _run_detached(
+        self,
+        cmd: str | list[str],
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        login: bool,
+        log: str | None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {"cwd": cwd, "env": env, "log": log}
+        if isinstance(cmd, str):
+            args["cmd"] = cmd
+            args["login"] = login
+        else:
+            args["argv"] = list(cmd)
+        r = dict(self.call("detach", _timeout=30, **args))
+        self.registry.audit("run", cmd=cmd, detach=True, pid=r.get("pid"), log=r.get("log"))
+        return r
+
+    def proc_status(self, pid: int | None = None, *, limit: int = 20) -> dict[str, Any]:
+        """State of a detached run, or (without ``pid``) the most recent ones.
+
+        One run: ``{pid, pgid, host, cmd, cwd, log, started, state, ...}`` where ``state`` is
+        ``running``, ``exited`` (with ``rc`` and ``finished``), ``gone`` (killed with no exit
+        status recorded) or ``unknown`` (started on another login node). Without ``pid``:
+        ``{procs, count, total, host}``, newest first.
+        """
+        return dict(self.call("proc_status", pid=pid, limit=limit, _timeout=30))
+
+    def proc_tail(self, pid: int, *, lines: int = 50, max_bytes: int = 65536) -> dict[str, Any]:
+        """The last ``lines`` lines of a detached run's log (``content``), plus its state."""
+        return dict(self.call("proc_tail", pid=pid, lines=lines, max_bytes=max_bytes, _timeout=60))
+
+    def proc_kill(
+        self, pid: int, *, signal: str = "TERM", grace: int = 5, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Stop a detached run: send ``signal`` to its whole process group, then SIGKILL after
+        ``grace`` seconds. Returns the final state plus ``killed`` and the ``signals`` sent.
+
+        Only runs started on the current login node can be signalled. Needs ``confirm=True``
+        when the host lists ``proc_kill`` in ``confirm``.
+        """
+        self._require_confirm("proc_kill", confirm, f"kill detached process {pid}")
+        r = dict(self.call("proc_kill", pid=pid, signal=signal, grace=grace, _timeout=grace + 30))
+        self.registry.audit("proc_kill", pid=pid, signal=signal, state=r.get("state"))
+        return r
+
+    def wait_for(
+        self,
+        *,
+        pid: int | None = None,
+        path: str | None = None,
+        pattern: str | None = None,
+        offset: int | None = None,
+        timeout: float | None = 60,
+    ) -> dict[str, Any]:
+        """Block until a detached run exits, a remote file exists, or a log line matches.
+
+        ``pid`` (from ``run(detach=True)``): until the process stops running. ``path``: until the
+        file exists. ``pattern`` (a Python regex): until a line of ``path`` — by default the
+        ``pid``'s log — matches; with a ``pid`` the wait also ends if the process exits first.
+        Scanning starts at byte ``offset`` (negative = from the end); by default at the start of
+        the file or, for the ``pid``'s own log, where this run's output began (so an old match in
+        a reused ``log`` doesn't count). A line still missing its newline matches only once it
+        has stopped growing for a check. The remote side checks
+        every 0.5 s and reads only newly appended bytes, so waiting costs one round trip per
+        chunk of up to ``WAIT_CHUNK`` seconds, not one per poll.
+
+        Returns ``{done, met, reason, waited, ...}``: ``done`` means stop waiting (``reason`` is
+        ``matched``, ``exists`` or ``exited``); ``met`` means the requested condition held. A
+        match carries ``line``/``line_offset``; a ``pid`` wait carries the final ``process``
+        state. When ``timeout`` (seconds; ``None`` = no limit) runs out, ``done`` is false and
+        ``offset`` is where a follow-up call should resume scanning.
+        """
+        if pid is None and path is None:
+            raise InvalidArgument("wait_for needs pid= and/or path=")
+        t0 = time.monotonic()
+        while True:
+            left = None if timeout is None else timeout - (time.monotonic() - t0)
+            chunk = WAIT_CHUNK if left is None else max(1, min(WAIT_CHUNK, math.ceil(left)))
+            r = dict(
+                self.call(
+                    "waitfor",
+                    pid=pid,
+                    path=path,
+                    pattern=pattern,
+                    offset=offset,
+                    timeout=chunk,
+                    _timeout=chunk + 30,
+                    _cancel_on_timeout=True,
+                )
+            )
+            if r.get("done") or r.get("cancelled") or (left is not None and left <= chunk):
+                r["waited"] = round(time.monotonic() - t0, 1)
+                return r
+            if r.get("offset") is not None:
+                offset = int(r["offset"])
 
     def _resolve_compute_resources(
         self,

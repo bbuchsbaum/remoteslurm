@@ -11,14 +11,21 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import lru_cache
+from typing import Any
 
 from .errors import AuthRequired, NotConnected, RemoteTimeout
+
+# `connection` warns when a master with a known session_lifetime has less than this left.
+EXPIRY_WARN_SECONDS = 3600
 
 SSH_BATCH_OPTS = [
     "-T",
@@ -105,6 +112,59 @@ class SSHTransport(Transport):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
         return r.returncode == 0
+
+    def master_pid(self) -> int | None:
+        """PID of the local ssh master (``ssh -O check`` prints it), or None if none is running."""
+        try:
+            r = subprocess.run(self.control_cmd("check"), capture_output=True, timeout=10)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        if r.returncode != 0:
+            return None
+        m = re.search(rb"pid=(\d+)", r.stderr + r.stdout)
+        return int(m.group(1)) if m else None
+
+    def master_lifetime(self, session_lifetime: str | int | None = None) -> dict[str, Any]:
+        """When the live master started and, given the site's ``session_lifetime``, when it ends.
+
+        Returns ``master_pid``, ``control_persist``, ``connected_at``/``age_seconds``/``age`` (from
+        the local master process's start time) and, when ``session_lifetime`` is set,
+        ``expires_at``/``remaining_seconds``/``expiring`` (less than ``EXPIRY_WARN_SECONDS``
+        left). Without it there is no fixed expiry to report — ControlPersist is an *idle*
+        timeout — and ``lifetime_note`` says so.
+        """
+        from .config import parse_duration
+
+        pid = self.master_pid()
+        age = process_age(pid) if pid else None
+        out: dict[str, Any] = {"master_pid": pid, "control_persist": self.control_persist}
+        if age is None:
+            out["lifetime_note"] = "could not determine when the ssh master started"
+            return out
+        now = time.time()
+        out.update(
+            {
+                "connected_at": _iso(now - age),
+                "age_seconds": age,
+                "age": format_duration(age),
+                "expires_at": None,
+                "remaining_seconds": None,
+                "expiring": False,
+            }
+        )
+        if session_lifetime is None:
+            out["lifetime_note"] = (
+                "no fixed expiry known: OpenSSH keeps the master open while any client is "
+                f"attached and closes it {self.control_persist} after the last one leaves "
+                "(ControlPersist is an idle timeout). Set session_lifetime in the host config "
+                "if the site cuts connections after a fixed time."
+            )
+            return out
+        remaining = parse_duration(session_lifetime) - age
+        out["expires_at"] = _iso(now + remaining)
+        out["remaining_seconds"] = max(0, remaining)
+        out["expiring"] = remaining < EXPIRY_WARN_SECONDS
+        return out
 
     def master_exit(self) -> None:
         try:
@@ -252,3 +312,50 @@ class SSHTransport(Transport):
 
 def ssh_available() -> bool:
     return shutil.which("ssh") is not None
+
+
+def parse_etime(text: str) -> int | None:
+    """Seconds in a ``ps -o etime`` value (``[[dd-]hh:]mm:ss``), or None if it doesn't parse."""
+    s = text.strip()
+    days = 0
+    try:
+        if "-" in s:
+            d, s = s.split("-", 1)
+            days = int(d)
+        parts = [int(x) for x in s.split(":")]
+    except ValueError:
+        return None
+    if not 1 <= len(parts) <= 3 or days < 0 or any(p < 0 for p in parts):
+        return None
+    h, m, sec = [0] * (3 - len(parts)) + parts
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+def process_age(pid: int) -> int | None:
+    """Seconds since local process ``pid`` started (portable ``ps -o etime=``), or None."""
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, timeout=5
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    return parse_etime(r.stdout)
+
+
+def format_duration(secs: float) -> str:
+    """Compact duration: ``2d3h``, ``5h07m``, ``42m``."""
+    secs = int(max(0, secs))
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d{h}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")

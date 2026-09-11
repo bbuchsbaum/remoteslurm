@@ -24,6 +24,12 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   `path` (an existing remote script), never both.
 - Don't run heavy work through `run` — that's the login node. `run` is for quick checks
   (`squeue`, `ls`, `git`), and only when the host allows it.
+- For login-node work that must keep running after the call (a server, an install, a setup
+  script), use `run(detach=True)`: it returns `{pid, log}` at once and survives the connection.
+  Check it with `proc_status`/`proc_tail`, stop it with `proc_kill`, and block with
+  `wait(pid=...)` — or `wait(pid=..., pattern="READY")` to return as soon as its log prints a
+  marker. Don't put `&` in a plain `run`: the call returns ~2 s after the command exits
+  (`lingering: true`), and the background process dies at its next write (SIGPIPE).
 
 ## After a job finishes (or won't start)
 - Use `diagnose <job_id>` instead of manually reading logs. It returns a plain-English
@@ -37,5 +43,7 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
 - Read `notes` before submitting; obey the cluster's walltime/account/partition rules.
 - `sync`, not `put`. `edit`, not read+write. `diagnose`, not log spelunking. Templates, not
   hand-tuned flags.
+- Before a long or unattended stretch, call `connection`; if it carries a `warning`, ask the
+  user to reconnect first.
 - Paths are on the *cluster*, not your laptop. `~` and configured variables such as `$WORK`
   expand remotely.

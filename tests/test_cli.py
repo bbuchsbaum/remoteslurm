@@ -123,6 +123,57 @@ def test_config_and_mcp_config(
     assert rc == 1
 
 
+def test_run_detach_proc_and_wait(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    rc, out, _ = run(
+        capsys,
+        "run",
+        "--no-daemon",
+        "--json",
+        "--detach",
+        "echo hi; sleep 0.3; echo READY; sleep 300",
+    )
+    assert rc == 0
+    pid = json.loads(out)["pid"]
+    try:
+        rc, out, _ = run(
+            capsys,
+            "wait",
+            "--no-daemon",
+            "--pid",
+            str(pid),
+            "--pattern",
+            "READY",
+            "--timeout",
+            "20",
+        )
+        assert rc == 0 and out.strip() == "READY"
+        rc, out, _ = run(capsys, "proc", "--no-daemon", str(pid))
+        assert rc == 0 and f"pid {pid} running" in out
+        rc, out, _ = run(capsys, "proc", "--no-daemon")
+        assert rc == 0 and str(pid) in out
+        rc, out, _ = run(capsys, "proc", "tail", str(pid), "--no-daemon")
+        assert rc == 0 and "hi\nREADY\n" in out
+        rc, out, _ = run(capsys, "proc", "kill", str(pid), "--grace", "2", "--no-daemon")
+        assert rc == 0 and out.startswith("killed")
+        # exited, but by SIGTERM (rc 143) -> non-zero exit, like `wait JOB` on a failed job
+        rc, _, err = run(capsys, "wait", "--no-daemon", "--pid", str(pid), "--timeout", "10")
+        assert rc == 1 and "rc=143" in err
+    finally:
+        cli.main(["proc", "kill", str(pid), "--signal", "KILL", "--grace", "0", "--no-daemon"])
+        capsys.readouterr()
+
+
+def test_wait_and_proc_argument_errors(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    rc, _, err = run(capsys, "wait", "--no-daemon")
+    assert rc == 1 and "invalid_arg" in err
+    rc, _, err = run(capsys, "wait", "123", "--pid", "5", "--no-daemon")
+    assert rc == 1 and "not both" in err
+    rc, _, err = run(capsys, "proc", "tail", "--no-daemon")
+    assert rc == 1 and "needs a PID" in err
+    rc, _, err = run(capsys, "proc", "frobnicate", "--no-daemon")
+    assert rc == 1 and "unknown action" in err
+
+
 def test_doctor_local(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
     rc, out, err = run(capsys, "--json", "doctor")
     d = json.loads(out)

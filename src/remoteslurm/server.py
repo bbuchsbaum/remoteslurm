@@ -22,7 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from .cluster import Cluster
 from .config import ENV_DEFAULT_HOST
 from .errors import RemoteSlurmError
-from .transport import SSHTransport
+from .transport import SSHTransport, format_duration
 
 ENV_MAX_CHARS = "REMOTESLURM_MCP_MAX_CHARS"
 # Hard ceiling on any single string field in a tool result (agents have token caps).
@@ -31,7 +31,8 @@ MAX_CHARS = int(os.environ.get(ENV_MAX_CHARS, "200000"))
 ENV_MCP_TOOLS = "REMOTESLURM_MCP_TOOLS"
 # The default tool set: the workflow-critical tools an agent needs, nothing more. Set
 # REMOTESLURM_MCP_TOOLS=all to also expose glob/diff/job_output/sinfo/projects/sweep/
-# queue_info/quota/events. (`wait` is core — agents want a bounded wait.)
+# queue_info/quota/events. (`wait` is core — agents want a bounded wait — and so are the
+# proc_* tools, which are the only handle on a `run(detach=True)` process.)
 CORE_TOOLS = {
     "info",
     "ls",
@@ -40,6 +41,9 @@ CORE_TOOLS = {
     "grep",
     "write",
     "run",
+    "proc_status",
+    "proc_tail",
+    "proc_kill",
     "submit",
     "jobs",
     "diagnose",
@@ -315,6 +319,8 @@ async def run(
     mem: str | None = None,
     gpus: int | None = None,
     queue_timeout: int = 600,
+    detach: bool = False,
+    log: str | None = None,
     host: str | None = None,
 ) -> dict[str, Any]:
     """Run a shell command on the *login node* and return rc/stdout/stderr — or, with
@@ -323,6 +329,14 @@ async def run(
     Login-node runs cap output at ``max_output`` bytes/stream and clamp ``timeout`` to 1..3600 s;
     ``login=True`` loads modules/profile. Keep login-node work light — heavy or long work belongs
     in ``submit`` or ``compute=True``.
+
+    ``detach=True`` starts the command in the background, detached from this connection, and
+    returns at once with ``{pid, pgid, log, host}``; stdout+stderr go to ``log`` (default: a new
+    file under ``~/.cache/remoteslurm/procs``). Use it for anything that must keep running after
+    the call (a server, an install, a setup script), then ``proc_status``/``proc_tail``/
+    ``proc_kill`` and ``wait(pid=..., pattern=...)``. Don't background with ``&`` in a normal
+    run: it returns ~2 s after the command exits with ``lingering: true``, and the background
+    process dies of SIGPIPE the next time it writes output.
 
     ``compute=True`` queues for a node and runs the command there. Resources come from
     ``template`` then ``partition``/``time``/``cpus``/``mem``/``gpus`` (account from the host
@@ -338,6 +352,8 @@ async def run(
     to = _clamp(timeout, 1, 3600)
 
     def f(c: Cluster) -> dict[str, Any]:
+        if detach:
+            return c.run(cmd, cwd=cwd, login=login, detach=True, log=log, compute=compute)
         if compute:
             return c.run(
                 cmd,
@@ -356,6 +372,57 @@ async def run(
         return c.run(cmd, cwd=cwd, timeout=to, login=login, max_output=max_output)
 
     return await _guard(host, f)
+
+
+async def proc_status(pid: int | None = None, host: str | None = None) -> dict[str, Any]:
+    """State of a process started with ``run(detach=True)``.
+
+    ``state`` is ``running``, ``exited`` (with ``rc``), ``gone`` (killed with no exit status
+    recorded) or ``unknown`` (started on another login node); also ``log``, ``cmd``, ``started``,
+    ``elapsed``. Without ``pid``: the most recent detached runs, newest first. Never blocks —
+    use ``wait(pid=...)`` to wait for the exit or for a line in its log.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.proc_status(pid)
+
+    return await _guard(host, f)
+
+
+async def proc_tail(
+    pid: int, lines: int = 50, max_bytes: int = 65536, host: str | None = None
+) -> dict[str, Any]:
+    """The last ``lines`` lines of a detached run's log (stdout+stderr) as ``content``, plus its
+    current ``state``. ``max_bytes`` caps the read (1..1,000,000)."""
+    mb = _clamp(max_bytes, 1, 1_000_000)
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.proc_tail(pid, lines=lines, max_bytes=mb)
+
+    return await _guard(host, f)
+
+
+async def proc_kill(
+    pid: int,
+    signal: str = "TERM",
+    grace: int = 5,
+    confirm: bool = False,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Stop a detached run: signal its whole process group (``TERM``, ``INT``, ``HUP`` or
+    ``KILL``), escalating to ``KILL`` after ``grace`` seconds (0..60).
+
+    Returns the final state with ``killed`` and the ``signals`` sent (``rc`` 143 = TERM, 137 =
+    KILL). Only runs started on the current login node can be signalled. If the host requires
+    confirmation for ``proc_kill`` and ``confirm`` is not ``true``, nothing is sent and the reply
+    is ``{needs_confirmation: true, what}`` — re-call with ``confirm=true``.
+    """
+    g = _clamp(grace, 0, 60)
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.proc_kill(pid, signal=signal, grace=g, confirm=confirm)
+
+    return await _guard_confirmable(host, f)
 
 
 # -- slurm ------------------------------------------------------------------------------------
@@ -551,6 +618,11 @@ async def connection(host: str | None = None) -> dict[str, Any]:
     Use this first after any ``not_connected``/``auth_required`` error. When not alive,
     ``action`` holds the exact command the *user* must run in a terminal (MFA hosts cannot be
     authenticated by an agent), e.g. ``remoteslurm connect mycluster``.
+
+    When alive it also reports the master's ``connected_at``/``age``. If the host sets
+    ``session_lifetime`` (the site cuts connections after a fixed time) it adds ``expires_at``/
+    ``remaining_seconds``, and a ``warning`` plus ``action`` once less than an hour remains.
+    Check this before starting long or unattended work, so the user can reconnect first.
     """
 
     def work() -> dict[str, Any]:
@@ -575,6 +647,18 @@ async def connection(host: str | None = None) -> dict[str, Any]:
             if not out["master_alive"]:
                 out["action"] = f"run in a terminal: remoteslurm connect {hc.name}"
                 out["connect_cmd"] = shlex.join(transport.connect_cmd())
+            else:
+                lt = transport.master_lifetime(hc.session_lifetime)
+                out.update(lt)
+                if lt.get("expiring"):
+                    left = int(lt.get("remaining_seconds") or 0)
+                    eta = f"in {format_duration(left)}" if left > 0 else "at any moment"
+                    out["warning"] = (
+                        f"the ssh connection to {hc.name} is {lt['age']} old and the site limit "
+                        f"is {hc.session_lifetime}; expect it to drop {eta}. Ask the user to "
+                        "reconnect before starting long or unattended work."
+                    )
+                    out["action"] = f"run in a terminal: remoteslurm connect --force {hc.name}"
         else:
             out["transport"] = "local"
             out["master_alive"] = True
@@ -683,32 +767,64 @@ async def quota(host: str | None = None) -> dict[str, Any]:
 
 
 # -- watch / wait (F2) ------------------------------------------------------------------------
-async def wait(job_id: str, timeout: int = 120, host: str | None = None) -> dict[str, Any]:
-    """Bounded wait for a job to finish — poll up to ``timeout`` seconds (capped at 300), then
-    return the current status with ``terminal: bool``.
+def _wait_job(c: Cluster, job_id: str, cap: int) -> dict[str, Any]:
+    interval = 5.0
+    t0 = time.monotonic()
+    st = c.job_status(job_id, refresh=True)
+    # Bound WALL-CLOCK, not iteration count: each job_status can itself take seconds over a slow
+    # ssh link, so sleep only for the time left in the cap.
+    while not st.terminal:
+        elapsed = time.monotonic() - t0
+        if elapsed >= cap:
+            break
+        time.sleep(min(interval, cap - elapsed))
+        st = c.job_status(job_id, refresh=True)
+    d = st.to_dict()
+    d["terminal"] = bool(st.terminal)
+    return d
 
-    Most MCP clients cap how long a single tool call may run, so this is deliberately bounded:
-    on timeout it returns the latest status with ``terminal: false`` — call it again to keep
-    waiting (loop only as needed). When the job has finished it returns ``terminal: true`` with
-    ``state``/``exit_code``. Prefer this over tight polling of ``jobs``.
+
+async def wait(
+    job_id: str | None = None,
+    timeout: int = 120,
+    host: str | None = None,
+    *,
+    pid: int | None = None,
+    path: str | None = None,
+    pattern: str | None = None,
+    offset: int | None = None,
+) -> dict[str, Any]:
+    """Bounded wait — up to ``timeout`` seconds (capped at 300), then return. Give one target:
+
+    * ``job_id``: a Slurm job. Returns its status with ``terminal: bool`` (``state``/``exit_code``
+      once finished).
+    * ``pid``: a ``run(detach=True)`` process. Returns when it stops running (``process`` holds
+      its final state and ``rc``).
+    * ``path``: returns when the remote file exists; with ``pattern`` (a Python regex), when a
+      line of the file matches. ``pid`` + ``pattern`` watches that process's log and also
+      returns if the process exits first.
+
+    Non-job waits return ``{done, met, reason, waited, ...}``: ``done`` = stop waiting
+    (``reason``: ``matched``/``exists``/``exited``), ``met`` = the condition you asked for held; a
+    match carries ``line``. Most MCP clients cap how long one call may run, so on timeout it
+    returns ``terminal: false`` / ``done: false`` — call again to keep waiting, passing back
+    ``offset`` for a pattern wait so the scan resumes rather than restarts. Prefer this over
+    polling ``jobs``/``proc_status`` or a hand-written sleep loop in ``run``.
     """
     cap = _clamp(timeout, 1, 300)
 
     def f(c: Cluster) -> dict[str, Any]:
-        interval = 5.0
-        t0 = time.monotonic()
-        st = c.job_status(job_id, refresh=True)
-        # Bound WALL-CLOCK, not iteration count: each job_status can itself take seconds over a
-        # slow ssh link, so sleep only for the time left in the cap.
-        while not st.terminal:
-            elapsed = time.monotonic() - t0
-            if elapsed >= cap:
-                break
-            time.sleep(min(interval, cap - elapsed))
-            st = c.job_status(job_id, refresh=True)
-        d = st.to_dict()
-        d["terminal"] = bool(st.terminal)
-        return d
+        from .errors import InvalidArgument
+
+        if job_id is not None:
+            if pid is not None or path is not None or pattern is not None:
+                raise InvalidArgument("give either job_id or pid/path/pattern, not both")
+            return _wait_job(c, job_id, cap)
+        if pid is None and path is None:
+            raise InvalidArgument(
+                "wait needs a target: job_id, pid (a detached run) or path (+ optional pattern)"
+            )
+        return c.wait_for(pid=pid, path=path, pattern=pattern, offset=offset, timeout=cap)
 
     return await _guard(host, f)
 
@@ -759,6 +875,9 @@ ALL_TOOLS: dict[str, Any] = {
     "write": write,
     "diff": diff,
     "run": run,
+    "proc_status": proc_status,
+    "proc_tail": proc_tail,
+    "proc_kill": proc_kill,
     "submit": submit,
     "sweep": sweep,
     "jobs": jobs,

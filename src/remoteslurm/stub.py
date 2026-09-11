@@ -27,6 +27,7 @@ import json
 import os
 import re
 import select
+import selectors
 import shutil
 import signal
 import socket
@@ -55,10 +56,29 @@ LONG_WORKERS = 6
 SLOW_OPS = frozenset(("run", "srun", "sbatch"))
 # Ops that can stream multi-frame responses when the request carries ``stream: true``.
 STREAM_OPS = frozenset(("run", "srun"))
-# Long-lived streaming ops with no subprocess (e.g. `follow` tails a file): served by the slow
-# pool, always stream, and are cancelled via a per-request ``threading.Event`` in the registry.
-LONG_OPS = frozenset(("follow",))
+# Long-lived ops with no subprocess, served by the long pool and cancelled via a per-request
+# ``threading.Event`` in the registry: `follow` tails a file (always streams); `waitfor` polls
+# for a detached run's exit or a file/log line (one response).
+LONG_OPS = frozenset(("follow", "waitfor"))
+ALWAYS_STREAM_OPS = frozenset(("follow",))
 KILL_GRACE = 0.5  # seconds between SIGTERM and SIGKILL when cancelling a process group
+# A `run` returns once its command has exited and its pipes are drained. A background child that
+# inherited stdout/stderr would hold the pipes open indefinitely, so after the command exits the
+# pipes are read for at most this long before returning (the result is flagged `lingering`).
+RUN_DRAIN_GRACE = 2.0
+KILL_DRAIN = 2.0  # after a timeout kill, read leftover output for at most this long
+PIPE_BUF = getattr(select, "PIPE_BUF", 512)  # stdin write size that never blocks a ready pipe
+# Detached runs (`run(detach=True)`): records, rc files and default logs live here, under the
+# remote home (shared between login nodes on most clusters), else next to the stub.
+PROC_SUBDIR = "procs"
+PROC_LIST_DEFAULT = 20
+PROC_LIST_MAX = 200
+PROC_KILL_GRACE = 5  # seconds between the requested signal and SIGKILL in `proc_kill`
+WAIT_POLL = 0.5  # `waitfor`: seconds between checks
+WAIT_DEFAULT = 60
+WAIT_MAX = 3600
+WAIT_SCAN_BYTES = 8 * 1024 * 1024  # max log bytes a `waitfor` scans per check (stays responsive)
+WAIT_CARRY_MAX = 64 * 1024  # longest partial (newline-less) line kept between checks
 
 DEFAULT_READ_BYTES = 64 * 1024
 MAX_READ_BYTES = 4 * 1024 * 1024
@@ -228,27 +248,59 @@ def _kill_group(proc, sig):
             return False
 
 
-def _stream_communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
-    """Drive ``proc`` to completion, emitting stdout/stderr as it arrives via ``emit``.
+def _kill_proc(proc, new_session):
+    """SIGKILL ``proc`` (its whole process group when it was started in a new session)."""
+    if new_session:
+        _kill_group(proc, signal.SIGKILL)
+        return
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
-    ``emit`` is called with ``{"stream": "stdout"|"stderr", "data": <text>}`` for each piece of
-    output. At most ``max_output`` bytes per stream are decoded/emitted/kept; past that the
-    stream is flagged truncated but the pipe is still drained so the child never blocks on a
-    full buffer. Returns the same result shape as the non-streaming path (rc/stdout/stderr/…),
-    where ``stdout``/``stderr`` hold the bounded capture. A timeout kills the process group and
-    raises ``StubError("timeout")`` with whatever output was captured, matching ``_run``.
+
+def _close_quiet(f):
+    if f is None:
+        return
+    try:
+        f.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
+    """Drive ``proc`` to completion with bounded memory and bounded time.
+
+    One selector loop feeds ``stdin`` and reads stdout/stderr. At most ``max_output`` bytes per
+    stream are decoded and kept (and, when ``emit`` is given, passed on as
+    ``{"stream": "stdout"|"stderr", "data": <text>}`` as they arrive); past that the stream is
+    flagged truncated but still drained so the child never blocks on a full pipe.
+
+    Every wait is bounded, so a stray process holding the pipes can never pin a worker:
+
+    * once the command itself exits, the pipes are read for at most ``RUN_DRAIN_GRACE`` more
+      seconds. If a background child still holds them, the result comes back with
+      ``lingering: true``. The stub then closes its end of the pipes, so that child dies of
+      SIGPIPE the next time it writes to them.
+    * on timeout the process (group) is killed and leftover output is read for at most
+      ``KILL_DRAIN`` seconds before ``StubError("timeout")`` is raised with what was captured.
+      A child that left the group (``setsid``) survives the kill but can no longer block us.
     """
-    if stdin is not None and proc.stdin is not None:
-        try:
-            proc.stdin.write(stdin.encode("utf-8"))
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-    pipes = {}  # fd -> ("stdout"|"stderr", fileobj)
-    if proc.stdout is not None:
-        pipes[proc.stdout.fileno()] = ("stdout", proc.stdout)
-    if proc.stderr is not None:
-        pipes[proc.stderr.fileno()] = ("stderr", proc.stderr)
+    sel = selectors.DefaultSelector()
+    open_reads = set()
+    for name, f in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+        if f is not None:
+            sel.register(f, selectors.EVENT_READ, name)
+            open_reads.add(name)
+    in_buf = stdin.encode("utf-8") if stdin is not None else b""
+    in_off = 0
+    writing = False
+    if proc.stdin is not None:
+        if in_buf:
+            sel.register(proc.stdin, selectors.EVENT_WRITE, "stdin")
+            writing = True
+        else:
+            _close_quiet(proc.stdin)
     kept = {"stdout": [], "stderr": []}  # decoded text within the cap (for the result)
     kept_bytes = {"stdout": 0, "stderr": 0}
     truncated = {"stdout": False, "stderr": False}
@@ -256,55 +308,87 @@ def _stream_communicate(proc, argv, timeout, stdin, max_output, emit, new_sessio
         "stdout": codecs.getincrementaldecoder("utf-8")("replace"),
         "stderr": codecs.getincrementaldecoder("utf-8")("replace"),
     }
-    open_fds = set(pipes)
     deadline = t0 + timeout
     timed_out = False
-    while open_fds:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            timed_out = True
-            break
-        try:
-            ready, _, _ = select.select(list(open_fds), [], [], min(remaining, 0.5))
-        except (OSError, ValueError):
-            break
-        for fd in ready:
-            name, _f = pipes[fd]
-            try:
-                data = os.read(fd, STREAM_READ_BYTES)
-            except OSError:
-                open_fds.discard(fd)
+    lingering = False
+    exited_at = None  # when the command exited while its pipes were still open
+    drain_until = None  # after a timeout kill: stop reading at this time
+    try:
+        while open_reads or writing:
+            now = time.time()
+            if drain_until is not None:
+                if now >= drain_until:
+                    break
+            elif exited_at is None and now >= deadline:  # an exited command is in its grace
+                timed_out = True
+                _kill_proc(proc, new_session)
+                drain_until = now + KILL_DRAIN
+            elif proc.poll() is not None:
+                if exited_at is None:
+                    exited_at = now
+                elif now - exited_at >= RUN_DRAIN_GRACE:
+                    lingering = True
+                    break
+            if writing and (drain_until is not None or exited_at is not None):
+                sel.unregister(proc.stdin)  # nobody is left to read the rest of stdin
+                _close_quiet(proc.stdin)
+                writing = False
                 continue
-            if not data:
-                open_fds.discard(fd)
-                continue
-            room = max_output - kept_bytes[name]
-            if room > 0:
-                take = data[:room]
-                kept_bytes[name] += len(take)
-                text = dec[name].decode(take)
-                if text:
-                    kept[name].append(text)
-                    if emit is not None:
-                        emit({"stream": name, "data": text})
-                if len(data) > room:
-                    truncated[name] = True
+            if drain_until is not None:
+                limit = drain_until
+            elif exited_at is not None:
+                limit = exited_at + RUN_DRAIN_GRACE
             else:
-                truncated[name] = True
-    if not timed_out:
+                limit = deadline
+            for key, _events in sel.select(max(0.0, min(0.25, limit - now))):
+                name = key.data
+                if name == "stdin":
+                    try:
+                        in_off += os.write(key.fd, in_buf[in_off : in_off + PIPE_BUF])
+                    except OSError:  # EPIPE: the child closed its stdin
+                        in_off = len(in_buf)
+                    if in_off >= len(in_buf):
+                        sel.unregister(key.fileobj)
+                        _close_quiet(proc.stdin)
+                        writing = False
+                    continue
+                try:
+                    data = os.read(key.fd, STREAM_READ_BYTES)
+                except OSError:
+                    data = b""
+                if not data:
+                    sel.unregister(key.fileobj)
+                    open_reads.discard(name)
+                    continue
+                room = max_output - kept_bytes[name]
+                if room > 0:
+                    take = data[:room]
+                    kept_bytes[name] += len(take)
+                    text = dec[name].decode(take)
+                    if text:
+                        kept[name].append(text)
+                        if emit is not None:
+                            emit({"stream": name, "data": text})
+                    if len(data) > room:
+                        truncated[name] = True
+                else:
+                    truncated[name] = True
+    finally:
+        sel.close()
+    if not timed_out and not lingering:
         try:
             proc.wait(timeout=max(0.1, deadline - time.time()))
         except subprocess.TimeoutExpired:
+            # The pipes closed but the command is still running (it closed its own stdio).
             timed_out = True
+            _kill_proc(proc, new_session)
     if timed_out:
-        if new_session:
-            _kill_group(proc, signal.SIGKILL)
-        else:
-            proc.kill()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:  # pragma: no cover - defensive
             pass
+    for f in (proc.stdin, proc.stdout, proc.stderr):
+        _close_quiet(f)
     for name in ("stdout", "stderr"):
         tail = dec[name].decode(b"", True)
         if tail:
@@ -317,7 +401,7 @@ def _stream_communicate(proc, argv, timeout, stdin, max_output, emit, new_sessio
             stderr="".join(kept["stderr"]),
         )
     dur = time.time() - t0
-    return {
+    res = {
         "rc": proc.returncode,
         "stdout": "".join(kept["stdout"]),
         "stderr": "".join(kept["stderr"]),
@@ -325,6 +409,15 @@ def _stream_communicate(proc, argv, timeout, stdin, max_output, emit, new_sessio
         "stderr_truncated": truncated["stderr"],
         "duration": round(dur, 3),
     }
+    if lingering:
+        res["lingering"] = True
+        res["note"] = (
+            "the command exited but a background process it started still held stdout/stderr; "
+            "stopped reading after %ss, so that process will die (SIGPIPE) the next time it "
+            "writes output. Redirect it (cmd > log 2>&1 &) or use run(detach=True) instead."
+            % RUN_DRAIN_GRACE
+        )
+    return res
 
 
 def _run(
@@ -371,35 +464,8 @@ def _run(
             on_spawn(proc)
         except Exception:  # pragma: no cover - defensive
             pass
-    if emit is not None:
-        # Streaming variant: read the pipes incrementally and emit chunks as output arrives.
-        return _stream_communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0)
-    try:
-        out, err = proc.communicate(
-            input=stdin.encode("utf-8") if stdin is not None else None, timeout=timeout
-        )
-    except subprocess.TimeoutExpired:
-        if new_session:
-            _kill_group(proc, signal.SIGKILL)
-        else:
-            proc.kill()
-        out, err = proc.communicate()
-        raise StubError(
-            "timeout",
-            "command timed out after %ss: %s" % (timeout, " ".join(argv[:4])),
-            stdout=_decode(out[-max_output:]),
-            stderr=_decode(err[-max_output:]),
-        )
-    dur = time.time() - t0
-    res = {
-        "rc": proc.returncode,
-        "stdout": _decode(out[:max_output]),
-        "stderr": _decode(err[:max_output]),
-        "stdout_truncated": len(out) > max_output,
-        "stderr_truncated": len(err) > max_output,
-        "duration": round(dur, 3),
-    }
-    return res
+    # Streaming and non-streaming runs share one bounded loop (``emit`` is None for the latter).
+    return _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0)
 
 
 def _which(name):
@@ -1258,6 +1324,560 @@ def op_follow(args):
     return {"offset": offset, "eof": eof}
 
 
+# --------------------------------------------------------------------------- detached runs
+
+# Runs the command, then records its exit status atomically in the rc file, so the status
+# survives this stub (and the ssh connection) going away. The trap keeps the wrapper alive
+# through HUP/INT/TERM long enough to record the child's status; the child itself still gets the
+# default dispositions (caught signals are reset on exec).
+_DETACH_WRAPPER = (
+    'rs_rc=$1; shift; trap : HUP INT TERM; "$@"; rc=$?; '
+    'printf "%s\\n" "$rc" > "$rs_rc.tmp" && mv -f "$rs_rc.tmp" "$rs_rc"; exit "$rc"'
+)
+_KILL_SIGNALS = {
+    "TERM": signal.SIGTERM,
+    "INT": signal.SIGINT,
+    "HUP": signal.SIGHUP,
+    "KILL": signal.SIGKILL,
+}
+_PROC_DIR = []  # type: list[str]  # the resolved proc dir, cached per stub process
+
+
+def _proc_dir_candidates():
+    home = os.path.expanduser(os.path.join("~", ".cache", "remoteslurm", PROC_SUBDIR))
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), PROC_SUBDIR)
+    return [home] if here == home else [home, here]
+
+
+def _proc_dir():
+    """The directory for detached-run records and logs (created owner-only on first use)."""
+    if _PROC_DIR:
+        return _PROC_DIR[0]
+    err = None
+    for d in _proc_dir_candidates():
+        try:
+            os.makedirs(d, 0o700, exist_ok=True)
+        except OSError as e:
+            err = e
+            continue
+        if os.access(d, os.W_OK):
+            _PROC_DIR.append(d)
+            return d
+    raise StubError("permission", "no writable directory for detached runs (%s)" % err)
+
+
+def _hostname():
+    return socket.gethostname()
+
+
+def _proc_starttime(pid):
+    """Kernel start time of ``pid`` (Linux ``/proc``), to tell a reused pid apart; else None."""
+    try:
+        with io.open("/proc/%d/stat" % pid, "rb") as f:
+            data = f.read().decode("ascii", "replace")
+        return int(data.rsplit(")", 1)[1].split()[19])  # field 22; `comm` may contain ") "
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_atomic_text(path, text):
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), threading.current_thread().ident or 0)
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.rename(tmp, path)
+
+
+def _read_rc(path):
+    """``(rc, finished_at)`` from a detached run's rc file, or None while none is recorded."""
+    try:
+        with io.open(path, "r", encoding="utf-8") as f:
+            rc = int(f.read().split()[0])
+        return rc, os.path.getmtime(path)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_rc(path, rc):
+    try:
+        _write_atomic_text(path, "%d\n" % rc)
+    except OSError:
+        pass
+
+
+def _reap_detached(proc, rc_path):
+    """Reap a detached wrapper this stub started; record a signal death the wrapper could not."""
+    try:
+        rc = proc.wait()
+    except Exception:  # pragma: no cover - defensive
+        return
+    if _read_rc(rc_path) is None:
+        _write_rc(rc_path, 128 - rc if rc < 0 else rc)
+
+
+def _pid_arg(args, required=True):
+    pid = args.get("pid")
+    if pid is None:
+        if required:
+            raise StubError("invalid_arg", "pid is required")
+        return None
+    if isinstance(pid, bool):
+        raise StubError("invalid_arg", "pid must be an integer, got %r" % (pid,))
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        raise StubError("invalid_arg", "pid must be an integer, got %r" % (pid,))
+    if pid <= 1:
+        raise StubError("invalid_arg", "invalid pid: %d" % pid)
+    return pid
+
+
+def _no_record(pid):
+    return StubError(
+        "not_found",
+        "no detached run with pid %d (only processes started with run(detach=True) are tracked)"
+        % pid,
+        pid=pid,
+    )
+
+
+def _load_record(path):
+    try:
+        with io.open(path, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or not isinstance(rec.get("pid"), int):
+        return None
+    return rec
+
+
+def _record_files():
+    """``(mtime, path)`` of every detached-run record, newest first."""
+    out = []
+    for d in _proc_dir_candidates():
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(".json"):
+                p = os.path.join(d, n)
+                try:
+                    out.append((os.path.getmtime(p), p))
+                except OSError:
+                    pass
+    out.sort(reverse=True)
+    return out
+
+
+def _find_record(pid):
+    """This login node's record for ``pid``, else the newest record from another node."""
+    name = "%s.%d.json" % (_hostname(), pid)
+    for d in _proc_dir_candidates():
+        rec = _load_record(os.path.join(d, name))
+        if rec is not None:
+            return rec
+    suffix = ".%d.json" % pid
+    for _m, p in _record_files():
+        if p.endswith(suffix):
+            rec = _load_record(p)
+            if rec is not None:
+                return rec
+    return None
+
+
+def _group_alive(rec):
+    """Is any process of the run's group still alive (and is it still *our* group)?"""
+    try:
+        os.killpg(rec.get("pgid") or rec["pid"], 0)
+    except OSError:  # ProcessLookupError: all gone; PermissionError: the id is someone else's
+        return False
+    want = rec.get("starttime")
+    if want is not None:
+        have = _proc_starttime(rec["pid"])
+        if have is not None and have != want:
+            return False  # the pid (hence the group id) now belongs to an unrelated process
+    return True
+
+
+def _proc_view(rec):
+    """A detached run's public state: ``running``, ``exited`` (+``rc``), ``gone``, ``unknown``."""
+    here = _hostname()
+    same_host = rec.get("host") == here
+    out = {
+        "pid": rec["pid"],
+        "pgid": rec.get("pgid") or rec["pid"],
+        "host": rec.get("host"),
+        "cmd": rec.get("cmd"),
+        "cwd": rec.get("cwd"),
+        "log": rec.get("log"),
+        "started": rec.get("started"),
+    }
+    alive = same_host and _group_alive(rec)
+    rc = _read_rc(rec.get("rc_path") or "")
+    end = time.time()
+    if rc is not None:
+        out["state"] = "exited"
+        out["rc"], out["finished"] = rc
+        end = rc[1]
+        if alive:
+            out["group_alive"] = True
+            out["note"] = "the command exited but processes it started are still running"
+    elif alive:
+        out["state"] = "running"
+    elif not same_host:
+        out["state"] = "unknown"
+        out["note"] = "started on login node %s; this session is on %s" % (rec.get("host"), here)
+    else:
+        out["state"] = "gone"
+        out["note"] = "no exit status was recorded (killed with SIGKILL, or the node rebooted)"
+    started = rec.get("started")
+    if out["state"] in ("running", "exited") and isinstance(started, (int, float)):
+        out["elapsed"] = round(max(0.0, end - started), 1)
+    return out
+
+
+def op_detach(args):
+    """Start a command detached from this stub and the ssh connection; return at once.
+
+    The command runs in its own session with stdin from /dev/null and stdout+stderr appended to
+    ``log`` (default: a new file in the proc dir). A small bash wrapper records the exit status
+    in an rc file, so ``proc_status`` keeps working after the stub or the connection is gone.
+    Returns ``{pid, pgid, log, host, started}``; ``pid`` is the wrapper, which leads the group.
+    """
+    argv_in = args.get("argv")
+    cmd = args.get("cmd")
+    env = args.get("env")
+    if cmd is not None:
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise StubError("invalid_arg", "cmd must be a non-empty string")
+        target = ["bash", "-lc" if args.get("login") else "-c", cmd]
+        shown = cmd
+    elif argv_in is not None:
+        if (
+            not isinstance(argv_in, (list, tuple))
+            or not argv_in
+            or not all(isinstance(a, str) for a in argv_in)
+        ):
+            raise StubError("invalid_arg", "argv must be a non-empty list of strings")
+        if "/" not in argv_in[0] and not (env and "PATH" in env) and not _which(argv_in[0]):
+            raise StubError("not_found", "command not found: %s" % argv_in[0], command=argv_in[0])
+        target = list(argv_in)
+        shown = " ".join(argv_in)
+    else:
+        raise StubError("invalid_arg", "either argv or cmd is required")
+    cwd = args.get("cwd")
+    if cwd is not None:
+        cwd = _path(cwd, must_exist=True)
+        if not os.path.isdir(cwd):
+            raise StubError("invalid_arg", "not a directory: %s" % cwd, path=cwd)
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        for k, v in env.items():
+            full_env[str(k)] = str(v)
+    d = _proc_dir()
+    host = _hostname()
+    stem = "%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), codecs.encode(os.urandom(3), "hex").decode())
+    rc_path = os.path.join(d, stem + ".rc")
+    log = args.get("log")
+    if log:
+        log = _path(log)
+        try:
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+        except OSError as e:
+            raise _os_error(e, os.path.dirname(log))
+    else:
+        log = os.path.join(d, stem + ".log")
+    try:
+        logf = io.open(log, "ab")
+        log_start = os.fstat(logf.fileno()).st_size  # a reused log's old content ends here
+    except OSError as e:
+        raise _os_error(e, log)
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-c", _DETACH_WRAPPER, "rs-detach", rc_path] + target,
+            cwd=cwd,
+            env=full_env,
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as e:
+        raise StubError("error", "cannot start detached command: %s" % e)
+    finally:
+        logf.close()
+    started = time.time()
+    rec = {
+        "pid": proc.pid,
+        "pgid": proc.pid,
+        "host": host,
+        "cmd": shown,
+        "cwd": cwd or os.getcwd(),
+        "log": log,
+        "rc_path": rc_path,
+        "started": started,
+        "starttime": _proc_starttime(proc.pid),
+        "log_start": log_start,
+    }
+    t = threading.Thread(target=_reap_detached, args=(proc, rc_path), name="rs-reap-%d" % proc.pid)
+    t.daemon = True
+    t.start()
+    out = {"pid": proc.pid, "pgid": proc.pid, "log": log, "host": host, "started": started}
+    try:
+        _write_atomic_text(os.path.join(d, "%s.%d.json" % (host, proc.pid)), json.dumps(rec))
+    except OSError as e:
+        out["warning"] = "running, but its record could not be saved (%s); proc_* won't find it" % e
+    return out
+
+
+def op_proc_status(args):
+    """One detached run's state (``pid``), or the most recent runs (``{procs, count, total}``)."""
+    pid = _pid_arg(args, required=False)
+    if pid is not None:
+        rec = _find_record(pid)
+        if rec is None:
+            raise _no_record(pid)
+        return _proc_view(rec)
+    files = _record_files()
+    limit = _clamp(args.get("limit"), PROC_LIST_DEFAULT, PROC_LIST_MAX)
+    procs = []
+    for _m, p in files[:limit]:
+        rec = _load_record(p)
+        if rec is not None:
+            procs.append(_proc_view(rec))
+    return {"procs": procs, "count": len(procs), "total": len(files), "host": _hostname()}
+
+
+def op_proc_tail(args):
+    """The last ``lines`` lines of a detached run's log, plus its current state."""
+    pid = _pid_arg(args)
+    rec = _find_record(pid)
+    if rec is None:
+        raise _no_record(pid)
+    lines = _clamp(args.get("lines"), 50, 100000)
+    max_bytes = _clamp(args.get("max_bytes"), DEFAULT_READ_BYTES, MAX_READ_BYTES)
+    out = _proc_view(rec)
+    log = rec.get("log") or ""
+    try:
+        with io.open(log, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            data, skipped = _tail_bytes(f, size, lines, max_bytes)
+    except OSError as e:
+        raise _os_error(e, log)
+    out.update({"content": _decode(data), "size": size, "truncated": skipped > 0})
+    return out
+
+
+def op_proc_kill(args):
+    """Signal a detached run's whole process group; escalate to SIGKILL after ``grace`` s."""
+    pid = _pid_arg(args)
+    rec = _find_record(pid)
+    if rec is None:
+        raise _no_record(pid)
+    here = _hostname()
+    if rec.get("host") != here:
+        raise StubError(
+            "invalid_arg",
+            "pid %d runs on login node %s; this session is on %s and cannot signal it"
+            % (pid, rec.get("host"), here),
+            pid=pid,
+        )
+    name = str(args.get("signal") or "TERM").upper()
+    if name.startswith("SIG"):
+        name = name[3:]
+    sig = _KILL_SIGNALS.get(name)
+    if sig is None:
+        raise StubError(
+            "invalid_arg", "signal must be one of %s" % ", ".join(sorted(_KILL_SIGNALS))
+        )
+    grace = _clamp(args.get("grace"), PROC_KILL_GRACE, 60, lo=0)
+    if not _group_alive(rec):
+        out = _proc_view(rec)
+        out.update({"killed": False, "reason": "not running"})
+        return out
+    pgid = rec.get("pgid") or pid
+    sent = [name]
+    last = sig
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        pass
+    deadline = time.time() + grace
+    while time.time() < deadline and _group_alive(rec):
+        time.sleep(0.05)
+    if sig != signal.SIGKILL and _group_alive(rec):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        sent.append("KILL")
+        last = signal.SIGKILL
+        deadline = time.time() + 2
+        while time.time() < deadline and _group_alive(rec):
+            time.sleep(0.05)
+    # The wrapper (or this stub's reaper) records the exit status as it dies; if neither will
+    # (a SIGKILLed wrapper started by an earlier stub), record the signal ourselves.
+    rc_path = rec.get("rc_path") or ""
+    deadline = time.time() + 1.0
+    while time.time() < deadline and _read_rc(rc_path) is None:
+        time.sleep(0.05)
+    if rc_path and _read_rc(rc_path) is None and not _group_alive(rec):
+        _write_rc(rc_path, 128 + int(last))
+    out = _proc_view(rec)
+    out.update({"killed": out["state"] != "running", "signals": sent})
+    return out
+
+
+def op_waitfor(args):
+    """Check every ``WAIT_POLL`` s, for up to ``timeout`` s, until a condition holds.
+
+    ``pid`` (a detached run): until it stops running. ``path``: until it exists. ``pattern`` (a
+    regex): until a line of ``path`` (default: the ``pid``'s log) matches; with a ``pid`` it also
+    stops when the process exits first. Returns ``{done, met, reason, waited, ...}``: ``done`` =
+    stop waiting (``reason`` matched | exists | exited), ``met`` = the requested condition held.
+    On timeout ``done`` is false and ``offset`` is where the next call should resume scanning.
+    ``offset`` defaults to 0 or, for the ``pid``'s own log, to where this run's output began.
+    A line without its newline yet matches only once it has stopped growing for a whole check.
+    A cancellable LONG op (its registered event ends the wait early).
+    """
+    cancel_event = args.get("_cancel_event")
+    timeout = _clamp(args.get("timeout"), WAIT_DEFAULT, WAIT_MAX)
+    pid = _pid_arg(args, required=False)
+    path = args.get("path")
+    pattern = args.get("pattern")
+    rec = None
+    own_log = False  # watching the pid's own log rather than a caller-given path
+    if pid is not None:
+        rec = _find_record(pid)
+        if rec is None:
+            raise _no_record(pid)
+        if path is None and pattern is not None:
+            path = rec.get("log")
+            own_log = True
+        if path is None and _proc_view(rec)["state"] == "unknown":
+            raise StubError(
+                "invalid_arg",
+                "pid %d runs on login node %s; this session is on %s and cannot watch it"
+                % (pid, rec.get("host"), _hostname()),
+                pid=pid,
+            )
+    elif path is None:
+        raise StubError("invalid_arg", "waitfor needs a pid and/or a path")
+    rx = None
+    if pattern is not None:
+        if not isinstance(pattern, str) or not pattern:
+            raise StubError("invalid_arg", "pattern must be a non-empty string")
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            raise StubError("invalid_arg", "bad regex %r: %s" % (pattern, e))
+    p = _path(path) if path is not None else None
+    if rx is not None and os.path.isdir(p):
+        raise StubError("invalid_arg", "is a directory: %s" % p, path=p)
+    raw_offset = args.get("offset")
+    if raw_offset is None:
+        # A reused log may hold an old match: by default scan only this run's own output.
+        raw_offset = rec.get("log_start", 0) if own_log else 0
+    try:
+        raw_offset = int(raw_offset)
+    except (TypeError, ValueError):
+        raise StubError("invalid_arg", "offset must be an integer")
+    scan_state = {"pos": None, "carry": b""}  # bytes read so far; trailing partial line
+
+    def scan(final=False):
+        """Scan what was appended to ``p`` since the last check; a match dict or None.
+
+        Reads at most ``WAIT_SCAN_BYTES`` per check, or everything up to EOF when ``final``
+        (the writer has exited, so the file is finite).
+        """
+        try:
+            f = io.open(p, "rb")
+        except OSError:
+            return None  # not there yet (or unreadable): keep waiting
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            pos = scan_state["pos"]
+            carry = scan_state["carry"]
+            if pos is None:
+                pos = max(0, size + raw_offset) if raw_offset < 0 else min(raw_offset, size)
+            elif size < pos:  # truncated or replaced: start over
+                pos, carry = 0, b""
+            f.seek(pos)
+            start = pos
+            budget = None if final else WAIT_SCAN_BYTES
+            hit = None
+            while (budget is None or budget > 0) and hit is None:
+                chunk = f.read(1024 * 1024 if budget is None else min(1024 * 1024, budget))
+                if not chunk:
+                    break
+                if budget is not None:
+                    budget -= len(chunk)
+                o = pos - len(carry)
+                pos += len(chunk)
+                lines = (carry + chunk).split(b"\n")
+                carry = lines.pop()
+                for ln in lines:
+                    if rx.search(_decode(ln)):
+                        hit = (ln, o, o + len(ln) + 1)
+                        break
+                    o += len(ln) + 1
+                if len(carry) > WAIT_CARRY_MAX:
+                    carry = carry[-WAIT_CARRY_MAX:]
+            # A line without its newline yet (e.g. a prompt) counts only once nothing was
+            # appended for a whole check, or the writer has exited, so a `$`-anchored pattern
+            # can't fire on half a line.
+            settled = final or pos == start
+            if hit is None and carry and settled and rx.search(_decode(carry)):
+                hit = (carry, pos - len(carry), pos)
+            if hit is not None:
+                scan_state["pos"], scan_state["carry"] = hit[2], b""
+                return {"line": _decode(hit[0])[:DIFF_MAX_LINE], "line_offset": hit[1]}
+            scan_state["pos"], scan_state["carry"] = pos, carry
+            return None
+
+    t0 = time.time()
+
+    def result(done, met, reason, **extra):
+        out = {"done": done, "met": met, "reason": reason, "waited": round(time.time() - t0, 1)}
+        if p is not None:
+            out["path"] = p
+        if rx is not None and scan_state["pos"] is not None:
+            out["offset"] = scan_state["pos"] - len(scan_state["carry"])
+        if rec is not None:
+            out["process"] = _proc_view(rec)
+        out.update(extra)
+        return out
+
+    def check_path(final=False):
+        if p is None:
+            return None
+        if rx is not None:
+            hit = scan(final)
+            return None if hit is None else result(True, True, "matched", **hit)
+        return result(True, True, "exists") if os.path.lexists(p) else None
+
+    while True:
+        found = check_path()
+        if found is not None:
+            return found
+        # Re-read every check: a run on another login node reports `unknown` until its rc file
+        # shows up on the shared home.
+        if rec is not None and _proc_view(rec)["state"] in ("exited", "gone"):
+            found = check_path(final=True)  # to EOF: output written just before the exit counts
+            return found if found is not None else result(True, p is None, "exited")
+        waited = time.time() - t0
+        if waited >= timeout:
+            return result(False, False, "timeout")
+        pause = min(WAIT_POLL, timeout - waited)
+        if cancel_event is not None:
+            if cancel_event.wait(pause):
+                return result(False, False, "cancelled")
+        else:
+            time.sleep(pause)
+
+
 def _slurm(argv, timeout=60, cwd=None, stdin=None, on_spawn=None, new_session=False):
     if not _which(argv[0]):
         raise StubError(
@@ -1521,6 +2141,11 @@ OPS = {
     "run": op_run,
     "srun": op_srun,
     "follow": op_follow,
+    "detach": op_detach,
+    "proc_status": op_proc_status,
+    "proc_tail": op_proc_tail,
+    "proc_kill": op_proc_kill,
+    "waitfor": op_waitfor,
     "sbatch": op_sbatch,
     "squeue": op_squeue,
     "sacct": op_sacct,
@@ -1632,8 +2257,8 @@ class Server(object):
                 raise StubError("invalid_arg", "unknown op: %r" % (op,))
             registers_proc = op in SLOW_OPS
             registers_event = op in LONG_OPS
-            # `run`/`srun` stream only when asked; `follow` always streams.
-            streaming = (op in STREAM_OPS and bool(args.get("stream"))) or (op in LONG_OPS)
+            # `run`/`srun` stream only when asked; `follow` always streams; `waitfor` never does.
+            streaming = (op in STREAM_OPS and bool(args.get("stream"))) or (op in ALWAYS_STREAM_OPS)
             cancellable = registers_proc or registers_event
             if registers_proc or registers_event or streaming:
                 # Copy args so the caller's dict is never mutated and the internal `_`-prefixed
