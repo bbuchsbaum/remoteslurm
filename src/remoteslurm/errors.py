@@ -75,6 +75,12 @@ class ConfigError(RemoteSlurmError):
     code = "config_error"
 
 
+class Cancelled(RemoteSlurmError):
+    """The caller abandoned the call (e.g. an MCP client cancelled or timed out the tool call)."""
+
+    code = "cancelled"
+
+
 class ConfirmationRequired(RemoteSlurmError):
     """A destructive op (``rm``/``cancel``/…) needs an explicit ``confirm=True``.
 
@@ -103,6 +109,7 @@ _BY_CODE: dict[str, type[RemoteSlurmError]] = {
         SessionDied,
         InvalidArgument,
         ConfigError,
+        Cancelled,
         ConfirmationRequired,
     )
 }

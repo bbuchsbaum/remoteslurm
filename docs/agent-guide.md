@@ -29,7 +29,10 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   Check it with `proc_status`/`proc_tail`, stop it with `proc_kill`, and block with
   `wait(pid=...)` — or `wait(pid=..., pattern="READY")` to return as soon as its log prints a
   marker. Don't put `&` in a plain `run`: the call returns ~2 s after the command exits
-  (`lingering: true`), and the background process dies at its next write (SIGPIPE).
+  (`lingering: true`) and the background process survives only as long as this session.
+- Keep each call under ~25 min: `run` timeouts are capped at 1500 s, and a `compute=True` run
+  must fit its `queue_timeout` + `time` in that. For longer work use `submit` or
+  `run(detach=True)`, then loop on `wait` (≤300 s per call).
 
 ## After a job finishes (or won't start)
 - Use `diagnose <job_id>` instead of manually reading logs. It returns a plain-English

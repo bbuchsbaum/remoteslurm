@@ -354,6 +354,104 @@ def test_mcp_proc_kill_honours_confirm(mcp_cluster: Cluster) -> None:
         mcp_cluster.proc_kill(r["pid"], signal="KILL", grace=0)
 
 
+def _pid_dead_within(pid: int, timeout: float) -> bool:
+    import os
+    import time as _t
+
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        _t.sleep(0.05)
+    return False
+
+
+def _read_pid(p: Any, timeout: float = 10.0) -> int:
+    import time as _t
+
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if p.exists() and p.read_text().strip():
+            return int(p.read_text().strip())
+        _t.sleep(0.05)
+    raise AssertionError(f"{p} never written")
+
+
+def test_cancelled_mcp_run_kills_the_remote_process(mcp_cluster: Cluster, sandbox: Any) -> None:
+    """An aborted tool call (anyio cancellation, as FastMCP does on notifications/cancelled)
+    must cancel the stub's run instead of letting it run out its 120 s timeout."""
+    import time as _t
+
+    import anyio
+
+    marker = sandbox / "cancel.pid"
+
+    async def go() -> None:
+        with anyio.move_on_after(1.5):
+            await server.run(cmd=f"echo $$ > {marker}; exec sleep 60", timeout=120)
+
+    t0 = _t.monotonic()
+    anyio.run(go)
+    # asyncio.run waits for the worker thread on shutdown: without cancel-on-abort, 60 s.
+    assert _t.monotonic() - t0 < 10
+    pid = _read_pid(marker)
+    assert _pid_dead_within(pid, 10), "the remote process outlived the cancelled call"
+    assert mcp_cluster.run(["echo", "ok"])["stdout"] == "ok\n"
+
+
+def test_cancelled_mcp_wait_releases_the_stub_wait(mcp_cluster: Cluster) -> None:
+    import time as _t
+
+    import anyio
+
+    r = mcp_cluster.run("sleep 300", detach=True)
+    try:
+
+        async def go() -> None:
+            with anyio.move_on_after(1.5):
+                await server.wait(pid=r["pid"], timeout=300)
+
+        t0 = _t.monotonic()
+        anyio.run(go)
+        assert _t.monotonic() - t0 < 10  # else it waited out the stub's 300 s wait
+        deadline = _t.time() + 10
+        while mcp_cluster.session._pending and _t.time() < deadline:
+            _t.sleep(0.05)
+        assert not mcp_cluster.session._pending, "the stub's waitfor kept running"
+    finally:
+        mcp_cluster.proc_kill(r["pid"], signal="KILL", grace=0)
+
+
+def test_inflight_refuses_new_requests_once_cancelled(mcp_cluster: Cluster) -> None:
+    from remoteslurm.errors import Cancelled
+    from remoteslurm.session import CURRENT_INFLIGHT, InFlight
+
+    tracker = InFlight()
+    assert tracker.cancel() == 0
+    token = CURRENT_INFLIGHT.set(tracker)
+    try:
+        with pytest.raises(Cancelled):
+            mcp_cluster.run(["sleep", "30"])  # killable: refused once the caller gave up
+        assert mcp_cluster.ping()["protocol"] == 2  # bookkeeping ops still go through
+    finally:
+        CURRENT_INFLIGHT.reset(token)
+
+
+def test_mcp_run_limits_blocking_time(
+    mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unset walltime is budgeted as 1 h: 600 + 3600 + 30 s is over the 1500 s default.
+    r = call("run", cmd="hostname", compute=True)
+    assert r["error"] == "invalid_arg" and "submit" in r["action"]
+    r = call("run", cmd="hostname", compute=True, time="02:00:00")
+    assert r["error"] == "invalid_arg" and "7200s" in r["message"]
+    monkeypatch.setenv(server.ENV_MAX_CALL, "2")
+    r = call("run", cmd="sleep 10", timeout=60)  # clamped to 2 s
+    assert r["error"] == "timeout"
+
+
 def _lifetime_setup(monkeypatch: pytest.MonkeyPatch, hc: Any, age: int) -> None:
     from remoteslurm.transport import SSHTransport
 

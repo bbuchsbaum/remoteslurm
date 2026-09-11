@@ -2,11 +2,22 @@
 
 ## Unreleased
 
+- MCP: cancelling a tool call (a client timeout or abort) now cancels the remote work it
+  started — a login-node `run`, a `compute=True` srun (releasing its allocation), a `wait` —
+  instead of leaving it to run out its own timeout; the stub also honours a cancel that arrives
+  while the op is still queued. Side-effecting calls such as `submit` are left to finish, so a
+  submitted job is still recorded. `run` and `sync` timeouts are capped at 1500 s
+  (`REMOTESLURM_MCP_MAX_CALL`) so a call ends before a client's 30-minute abort, and a
+  `compute=True` run whose queue wait + walltime could exceed that is refused with a hint.
+  `Cluster.run(max_seconds=)` exposes the same check to library callers.
+- A lingering run's background output is now drained into a `lingering_log` (up to 16 MiB;
+  logs untouched for 7 days are pruned) instead of the pipes being closed, so a mistakenly
+  backgrounded command keeps running as long as the stub session does, and
+  `wait(path=..., pattern=...)` can watch it.
 - Login-node `run` is now bounded in every case. It returns about 2 s after the command exits
   even if a background child still holds stdout/stderr (the result is flagged `lingering`, with
-  a note), where it used to wait for the timeout; that child then dies of SIGPIPE at its next
-  write, so background work belongs in `run(detach=True)`. After a timeout kill it drains
-  leftover output for at most 2 s; previously a `setsid` child holding the pipes blocked one of the stub's four
+  a note), where it used to wait for the timeout. After a timeout kill it drains leftover
+  output for at most 2 s; previously a `setsid` child holding the pipes blocked one of the stub's four
   slow-pool workers until that child exited. Non-streaming runs now use the streaming path's
   bounded-memory reader, so a timeout error carries the first `max_output` bytes, not the last.
 - Detached runs: `run(detach=True)` / `rslurm run --detach` / MCP `run(detach=true)` start a

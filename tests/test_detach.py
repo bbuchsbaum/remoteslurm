@@ -68,7 +68,8 @@ def test_run_returns_soon_after_exit_when_background_child_holds_pipe(
     child = int(_wait_text(marker))
     try:
         assert r["rc"] == 0 and r["stdout"] == "hi\n"
-        assert r["lingering"] is True and "SIGPIPE" in r["note"] and "detach" in r["note"]
+        assert r["lingering"] is True and "detach" in r["note"]
+        assert Path(r["lingering_log"]).parent == sandbox / ".cache" / "remoteslurm" / "procs"
         assert elapsed < 15, f"run was held open {elapsed:.1f}s by a background child"
         assert _alive(child)  # left running; only its output is gone
     finally:
@@ -107,6 +108,37 @@ def test_run_large_stdin_with_capped_output(cluster: Cluster) -> None:
     assert r["rc"] == 0 and r["stdout_truncated"] and len(r["stdout"]) == 1000
     r = cluster.run(["true"], stdin=data, timeout=30)  # never reads stdin: EPIPE is not an error
     assert r["rc"] == 0 and "lingering" not in r
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_lingering_child_keeps_running_and_its_output_goes_to_a_log(
+    cluster: Cluster, sandbox: Path, stream: bool
+) -> None:
+    marker = sandbox / f"survived-{stream}"
+    # The child must outlast the 2 s drain grace, or the run simply waits for it.
+    r = cluster.run(
+        f"echo hi; (sleep 3; echo late; echo survived > {marker}) &", timeout=30, stream=stream
+    )
+    assert r["lingering"] is True and r["stdout"] == "hi\n"
+    # It wrote to stdout after the call returned and still reached its next command.
+    assert _wait_text(marker) == "survived"
+    w = cluster.wait_for(path=r["lingering_log"], pattern="^late$", timeout=10)
+    assert w["met"] and w["line"] == "late"
+
+
+def test_lingering_drain_is_capped(make_cluster: Callable[..., Cluster], sandbox: Path) -> None:
+    c = make_cluster({"REMOTESLURM_LINGER_MAX_BYTES": "1000"})
+    marker = sandbox / "flood.pid"
+    r = c.run(f"sh -c 'echo $$ > {marker}; exec yes' &", timeout=30)
+    flood = int(_wait_text(marker))
+    try:
+        assert r["lingering"] is True
+        assert _wait_dead(flood), "the capped drain should close the pipe (SIGPIPE)"
+        data = Path(r["lingering_log"]).read_bytes()
+        assert data.endswith(b"cap reached; stopped reading]\n")
+        assert b"y\ny\n" in data and len(data) < 1100
+    finally:
+        _kill(flood)
 
 
 def test_run_exiting_inside_the_grace_before_its_deadline_is_not_a_timeout(
@@ -331,3 +363,76 @@ def test_wait_for_scans_to_eof_after_a_large_burst_before_exit(cluster: Cluster)
     r = cluster.run("head -c 40000000 /dev/zero | tr '\\0' x; echo; echo DONE", detach=True)
     w = cluster.wait_for(pid=r["pid"], pattern="^DONE$", timeout=60)
     assert w["met"] and w["reason"] == "matched" and w["line"] == "DONE"
+
+
+# --------------------------------------------------------------------------- cancellation
+def test_cancel_of_a_queued_run_stops_it_when_it_starts(cluster: Cluster) -> None:
+    from remoteslurm import stub as stub_mod
+
+    s = cluster.session
+    busy = [
+        s.submit("run", {"argv": ["sleep", "2"]}) for _ in range(stub_mod.SLOW_WORKERS)
+    ]  # fill the slow pool so the next run has to queue
+    rid = s.new_request_id()
+    queued = s.submit("run", {"argv": ["sleep", "60"], "timeout": 120}, request_id=rid)
+    time.sleep(0.3)
+    c = s.cancel(rid)
+    assert c["cancelled"] is True and c.get("queued") is True  # not started: remembered
+    r = queued.result(timeout=30)  # would take 60 s if the cancel had been lost
+    assert r.get("cancelled") is True
+    for f in busy:
+        f.result(timeout=30)
+
+
+def test_cancel_landing_while_the_request_is_sent_is_resent(
+    cluster: Cluster, sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from remoteslurm.session import CURRENT_INFLIGHT, InFlight, Session
+
+    tracker = InFlight()
+    real_submit = Session.submit
+
+    def submit_as_caller_gives_up(self, op, args=None, request_id=None):  # type: ignore[no-untyped-def]
+        # The caller aborts while the run is being sent, and its cancel reaches nothing (e.g.
+        # during a respawn). Other requests (the staleness ping, the cancel) pass untouched.
+        if op == "run":
+            tracker.cancelled.set()
+        return real_submit(self, op, args, request_id)
+
+    monkeypatch.setattr(Session, "submit", submit_as_caller_gives_up)
+    token = CURRENT_INFLIGHT.set(tracker)
+    try:
+        t0 = time.time()
+        r = cluster.run("exec sleep 60", timeout=120)
+    finally:
+        CURRENT_INFLIGHT.reset(token)
+    assert r.get("cancelled") is True and time.time() - t0 < 10
+
+
+def test_a_cancelled_call_still_records_its_submitted_job(cluster: Cluster) -> None:
+    from remoteslurm.session import CURRENT_INFLIGHT, InFlight
+
+    tracker = InFlight()
+    tracker.cancel()  # the MCP call was abandoned; bookkeeping must still complete
+    token = CURRENT_INFLIGHT.set(tracker)
+    try:
+        job = cluster.submit("#!/bin/bash\necho hi\n", name="cancelled-caller")
+    finally:
+        CURRENT_INFLIGHT.reset(token)
+    assert cluster.registry.get(job.job_id) is not None
+
+
+def test_old_lingering_logs_are_pruned(cluster: Cluster, sandbox: Path) -> None:
+    procs = sandbox / ".cache" / "remoteslurm" / "procs"
+    procs.mkdir(parents=True, exist_ok=True)
+    old = procs / "lingering-20200101-000000-abcdef.log"
+    old.write_text("stale\n")
+    week_ago = time.time() - 8 * 86400
+    os.utime(old, (week_ago, week_ago))
+    marker = sandbox / "prune.pid"
+    r = cluster.run(f"sleep 30 & echo $! > {marker}", timeout=30)
+    try:
+        assert r["lingering"] is True and Path(r["lingering_log"]).exists()
+        assert not old.exists()
+    finally:
+        _kill(int(_wait_text(marker)))

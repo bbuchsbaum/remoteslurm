@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import shlex
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -22,11 +23,17 @@ from mcp.server.fastmcp import FastMCP
 from .cluster import Cluster
 from .config import ENV_DEFAULT_HOST
 from .errors import RemoteSlurmError
+from .session import CURRENT_INFLIGHT, InFlight
 from .transport import SSHTransport, format_duration
 
 ENV_MAX_CHARS = "REMOTESLURM_MCP_MAX_CHARS"
 # Hard ceiling on any single string field in a tool result (agents have token caps).
 MAX_CHARS = int(os.environ.get(ENV_MAX_CHARS, "200000"))
+
+ENV_MAX_CALL = "REMOTESLURM_MCP_MAX_CALL"
+# Longest a single tool call may block. Clients abort long silent calls (Claude Code: 1,800 s),
+# so a login-node `run` timeout, and a `compute=True` run's queue wait + walltime, stay below.
+MAX_CALL_SECONDS = 1500  # default; $REMOTESLURM_MCP_MAX_CALL overrides it (read per call)
 
 ENV_MCP_TOOLS = "REMOTESLURM_MCP_TOOLS"
 # The default tool set: the workflow-critical tools an agent needs, nothing more. Set
@@ -93,6 +100,34 @@ def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(v)))
 
 
+def _max_call() -> int:
+    try:
+        return max(1, int(os.environ.get(ENV_MAX_CALL) or MAX_CALL_SECONDS))
+    except ValueError:
+        return MAX_CALL_SECONDS
+
+
+async def _in_worker(work: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Run ``work`` in a worker thread, tracking the stub requests it makes.
+
+    If the MCP call is cancelled (the client timed out or gave up), those requests are cancelled
+    on the stub, so a login-node run, an srun holding an allocation or a wait doesn't outlive
+    the call. The worker thread itself finishes as soon as the stub answers.
+    """
+    tracker = InFlight()
+
+    def tracked() -> dict[str, Any]:
+        CURRENT_INFLIGHT.set(tracker)  # in the thread's copy of the context
+        return work()
+
+    try:
+        return await asyncio.to_thread(tracked)
+    except asyncio.CancelledError:
+        # No awaiting here: anyio cancellation is level-triggered, so cancel from a thread.
+        threading.Thread(target=tracker.cancel, name="rs-mcp-cancel", daemon=True).start()
+        raise
+
+
 async def _guard(host: str | None, fn: Callable[[Cluster], dict[str, Any]]) -> dict[str, Any]:
     """Run ``fn(cluster)`` in a worker thread, converting errors to dicts."""
 
@@ -100,7 +135,7 @@ async def _guard(host: str | None, fn: Callable[[Cluster], dict[str, Any]]) -> d
         return fn(_get_cluster(host))
 
     try:
-        return _cap(await asyncio.to_thread(work))
+        return _cap(await _in_worker(work))
     except RemoteSlurmError as e:
         return e.to_dict()
     except Exception as e:  # noqa: BLE001 - never let an exception cross the MCP boundary
@@ -118,7 +153,7 @@ async def _guard_confirmable(
         return fn(_get_cluster(host))
 
     try:
-        return _cap(await asyncio.to_thread(work))
+        return _cap(await _in_worker(work))
     except ConfirmationRequired as e:
         return {"needs_confirmation": True, "what": e.what}
     except RemoteSlurmError as e:
@@ -326,7 +361,8 @@ async def run(
     """Run a shell command on the *login node* and return rc/stdout/stderr — or, with
     ``compute=True``, on a *compute node* via srun.
 
-    Login-node runs cap output at ``max_output`` bytes/stream and clamp ``timeout`` to 1..3600 s;
+    Login-node runs cap output at ``max_output`` bytes/stream and clamp ``timeout`` to the
+    per-call limit below;
     ``login=True`` loads modules/profile. Keep login-node work light — heavy or long work belongs
     in ``submit`` or ``compute=True``.
 
@@ -336,7 +372,13 @@ async def run(
     the call (a server, an install, a setup script), then ``proc_status``/``proc_tail``/
     ``proc_kill`` and ``wait(pid=..., pattern=...)``. Don't background with ``&`` in a normal
     run: it returns ~2 s after the command exits with ``lingering: true``, and the background
-    process dies of SIGPIPE the next time it writes output.
+    process's further output goes to ``lingering_log`` only for as long as this session lasts.
+
+    Calls stay under ~25 min (``$REMOTESLURM_MCP_MAX_CALL``, default 1500 s, at most 3600)
+    because clients abort long silent calls; cancelling the call kills its remote process. A
+    ``compute=True`` run
+    whose worst case (``queue_timeout`` + walltime + 30 s) exceeds that is refused
+    (``error: invalid_arg``) — pass a ``time`` and ``queue_timeout`` that fit, or use ``submit``.
 
     ``compute=True`` queues for a node and runs the command there. Resources come from
     ``template`` then ``partition``/``time``/``cpus``/``mem``/``gpus`` (account from the host
@@ -349,7 +391,8 @@ async def run(
     Live streaming of output (``run --stream``) and ``tail -f`` are CLI-only: this MCP ``run``
     tool always returns the complete result in one response.
     """
-    to = _clamp(timeout, 1, 3600)
+    limit = _max_call()
+    to = _clamp(timeout, 1, min(3600, limit))
 
     def f(c: Cluster) -> dict[str, Any]:
         if detach:
@@ -368,6 +411,7 @@ async def run(
                 login=login,
                 max_output=max_output,
                 cwd=cwd,
+                max_seconds=limit,
             )
         return c.run(cmd, cwd=cwd, timeout=to, login=login, max_output=max_output)
 
@@ -691,7 +735,8 @@ async def sync(
     touching anything. ``delete=True`` removes remote files missing locally, and only works
     when the project also sets ``delete = true`` (double opt-in). Oversized pushes are
     refused (``error: too_large``) unless ``force=True``. rsync runs locally in the server
-    process; a ``.remoteslurm-sync.json`` marker is written after each successful push.
+    process; a ``.remoteslurm-sync.json`` marker is written after each successful push. The
+    rsync is bounded by the per-call limit (``$REMOTESLURM_MCP_MAX_CALL``, default 1500 s).
     """
     from pathlib import Path
 
@@ -712,6 +757,7 @@ async def sync(
             delete=delete,
             force=force,
             force_protected=force,
+            timeout=_max_call(),
         )
 
     return await _guard(host, f)
@@ -769,6 +815,7 @@ async def quota(host: str | None = None) -> dict[str, Any]:
 # -- watch / wait (F2) ------------------------------------------------------------------------
 def _wait_job(c: Cluster, job_id: str, cap: int) -> dict[str, Any]:
     interval = 5.0
+    tracker = CURRENT_INFLIGHT.get()
     t0 = time.monotonic()
     st = c.job_status(job_id, refresh=True)
     # Bound WALL-CLOCK, not iteration count: each job_status can itself take seconds over a slow
@@ -777,7 +824,12 @@ def _wait_job(c: Cluster, job_id: str, cap: int) -> dict[str, Any]:
         elapsed = time.monotonic() - t0
         if elapsed >= cap:
             break
-        time.sleep(min(interval, cap - elapsed))
+        pause = min(interval, cap - elapsed)
+        if tracker is not None:
+            if tracker.cancelled.wait(pause):
+                break  # the MCP call was cancelled: stop polling
+        else:
+            time.sleep(pause)
         st = c.job_status(job_id, refresh=True)
     d = st.to_dict()
     d["terminal"] = bool(st.terminal)

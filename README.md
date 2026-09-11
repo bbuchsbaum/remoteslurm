@@ -145,7 +145,10 @@ remoteslurm mcp-config --host mycluster
 The default `core` tool set covers cluster information, bounded file operations, execution
 (including detached login-node processes), submission, job monitoring, diagnosis,
 synchronization, cancellation, waiting, and connection state. Set `REMOTESLURM_MCP_TOOLS=all` to
-add project and queue inspection, quota, sweeps, output, events, globbing, and diffs.
+add project and queue inspection, quota, sweeps, output, events, globbing, and diffs. `run` and
+`sync` stay under 25 minutes (`REMOTESLURM_MCP_MAX_CALL`, default 1500 s) because clients such as
+Claude Code abort silent calls after 30 minutes. Cancelling a `run` or `wait` call stops its
+remote process or wait; side-effecting calls such as `submit` finish, so their results are kept.
 
 An agent should call `info` first. The returned `notes`, `templates`, `projects`, and
 `learned_notes` are its local policy contract: they say where work belongs and how it should be

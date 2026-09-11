@@ -67,6 +67,22 @@ KILL_GRACE = 0.5  # seconds between SIGTERM and SIGKILL when cancelling a proces
 # pipes are read for at most this long before returning (the result is flagged `lingering`).
 RUN_DRAIN_GRACE = 2.0
 KILL_DRAIN = 2.0  # after a timeout kill, read leftover output for at most this long
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+# After a run turns `lingering`, a thread keeps draining its background children's output into
+# a log so they are not killed by SIGPIPE; it stops (closing the pipes) after this many bytes.
+LINGER_LOG_MAX = _env_int("REMOTESLURM_LINGER_MAX_BYTES", 16 * 1024 * 1024)
+LINGER_MAX_DRAINS = 16  # concurrent drains; beyond this a lingering run's pipes are just closed
+LINGER_KEEP_DAYS = 7  # lingering-output logs untouched for longer are pruned
+_LINGER_LOCK = threading.Lock()
+_LINGER_ACTIVE = [0]
 PIPE_BUF = getattr(select, "PIPE_BUF", 512)  # stdin write size that never blocks a ready pipe
 # Detached runs (`run(detach=True)`): records, rc files and default logs live here, under the
 # remote home (shared between login nodes on most clusters), else next to the stub.
@@ -268,6 +284,97 @@ def _close_quiet(f):
         pass
 
 
+def _start_linger_drain(files):
+    """Hand a lingering run's still-open pipes to a drain thread.
+
+    Returns ``(log_path_or_None, started)``. ``started`` is false when ``LINGER_MAX_DRAINS``
+    drains are already running; the caller then closes the pipes itself.
+    """
+    with _LINGER_LOCK:
+        if _LINGER_ACTIVE[0] >= LINGER_MAX_DRAINS:
+            return None, False
+        _LINGER_ACTIVE[0] += 1
+    try:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        tag = codecs.encode(os.urandom(3), "hex").decode()
+        d = _proc_dir()
+        _prune_lingering_logs(d)
+        path = os.path.join(d, "lingering-%s-%s.log" % (stamp, tag))
+        out = io.open(path, "ab")
+    except (StubError, OSError):
+        path, out = None, None
+    t = threading.Thread(target=_drain_lingering, args=(files, out), name="rs-linger")
+    t.daemon = True
+    try:
+        t.start()
+    except Exception:  # e.g. "can't start new thread": fall back to closing the pipes
+        _close_quiet(out)
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        with _LINGER_LOCK:
+            _LINGER_ACTIVE[0] -= 1
+        return None, False
+    return path, True
+
+
+def _prune_lingering_logs(d):
+    """Remove lingering-output logs untouched for ``LINGER_KEEP_DAYS`` (best effort)."""
+    cutoff = time.time() - LINGER_KEEP_DAYS * 86400
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        if n.startswith("lingering-") and n.endswith(".log"):
+            p = os.path.join(d, n)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.unlink(p)
+            except OSError:
+                pass
+
+
+def _drain_lingering(files, out):
+    """Copy what a run's background children still write into ``out`` until they close the
+    pipes. After ``LINGER_LOG_MAX`` bytes it stops and closes the pipes (the writers then get
+    SIGPIPE). With no ``out`` the bytes are discarded but still count against the cap."""
+    sel = selectors.DefaultSelector()
+    seen = 0
+    try:
+        for f in files:
+            sel.register(f, selectors.EVENT_READ)
+        live = len(files)
+        while live and seen < LINGER_LOG_MAX:
+            for key, _events in sel.select():
+                try:
+                    data = os.read(key.fd, STREAM_READ_BYTES)
+                except OSError:
+                    data = b""
+                if not data:
+                    sel.unregister(key.fileobj)
+                    live -= 1
+                    continue
+                keep = data[: max(0, LINGER_LOG_MAX - seen)]
+                seen += len(keep)
+                if out is not None and keep:
+                    out.write(keep)
+                    out.flush()
+        if live and out is not None:
+            out.write(b"\n[remoteslurm: lingering-output cap reached; stopped reading]\n")
+    except Exception:  # pragma: no cover - a drain thread must never die noisily
+        pass
+    finally:
+        sel.close()
+        for f in files:
+            _close_quiet(f)
+        _close_quiet(out)
+        with _LINGER_LOCK:
+            _LINGER_ACTIVE[0] -= 1
+
+
 def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
     """Drive ``proc`` to completion with bounded memory and bounded time.
 
@@ -280,8 +387,9 @@ def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
 
     * once the command itself exits, the pipes are read for at most ``RUN_DRAIN_GRACE`` more
       seconds. If a background child still holds them, the result comes back with
-      ``lingering: true``. The stub then closes its end of the pipes, so that child dies of
-      SIGPIPE the next time it writes to them.
+      ``lingering: true`` and the still-open pipes are handed to a drain thread that copies
+      the child's further output into ``lingering_log`` (see ``_drain_lingering``), so the
+      child keeps running while this stub lives.
     * on timeout the process (group) is killed and leftover output is read for at most
       ``KILL_DRAIN`` seconds before ``StubError("timeout")`` is raised with what was captured.
       A child that left the group (``setsid``) survives the kill but can no longer block us.
@@ -387,8 +495,16 @@ def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:  # pragma: no cover - defensive
             pass
+    handed = []  # pipes passed on to a lingering drain, which closes them itself
+    linger_log = None
+    if lingering:
+        still_open = [proc.stdout if n == "stdout" else proc.stderr for n in sorted(open_reads)]
+        linger_log, started = _start_linger_drain(still_open)
+        if started:
+            handed = still_open
     for f in (proc.stdin, proc.stdout, proc.stderr):
-        _close_quiet(f)
+        if f not in handed:
+            _close_quiet(f)
     for name in ("stdout", "stderr"):
         tail = dec[name].decode(b"", True)
         if tail:
@@ -411,12 +527,25 @@ def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
     }
     if lingering:
         res["lingering"] = True
-        res["note"] = (
-            "the command exited but a background process it started still held stdout/stderr; "
-            "stopped reading after %ss, so that process will die (SIGPIPE) the next time it "
-            "writes output. Redirect it (cmd > log 2>&1 &) or use run(detach=True) instead."
-            % RUN_DRAIN_GRACE
-        )
+        head = "the command exited but a background process it started still holds stdout/stderr"
+        if handed:
+            res["lingering_log"] = linger_log
+            where = (
+                "goes to lingering_log (wait on it with wait(path=..., pattern=...))"
+                if linger_log
+                else "is discarded (no writable log directory)"
+            )
+            res["note"] = (
+                "%s; its further output %s. It keeps running only while this stub session "
+                "lives: use run(detach=True) for work that must outlive the session."
+                % (head, where)
+            )
+        else:
+            res["note"] = (
+                "%s; too many lingering runs are already being drained, so this one's pipes "
+                "were closed and that process will die (SIGPIPE) at its next write. Use "
+                "run(detach=True) for background work." % head
+            )
     return res
 
 
@@ -2170,10 +2299,14 @@ class Server(object):
         self.fast = ThreadPoolExecutor(max_workers=FAST_WORKERS)
         self.slow = ThreadPoolExecutor(max_workers=SLOW_WORKERS)
         self.long = ThreadPoolExecutor(max_workers=LONG_WORKERS)
-        self.reg_lock = threading.Lock()  # protects `running`, `events` and `cancelled`
+        self.reg_lock = threading.Lock()  # protects the five registries below
         self.running = {}  # request id -> live Popen for cancellable slow ops
         self.events = {}  # request id -> threading.Event for non-subprocess cancellables (follow)
         self.cancelled = set()  # request ids that `cancel` has just killed
+        # Cancellable requests received but not finished, so a cancel that overtakes one still
+        # queued behind a busy pool (or not yet spawned) is not lost; and those so cancelled.
+        self.pending = set()
+        self.precancelled = set()
         self.alive = True
 
     def send(self, payload):
@@ -2189,6 +2322,12 @@ class Server(object):
     def _register(self, rid, proc):
         with self.reg_lock:
             self.running[rid] = proc
+            early = rid in self.precancelled
+            if early:
+                self.precancelled.discard(rid)
+                self.cancelled.add(rid)
+        if early:  # its cancel arrived while it was still queued: stop it at once
+            _kill_group(proc, signal.SIGKILL)
 
     def _unregister(self, rid):
         with self.reg_lock:
@@ -2197,6 +2336,10 @@ class Server(object):
     def _register_event(self, rid, event):
         with self.reg_lock:
             self.events[rid] = event
+            if rid in self.precancelled:
+                self.precancelled.discard(rid)
+                self.cancelled.add(rid)
+                event.set()
 
     def _unregister_event(self, rid):
         with self.reg_lock:
@@ -2232,6 +2375,11 @@ class Server(object):
                 self.cancelled.add(target)
                 event.set()
                 return {"cancelled": True, "id": target}
+            elif target in self.pending:
+                # Received but not started (queued behind a busy pool, or about to spawn): it is
+                # stopped the moment it registers.
+                self.precancelled.add(target)
+                return {"cancelled": True, "id": target, "queued": True}
             else:
                 return {"cancelled": False, "id": target, "reason": "not running"}
         _kill_group(proc, signal.SIGTERM)
@@ -2304,6 +2452,11 @@ class Server(object):
                     "done": True,
                 }
             )
+        finally:
+            if op in SLOW_OPS or op in LONG_OPS:
+                with self.reg_lock:
+                    self.pending.discard(rid)
+                    self.precancelled.discard(rid)
 
     def serve(self, inp):
         for raw in inp:
@@ -2328,6 +2481,11 @@ class Server(object):
             if op == "shutdown":
                 self.send({"id": req.get("id"), "ok": True, "result": {"bye": True}, "done": True})
                 break
+            if op in SLOW_OPS or op in LONG_OPS:
+                # Known from the moment it is read, so a cancel sent right behind it (and
+                # dispatched to the fast pool first) finds it even while it is still queued.
+                with self.reg_lock:
+                    self.pending.add(req.get("id"))
             pool = self.long if op in LONG_OPS else (self.slow if op in SLOW_OPS else self.fast)
             pool.submit(self.handle, req)
         self.fast.shutdown(wait=True)

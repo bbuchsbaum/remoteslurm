@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import queue
@@ -12,7 +13,14 @@ from collections.abc import Generator
 from concurrent.futures import Future
 from typing import Any
 
-from .errors import NotConnected, RemoteSlurmError, RemoteTimeout, SessionDied, from_stub_error
+from .errors import (
+    Cancelled,
+    NotConnected,
+    RemoteSlurmError,
+    RemoteTimeout,
+    SessionDied,
+    from_stub_error,
+)
 from .transport import Transport
 
 log = logging.getLogger(__name__)
@@ -29,6 +37,47 @@ STREAM_PROTOCOL = 2  # streaming (multi-frame) responses require remote PROTOCOL
 # Sentinel pushed onto every open stream queue when the session dies, so a `call_stream`
 # consumer blocked on the queue wakes up instead of hanging.
 _STREAM_DEAD = object()
+
+
+class InFlight:
+    """The stub requests issued on behalf of one caller (one MCP tool call), so that abandoning
+    the call can cancel them remotely instead of leaving them to run out their own timeouts."""
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._items: set[tuple[Session, str]] = set()
+
+    def add(self, session: Session, rid: str) -> None:
+        with self._lock:
+            if self.cancelled.is_set():
+                raise Cancelled("the call was cancelled by its caller")
+            self._items.add((session, rid))
+
+    def discard(self, session: Session, rid: str) -> None:
+        with self._lock:
+            self._items.discard((session, rid))
+
+    def cancel(self) -> int:
+        """Mark the call cancelled and ask the stub to kill whatever it still has in flight
+        (best effort; returns how many requests were targeted)."""
+        with self._lock:
+            self.cancelled.set()
+            items = list(self._items)
+        for session, rid in items:
+            session.cancel(rid)
+        return len(items)
+
+
+# Ops that are safe to kill when their caller gives up. Everything else — notably `sbatch` and
+# the bookkeeping calls after it — is left to finish, so its side effects are still recorded.
+KILLABLE_OPS = frozenset(("run", "srun", "waitfor", "follow"))
+
+# Set around one caller's work (the MCP server does this per tool call); `Session.call`
+# registers each KILLABLE_OPS request it sends with it.
+CURRENT_INFLIGHT: contextvars.ContextVar[InFlight | None] = contextvars.ContextVar(
+    "remoteslurm_inflight", default=None
+)
 
 
 class Session:
@@ -276,25 +325,37 @@ class Session:
         if op != "ping" and self.alive and time.time() - self.last_used > STALE_SECONDS:
             self._probe()
         rid = str(request_id) if request_id is not None else self.new_request_id()
-        fut = self.submit(op, args, request_id=rid)
+        tracker = CURRENT_INFLIGHT.get() if op in KILLABLE_OPS else None
+        if tracker is not None:
+            tracker.add(self, rid)  # raises Cancelled if the caller already gave up
         try:
-            return fut.result(timeout=timeout)
-        except TimeoutError as e:
-            self._forget(fut)
-            if cancel_on_timeout:
+            fut = self.submit(op, args, request_id=rid)
+            if tracker is not None and tracker.cancelled.is_set():
+                # The caller gave up while this request was being sent (e.g. during a respawn,
+                # when its cancel had nothing to reach): send it now. The stub remembers
+                # cancels for ops that have not registered yet.
                 self.cancel(rid)
-            self._raise_if_master_dead()
-            raise RemoteTimeout(f"{op} did not complete within {timeout}s", op=op) from e
-        except KeyboardInterrupt:
-            # The user interrupted a blocking call (e.g. Ctrl-C during `run`); make sure the
-            # remote process does not linger before the interrupt propagates.
-            self._forget(fut)
-            if cancel_on_timeout:
-                try:
+            try:
+                return fut.result(timeout=timeout)
+            except TimeoutError as e:
+                self._forget(fut)
+                if cancel_on_timeout:
                     self.cancel(rid)
-                except Exception:
-                    pass
-            raise
+                self._raise_if_master_dead()
+                raise RemoteTimeout(f"{op} did not complete within {timeout}s", op=op) from e
+            except KeyboardInterrupt:
+                # The user interrupted a blocking call (e.g. Ctrl-C during `run`); make sure the
+                # remote process does not linger before the interrupt propagates.
+                self._forget(fut)
+                if cancel_on_timeout:
+                    try:
+                        self.cancel(rid)
+                    except Exception:
+                        pass
+                raise
+        finally:
+            if tracker is not None:
+                tracker.discard(self, rid)
 
     def _forget(self, fut: Future[Any]) -> None:
         with self._lock:

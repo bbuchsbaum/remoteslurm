@@ -451,6 +451,7 @@ class Cluster(SlurmOps):
         queue_timeout: int = 600,
         detach: bool = False,
         log: str | None = None,
+        max_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Run a command on the login node (bounded output), or on a compute node with
         ``compute=True`` (via ``srun``), or in the background with ``detach=True``.
@@ -470,11 +471,14 @@ class Cluster(SlurmOps):
         ``queue_timeout`` bounds how long to wait for the allocation; the result is
         ``{started: true, rc, stdout, stderr, node, elapsed}`` for a run that got a node, or
         ``{started: false, reason}`` if it never left the queue. ``allow_run`` is enforced
-        exactly as for a login-node ``run``.
+        exactly as for a login-node ``run``. ``max_seconds`` refuses (``InvalidArgument``) a
+        compute run whose worst-case blocking time — ``queue_timeout`` + walltime + 30 s — would
+        exceed it (the MCP server passes its per-call limit).
 
         A login-node run returns about two seconds after its command exits, even when a
         background child still holds stdout/stderr (the result then has ``lingering: true`` and
-        a ``note``; the stub stops reading, so that child dies of SIGPIPE at its next write).
+        a ``note``; the child's further output is drained into ``lingering_log`` while the stub
+        session lives).
         For work that must outlive the call, use ``detach=True``: the command starts
         in its own session, detached from the stub and the ssh connection, with stdout+stderr
         appended to ``log`` (default: a new file under ``~/.cache/remoteslurm/procs``), and the
@@ -506,6 +510,7 @@ class Cluster(SlurmOps):
                 login=login,
                 max_output=max_output,
                 cancel_on_timeout=cancel_on_timeout,
+                max_seconds=max_seconds,
             )
         args: dict[str, Any] = {
             "cwd": cwd,
@@ -744,6 +749,7 @@ class Cluster(SlurmOps):
         login: bool,
         max_output: int,
         cancel_on_timeout: bool,
+        max_seconds: int | None = None,
     ) -> dict[str, Any]:
         res = self._resolve_compute_resources(
             template=template,
@@ -754,8 +760,23 @@ class Cluster(SlurmOps):
             gpus=gpus,
             account=account,
         )
-        walltime = slurm.walltime_to_seconds(res.get("time")) or 3600
+        parsed = slurm.walltime_to_seconds(res.get("time"))
+        walltime = parsed or 3600
         total = int(queue_timeout) + int(walltime) + 30
+        if max_seconds is not None and total > max_seconds:
+            if parsed:
+                given = f"walltime {walltime}s"
+            elif res.get("time"):
+                given = f"time {res['time']!r} (unparsed, budgeted as {walltime}s)"
+            else:
+                given = f"no time given, budgeted as {walltime}s"
+            room = max(1, max_seconds - 30)
+            raise InvalidArgument(
+                f"this compute run could block for up to {total}s (queue_timeout "
+                f"{queue_timeout}s + {given} + 30s), over this caller's {max_seconds}s limit",
+                action=f"pass time= and queue_timeout= that sum below {room}s, "
+                "or use submit (then wait/jobs) for longer work",
+            )
         args: dict[str, Any] = dict(res)
         args.update(
             {
