@@ -1,6 +1,7 @@
 # remoteslurm
 
-[Agent guide](docs/agent-guide.md) · [Changelog](CHANGELOG.md) ·
+[Codex skill](skills/remoteslurm/SKILL.md) · [Agent guide](docs/agent-guide.md) ·
+[Changelog](CHANGELOG.md) ·
 [Design notes](docs/plans/v2-plan.md) ·
 [Issues](https://github.com/bbuchsbaum/remoteslurm/issues)
 
