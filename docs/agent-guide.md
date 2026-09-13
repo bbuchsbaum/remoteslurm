@@ -22,6 +22,9 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
 - Submit with `submit`. Prefer a **template**: `submit(template="cpu", script=...)` fills in
   options and prepends the module-load/venv preamble. Give either `script` (content) or
   `path` (an existing remote script), never both.
+- Use `pack` for independent shell commands that should share one or more one-node allocations.
+  `max_processes` caps GNU Parallel children inside each allocation; `max_concurrent` separately
+  throttles array allocations. GNU Parallel must be available in the template's job environment.
 - Don't run heavy work through `run` — that's the login node. `run` is for quick checks
   (`squeue`, `ls`, `git`), and only when the host allows it.
 - For login-node work that must keep running after the call (a server, an install, a setup

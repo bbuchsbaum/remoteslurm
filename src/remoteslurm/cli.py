@@ -825,6 +825,52 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_pack(args: argparse.Namespace) -> int:
+    c = get_cluster(args)
+    if args.commands == "-":
+        commands = sys.stdin.read().splitlines()
+    else:
+        p = Path(args.commands).expanduser()
+        if not p.is_file():
+            raise InvalidArgument(f"command file does not exist: {p}")
+        commands = p.read_text().splitlines()
+    options: dict[str, Any] = {}
+    for kv in args.opt or []:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            options[k.replace("-", "_")] = v
+        else:
+            options[kv.replace("-", "_")] = True
+    if args.cpus is not None:
+        options["cpus_per_task"] = args.cpus
+    job = c.pack(
+        commands,
+        max_processes=args.max_processes,
+        batches=args.batches,
+        max_concurrent=args.max_concurrent,
+        dependency=args.dependency,
+        template=args.template,
+        name=args.name,
+        cwd=args.cwd,
+        **options,
+    )
+    rec = c.registry.get(job.job_id)
+    meta = (rec.meta.get("pack") if rec else None) or {}
+    st = job.status()
+    d = st.to_dict()
+    d.update(meta)
+    emit(
+        args,
+        d,
+        lambda d: print(
+            f"Submitted packed job {job.job_id} ({d.get('n')} commands, "
+            f"{d.get('batches')} allocation(s), up to {d.get('max_processes')} processes each)\n"
+            f"  commands: {d.get('commands_path')}\n  script: {d.get('script_path')}"
+        ),
+    )
+    return EXIT_OK
+
+
 def cmd_templates(args: argparse.Namespace) -> int:
     cfg = Config.load(Path(args.config) if getattr(args, "config", None) else None)
     host = cfg.host(args.host)
@@ -1737,6 +1783,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument(
         "--sbatch-arg", action="append", metavar="ARG", help="raw extra sbatch argument"
+    )
+
+    sp = add(
+        "pack",
+        cmd_pack,
+        "submit a command file packed onto one-node allocations with GNU Parallel",
+    )
+    sp.add_argument("commands", help="local command file (one shell command per line), or -")
+    sp.add_argument(
+        "-j",
+        "--max-processes",
+        type=int,
+        default=1,
+        help="maximum concurrent commands per allocation (default: 1)",
+    )
+    sp.add_argument(
+        "-b",
+        "--batches",
+        type=int,
+        default=1,
+        help="number of one-node array allocations (default: 1)",
+    )
+    sp.add_argument(
+        "--max-concurrent",
+        type=int,
+        help="cap simultaneously running array allocations",
+    )
+    sp.add_argument("-n", "--name", default="pack", help="job/array name (default: pack)")
+    sp.add_argument("--cwd", help="remote working directory for the commands")
+    sp.add_argument("--template", help="config template name (options + preamble)")
+    sp.add_argument(
+        "-c",
+        "--cpus",
+        type=int,
+        help="CPUs for each packed allocation (default: max-processes if otherwise unset)",
+    )
+    sp.add_argument("--dependency", metavar="SPEC", help="e.g. afterok:123")
+    sp.add_argument(
+        "-o", "--opt", action="append", metavar="KEY=VAL", help="any sbatch option, e.g. mem=8G"
     )
 
     sp = add(

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 SQUEUE_CACHE_SECONDS = 10.0
 ACCOUNTING_GRACE_SECONDS = 600.0  # how long after last sighting we report "accounting_pending"
 MAX_SWEEP_TASKS = 1000  # guard: refuse sweeps larger than a typical Slurm MaxArraySize
+MAX_PACK_BATCHES = 1000  # same scheduler-facing guard for packed command arrays
 LEARNED_NOTES_CAP = 50
 
 
@@ -214,6 +215,68 @@ def sweep_wrapper(
         _SWEEP_WRAPPER_TMPL.replace("__NAME__", safe_name)
         .replace("__PARAMS_Q__", shlex.quote(params_path))
         .replace("__BODY__", user)
+    )
+
+
+# --------------------------------------------------------------------------- packed commands
+def packed_commands(commands: list[str]) -> list[str]:
+    """Validate one-command-per-line input while preserving shell syntax and whitespace."""
+    if not isinstance(commands, (list, tuple)):
+        raise InvalidArgument("packed commands must be a list of shell command strings")
+    clean: list[str] = []
+    for command in commands:
+        if not isinstance(command, str):
+            raise InvalidArgument("every packed command must be a string")
+        if "\x00" in command or "\n" in command:
+            raise InvalidArgument("a packed command may not contain NUL or newline characters")
+        command = command.rstrip("\r")
+        if command.strip():
+            clean.append(command)
+    if not clean:
+        raise InvalidArgument("packed command list is empty")
+    return clean
+
+
+_PACK_WRAPPER_TMPL = r"""#!/bin/bash
+# remoteslurm packed-command wrapper (name=__NAME__). Each Slurm array task selects a
+# contiguous slice of the command file and runs at most RS_MAX_PROCESSES through GNU Parallel.
+set -o pipefail
+RS_COMMANDS=__COMMANDS_Q__
+RS_TOTAL=__TOTAL__
+RS_BATCHES=__BATCHES__
+RS_MAX_PROCESSES=__MAX_PROCESSES__
+RS_BATCH_ID="${SLURM_ARRAY_TASK_ID:-0}"
+case "$RS_BATCH_ID" in
+  ''|*[!0-9]*) echo "invalid SLURM_ARRAY_TASK_ID: $RS_BATCH_ID" >&2; exit 2 ;;
+esac
+if [ "$RS_BATCH_ID" -ge "$RS_BATCHES" ]; then
+  echo "SLURM_ARRAY_TASK_ID $RS_BATCH_ID is outside 0-$((RS_BATCHES - 1))" >&2
+  exit 2
+fi
+if ! command -v parallel >/dev/null 2>&1; then
+  echo "GNU Parallel is required for a remoteslurm packed job" >&2
+  exit 127
+fi
+RS_PER_BATCH=$(( (RS_TOTAL + RS_BATCHES - 1) / RS_BATCHES ))
+RS_START=$(( RS_BATCH_ID * RS_PER_BATCH + 1 ))
+RS_END=$(( RS_START + RS_PER_BATCH - 1 ))
+if [ "$RS_END" -gt "$RS_TOTAL" ]; then RS_END="$RS_TOTAL"; fi
+if [ "$RS_START" -gt "$RS_TOTAL" ]; then exit 0; fi
+sed -n "${RS_START},${RS_END}p" "$RS_COMMANDS" | parallel --jobs "$RS_MAX_PROCESSES"
+"""
+
+
+def pack_wrapper(
+    commands_path: str, name: str, *, total: int, batches: int, max_processes: int
+) -> str:
+    """Build a one-node packed-command array wrapper around a remote command file."""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:64] or "pack"
+    return (
+        _PACK_WRAPPER_TMPL.replace("__NAME__", safe_name)
+        .replace("__COMMANDS_Q__", shlex.quote(commands_path))
+        .replace("__TOTAL__", str(total))
+        .replace("__BATCHES__", str(batches))
+        .replace("__MAX_PROCESSES__", str(max_processes))
     )
 
 
@@ -989,7 +1052,108 @@ class SlurmOps:
         # single pass: each %X is replaced exactly once, from the original string
         return re.sub(r"%([AaJjxuN])", lambda m: mapping[m.group(1)], path)
 
-    # -- sweeps -------------------------------------------------------------------------------
+    # -- packed jobs / sweeps -----------------------------------------------------------------
+    def pack(
+        self,
+        commands: list[str],
+        *,
+        max_processes: int = 1,
+        batches: int = 1,
+        max_concurrent: int | None = None,
+        dependency: str | None = None,
+        template: str | None = None,
+        name: str = "pack",
+        cwd: str | None = None,
+        **options: Any,
+    ) -> Job:
+        """Submit independent shell commands packed onto one-node allocations.
+
+        Commands are stored remotely one per line. The job is an array of ``batches`` one-node,
+        one-task allocations; each array task takes a contiguous slice and runs GNU Parallel
+        with at most ``max_processes`` children. ``max_concurrent`` separately throttles how
+        many packed allocations Slurm may run at once. Unless host defaults, a template, or an
+        explicit option specifies CPUs per task, the allocation requests one CPU per concurrent
+        child. GNU Parallel must be available in the job environment.
+        """
+        clean = packed_commands(commands)
+        for label, value in (("max_processes", max_processes), ("batches", batches)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise InvalidArgument(f"{label} must be a positive integer")
+        if batches > len(clean):
+            raise InvalidArgument(
+                f"batches ({batches}) exceeds the number of commands ({len(clean)})",
+                action="reduce batches so every allocation receives at least one command",
+            )
+        if batches > MAX_PACK_BATCHES:
+            raise InvalidArgument(
+                f"packed job would create {batches} array tasks (limit {MAX_PACK_BATCHES})",
+                action="reduce batches or split the command list",
+            )
+        if max_concurrent is not None and (
+            isinstance(max_concurrent, bool)
+            or not isinstance(max_concurrent, int)
+            or max_concurrent <= 0
+        ):
+            raise InvalidArgument("max_concurrent must be a positive integer")
+
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:48] or "pack"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base_dir = (self.host.script_dir or "~/.remoteslurm/packs").rstrip("/")
+        pack_dir = f"{base_dir}/{safe}-{stamp}-{os.getpid()}"
+        written = self.write(f"{pack_dir}/commands.txt", "\n".join(clean) + "\n")
+        commands_path = written["path"]
+        wrapper = pack_wrapper(
+            commands_path,
+            name,
+            total=len(clean),
+            batches=batches,
+            max_processes=max_processes,
+        )
+        spec = f"0-{batches - 1}"
+        if max_concurrent is not None:
+            spec += f"%{max_concurrent}"
+
+        pack_options = dict(options)
+        known_options: dict[str, Any] = dict(self.host.defaults or {})
+        if template is not None:
+            known_options.update(self.host.resolve_template(template).options)
+        known_options.update(pack_options)
+        if "cpus_per_task" not in known_options and "cpus" not in known_options:
+            pack_options["cpus_per_task"] = max_processes
+        # Each array element is one allocation on one node. GNU Parallel, not Slurm task
+        # fan-out, owns concurrency inside it.
+        pack_options["nodes"] = 1
+        pack_options["ntasks"] = 1
+
+        job = self.submit(
+            script=wrapper,
+            name=name,
+            cwd=cwd,
+            template=template,
+            array=spec,
+            dependency=dependency,
+            **pack_options,
+        )
+        rec = self.registry.get(job.job_id)
+        if rec is not None:
+            meta = dict(rec.meta)
+            meta["pack"] = {
+                "commands_path": commands_path,
+                "n": len(clean),
+                "batches": batches,
+                "max_processes": max_processes,
+            }
+            self.registry.update(job.job_id, meta=meta)
+        self.registry.audit(
+            "pack",
+            job_id=job.job_id,
+            n=len(clean),
+            batches=batches,
+            max_processes=max_processes,
+            commands_path=commands_path,
+        )
+        return job
+
     def sweep(
         self,
         params: dict[str, list[Any]] | list[dict[str, Any]],

@@ -84,6 +84,30 @@ def test_put_get(cli_env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert rc == 0 and (dest / "a.txt").read_text() == "alpha\nbeta\ngamma\n"
 
 
+def test_pack_command_file(
+    cli_env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands = tmp_path / "commands.txt"
+    commands.write_text("echo one\necho two\necho three\n")
+
+    rc, out, _ = run(
+        capsys,
+        "--json",
+        "pack",
+        str(commands),
+        "--max-processes",
+        "2",
+        "--batches",
+        "2",
+    )
+    result = json.loads(out)
+
+    assert rc == 0
+    assert result["n"] == 3
+    assert result["batches"] == 2
+    assert result["max_processes"] == 2
+
+
 def test_errors_are_structured(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
     rc, out, err = run(capsys, "cat", "~/nope")
     assert rc == 1 and "error [not_found]" in err

@@ -102,6 +102,22 @@ rslurm watch 12345 --notify
 rslurm output 12345 -n 100
 ```
 
+Pack independent shell commands onto one or more one-node allocations with GNU Parallel. The two
+limits are intentionally separate: `--max-processes` controls concurrent processes inside each
+node, while `--max-concurrent` throttles the packed array allocations in Slurm.
+
+```bash
+# One allocation, at most 10 commands running on its node at once.
+rslurm pack commands.txt --template cpu --max-processes 10
+
+# Split the list across 4 allocations, run 10 processes per node, at most 2 nodes at once.
+rslurm pack commands.txt --template cpu --batches 4 --max-processes 10 --max-concurrent 2
+```
+
+Each nonblank line is a shell command. GNU Parallel must be available in the template's job
+environment. Unless the host, template, or `--cpus` specifies otherwise, each allocation requests
+one CPU per concurrent process.
+
 If the job fails or never starts, ask for an explanation instead of manually spelunking through
 scheduler records and log files:
 
@@ -118,7 +134,7 @@ bounded log tails into a verdict with concrete next steps.
 |---|---|
 | Inspect the remote workspace | `info`, `ls`, `cat`, `tail`, `grep`, `find`, `diff` |
 | Move or update work | `sync`, `put`, `get`, `edit` |
-| Run work through Slurm | `submit`, `sweep`, `run --compute` |
+| Run work through Slurm | `submit`, `pack`, `sweep`, `run --compute` |
 | Keep login-node work running | `run --detach`, `proc`, `wait --pid`/`--path` |
 | Observe jobs | `jobs`, `status`, `wait`, `watch`, `events` |
 | Understand or stop a job | `output`, `diagnose`, `cancel` |

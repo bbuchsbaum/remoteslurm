@@ -276,6 +276,36 @@ def test_sweep_wrapper_remote_path() -> None:
         jobs_mod.sweep_wrapper("/x/params.tsv", "s")  # neither body nor path
 
 
+def test_pack_wrapper_slices_commands_and_sets_process_cap(tmp_path: Path) -> None:
+    commands = tmp_path / "commands.txt"
+    commands.write_text("echo one\necho two\necho three\necho four\necho five\n")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    parallel = fakebin / "parallel"
+    parallel.write_text('#!/bin/sh\nprintf "parallel-%s\\n" "$2"\ncat\n')
+    parallel.chmod(0o755)
+    wrapper = jobs_mod.pack_wrapper(str(commands), "demo", total=5, batches=2, max_processes=3)
+    script = tmp_path / "pack.sh"
+    script.write_text(wrapper)
+    env = {"SLURM_ARRAY_TASK_ID": "1", "PATH": f"{fakebin}:/usr/bin:/bin"}
+
+    r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["parallel-3", "echo four", "echo five"]
+
+
+def test_packed_commands_validation() -> None:
+    assert jobs_mod.packed_commands(["echo one", "  ", "echo two\r"]) == [
+        "echo one",
+        "echo two",
+    ]
+    with pytest.raises(InvalidArgument):
+        jobs_mod.packed_commands([])
+    with pytest.raises(InvalidArgument):
+        jobs_mod.packed_commands(["echo one\necho two"])
+
+
 # --------------------------------------------------------------------------- sweeps (FakeSlurm)
 def test_sweep_submits_array_and_records_meta(make_cluster) -> None:
     c = make_cluster()
@@ -292,6 +322,39 @@ def test_sweep_submits_array_and_records_meta(make_cluster) -> None:
     tsv = c.read_text(rec.meta["sweep"]["params_path"])
     assert tsv.splitlines()[0] == "lr\tseed"
     assert len(tsv.splitlines()) == 7  # header + 6 rows
+
+
+def test_pack_submits_one_node_array_and_records_meta(make_cluster) -> None:
+    c = make_cluster()
+    job = c.pack(
+        ["echo one", "echo two", "echo three", "echo four"],
+        max_processes=2,
+        batches=2,
+        max_concurrent=1,
+        dependency="afterok:1000",
+        name="packed",
+    )
+    rec = c.registry.get(job.job_id)
+
+    assert rec.meta["array"] == "0-1%1"
+    assert rec.meta["dependency"] == "afterok:1000"
+    assert rec.meta["pack"]["n"] == 4
+    assert rec.meta["pack"]["batches"] == 2
+    assert rec.meta["pack"]["max_processes"] == 2
+    assert "--nodes=1" in rec.sbatch_args
+    assert "--ntasks=1" in rec.sbatch_args
+    assert "--cpus-per-task=2" in rec.sbatch_args
+    assert c.read_text(rec.meta["pack"]["commands_path"]).splitlines() == [
+        "echo one",
+        "echo two",
+        "echo three",
+        "echo four",
+    ]
+
+
+def test_pack_rejects_empty_allocations(cluster) -> None:
+    with pytest.raises(InvalidArgument):
+        cluster.pack(["echo one"], batches=2)
 
 
 def test_sweep_failed_task_params_surface(make_cluster) -> None:

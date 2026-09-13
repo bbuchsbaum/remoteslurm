@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added packed command jobs: `Cluster.pack`, `rslurm pack`, and the core MCP `pack` tool split a
+  command list across one-node array allocations and use GNU Parallel to enforce a per-node
+  process cap. A separate array throttle controls how many packed allocations run concurrently.
 - `run --compute` now passes `--ntasks=1` to `srun`, preventing clusters from inferring multiple
   tasks from a larger allocation and launching duplicate copies of the requested command.
 - MCP: cancelling a tool call (a client timeout or abort) now cancels the remote work it

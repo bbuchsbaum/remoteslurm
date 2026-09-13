@@ -26,6 +26,7 @@ CORE_EXPECTED = {
     "proc_tail",
     "proc_kill",
     "submit",
+    "pack",
     "jobs",
     "diagnose",
     "sync",
@@ -284,6 +285,21 @@ def test_submit_and_jobs(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) 
 def test_submit_invalid_arg(mcp_cluster: Cluster) -> None:
     r = call("submit")
     assert r["error"] == "invalid_arg"
+
+
+def test_pack_tool_submits_commands(mcp_cluster: Cluster) -> None:
+    r = call(
+        "pack",
+        commands=["echo one", "echo two", "echo three"],
+        max_processes=2,
+        batches=2,
+    )
+
+    assert r["job_id"]
+    assert r["n"] == 3
+    assert r["batches"] == 2
+    assert r["max_processes"] == 2
+    assert r["commands_path"].endswith("/commands.txt")
 
 
 def test_job_output_and_cancel(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> None:

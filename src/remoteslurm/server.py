@@ -52,6 +52,7 @@ CORE_TOOLS = {
     "proc_tail",
     "proc_kill",
     "submit",
+    "pack",
     "jobs",
     "diagnose",
     "sync",
@@ -561,6 +562,56 @@ async def sweep(
     return await _guard(host, f)
 
 
+async def pack(
+    commands: list[str],
+    max_processes: int = 1,
+    batches: int = 1,
+    max_concurrent: int | None = None,
+    dependency: str | None = None,
+    template: str | None = None,
+    name: str = "pack",
+    cwd: str | None = None,
+    options: dict[str, Any] | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Submit independent shell commands packed onto one-node allocations with GNU Parallel.
+
+    ``commands`` contains one shell command per item. Each of the ``batches`` Slurm array tasks
+    receives a contiguous slice and runs at most ``max_processes`` commands concurrently on its
+    node. ``max_concurrent`` separately caps simultaneously running array tasks. Resources come
+    from the host/template/``options``; when CPUs are unspecified, CPUs per task defaults to
+    ``max_processes``. Returns the job id and persistent remote command-file metadata.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        job = c.pack(
+            commands,
+            max_processes=max_processes,
+            batches=batches,
+            max_concurrent=max_concurrent,
+            dependency=dependency,
+            template=template,
+            name=name,
+            cwd=cwd,
+            **(options or {}),
+        )
+        rec = c.registry.get(job.job_id)
+        meta = (rec.meta.get("pack") if rec else None) or {}
+        st = job.status()
+        return {
+            "job_id": job.job_id,
+            "state": st.state,
+            "script_path": st.script_path,
+            "stdout_path": st.stdout_path,
+            "commands_path": meta.get("commands_path"),
+            "n": meta.get("n"),
+            "batches": meta.get("batches"),
+            "max_processes": meta.get("max_processes"),
+        }
+
+    return await _guard(host, f)
+
+
 async def jobs(
     job_id: str | None = None,
     refresh: bool = False,
@@ -931,6 +982,7 @@ ALL_TOOLS: dict[str, Any] = {
     "proc_tail": proc_tail,
     "proc_kill": proc_kill,
     "submit": submit,
+    "pack": pack,
     "sweep": sweep,
     "jobs": jobs,
     "diagnose": diagnose,
