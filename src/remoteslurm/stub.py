@@ -1243,7 +1243,11 @@ def op_run(args):
 
 def _srun_flags(args):
     """Build the ``srun`` option flags (no shell) from the resource args."""
-    flags = ["srun", "--quiet", "--unbuffered"]
+    # A compute run executes one command. Some sites infer the step task count from the whole
+    # allocation when it is omitted (for example, 192 CPUs with `-c 2` can become 96 tasks),
+    # duplicating the command once per inferred task. Pin the step to one task while `-c`
+    # continues to describe the CPUs assigned to that task.
+    flags = ["srun", "--quiet", "--unbuffered", "--ntasks=1"]
     part = args.get("partition")
     if part:
         flags += ["-p", str(part)]

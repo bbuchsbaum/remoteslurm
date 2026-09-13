@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `run --compute` now passes `--ntasks=1` to `srun`, preventing clusters from inferring multiple
+  tasks from a larger allocation and launching duplicate copies of the requested command.
 - MCP: cancelling a tool call (a client timeout or abort) now cancels the remote work it
   started — a login-node `run`, a `compute=True` srun (releasing its allocation), a `wait` —
   instead of leaving it to run out its own timeout; the stub also honours a cancel that arrives

@@ -13,6 +13,7 @@ import pytest
 from remoteslurm.cluster import Cluster
 from remoteslurm.config import HostConfig, Template
 from remoteslurm.session import Session
+from remoteslurm.stub import _srun_flags
 
 
 # --------------------------------------------------------------------------- helpers
@@ -93,6 +94,13 @@ def test_compute_queue_never_reports_not_started(make_cluster: Callable[..., Clu
 
 
 # --------------------------------------------------------------------------- resource resolution
+def test_compute_srun_requests_one_task() -> None:
+    flags = _srun_flags({"cpus": 2})
+
+    assert "--ntasks=1" in flags
+    assert flags[flags.index("-c") + 1] == "2"
+
+
 def test_resolve_compute_resources_template_then_kwargs() -> None:
     tmpl = Template(
         name="cpu",
