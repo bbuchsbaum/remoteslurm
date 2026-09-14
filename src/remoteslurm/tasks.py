@@ -77,8 +77,10 @@ def _command(value: Any) -> tuple[list[str], int]:
         timeout = value.get("timeout", timeout)
     else:
         command = value
-    if not isinstance(command, list) or not command or not all(
-        isinstance(part, str) and part for part in command
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(part, str) and part for part in command)
     ):
         raise InvalidArgument("validate must be a non-empty argv array, not a shell string")
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3600:

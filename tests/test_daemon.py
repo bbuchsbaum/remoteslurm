@@ -93,9 +93,7 @@ def test_no_daemon_env_bypasses(daemon_env: Path, monkeypatch: pytest.MonkeyPatc
     assert daemon.connect_via_daemon("fake", Config.load(), autostart=False) is None
 
 
-def test_stale_daemon_build_is_rejected(
-    daemon_env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_stale_daemon_build_is_rejected(daemon_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         daemon,
         "daemon_status",

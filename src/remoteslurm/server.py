@@ -535,9 +535,7 @@ async def ensure(
     from .tasks import TaskSpec
 
     def f(c: Cluster) -> dict[str, Any]:
-        return c.ensure(
-            TaskSpec.from_mapping(manifest), retry=retry, retry_unknown=retry_unknown
-        )
+        return c.ensure(TaskSpec.from_mapping(manifest), retry=retry, retry_unknown=retry_unknown)
 
     selected_host = host or manifest.get("host")
     return await _guard(selected_host, f)

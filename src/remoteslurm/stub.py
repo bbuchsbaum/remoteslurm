@@ -52,6 +52,8 @@ def _stub_sha():
             return hashlib.sha256(f.read()).hexdigest()[:16]
     except OSError:
         return None
+
+
 # Two pools so a long `run` (slow) can never queue behind a `ping`/`ls` (fast). Only the
 # escape-hatch ops that spawn a genuinely long-lived subprocess go to the slow pool; they
 # register their Popen so `cancel` can reach them. Everything else (including the short,
@@ -2278,9 +2280,7 @@ def op_task_fingerprint(args):
         base = _path(base, must_exist=True)
     return {
         "files": [
-            _fingerprint_file(
-                p, required=required, hash_content=hash_content, base=base
-            )
+            _fingerprint_file(p, required=required, hash_content=hash_content, base=base)
             for p in paths
         ]
     }

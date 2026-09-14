@@ -305,6 +305,8 @@ uv run --no-sync pytest -q tests/live
 
 You may instead provide `REMOTESLURM_LIVE_PARTITION`, `REMOTESLURM_LIVE_TIME`, or
 `REMOTESLURM_LIVE_CWD`. Omitted values fall back to configured or scheduler defaults.
+The durable-task live test runs when `REMOTESLURM_LIVE_CWD` is set, creates an isolated
+subdirectory there, and removes both its outputs and remote task record after validation.
 
 ## License
 
