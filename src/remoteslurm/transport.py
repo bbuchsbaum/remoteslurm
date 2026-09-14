@@ -337,7 +337,7 @@ def process_age(pid: int) -> int | None:
         r = subprocess.run(
             ["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, timeout=5
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, OSError):
         return None
     if r.returncode != 0:
         return None

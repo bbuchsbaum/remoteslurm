@@ -561,6 +561,16 @@ def test_parse_etime(text: str, secs: int | None) -> None:
     assert parse_etime(text) == secs
 
 
+def test_process_age_tolerates_sandbox_denial(monkeypatch: pytest.MonkeyPatch) -> None:
+    from remoteslurm import transport
+
+    def denied(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError(1, "Operation not permitted", "ps")
+
+    monkeypatch.setattr(transport.subprocess, "run", denied)
+    assert transport.process_age(4242) is None
+
+
 def test_parse_duration_and_session_lifetime_validation() -> None:
     from remoteslurm.config import HostConfig, parse_duration
     from remoteslurm.errors import ConfigError
