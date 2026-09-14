@@ -47,6 +47,18 @@ SACCT_FIELDS = [
     "User",
 ]
 
+SSTAT_USAGE_FIELDS = ["JobID", "AllocTRES", "NTasks", "AveCPU", "AveRSS", "MaxRSS", "Pids"]
+SACCT_USAGE_FIELDS = [
+    "JobID",
+    "State",
+    "AllocCPUS",
+    "NTasks",
+    "Elapsed",
+    "TotalCPU",
+    "AveRSS",
+    "MaxRSS",
+]
+
 ACTIVE_STATES = {
     "PENDING",
     "RUNNING",
@@ -349,6 +361,35 @@ def walltime_to_seconds(spec: str | int | None) -> int | None:
     return days * 86400 + h * 3600 + m * 60 + sec
 
 
+def accounting_time_to_seconds(spec: str | None) -> float | None:
+    """Parse an ``sstat``/``sacct`` CPU-time value, including fractional seconds."""
+    if spec is None:
+        return None
+    text = str(spec).strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        day_text, _, text = text.partition("-")
+        if not day_text.isdigit():
+            return None
+        days = int(day_text)
+    parts = text.split(":")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError:
+        return None
+    if len(values) == 3:
+        hours, minutes, seconds = values
+    elif len(values) == 2:
+        hours, minutes, seconds = 0.0, values[0], values[1]
+    elif len(values) == 1:
+        hours, minutes, seconds = 0.0, 0.0, values[0]
+    else:
+        return None
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
 def _parse_mem(s: str) -> int | None:
     """'15848K' -> bytes; '' -> None."""
     s = s.strip()
@@ -359,6 +400,124 @@ def _parse_mem(s: str) -> int | None:
         return None
     mult = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
     return int(float(m.group(1)) * mult[m.group(2).upper()])
+
+
+def _parse_int(value: str | None) -> int | None:
+    try:
+        return int(str(value)) if value not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def _allocated_cpus(tres: str) -> int | None:
+    match = re.search(r"(?:^|,)cpu=(\d+)(?:,|$)", tres or "", re.I)
+    return int(match.group(1)) if match else None
+
+
+def _usage_derived(
+    *,
+    source: str,
+    job_step: str,
+    allocated_cpus: int | None,
+    slurm_tasks: int | None,
+    elapsed_raw: str | None,
+    cpu_time_raw: str | None,
+    cpu_time_is_average: bool,
+    ave_rss_raw: str | None,
+    max_rss_raw: str | None,
+    pids_raw: str | None = None,
+) -> dict[str, Any]:
+    """Normalize live and terminal accounting rows into one usage schema."""
+    tasks = slurm_tasks or 1
+    elapsed_seconds = accounting_time_to_seconds(elapsed_raw)
+    cpu_value = accounting_time_to_seconds(cpu_time_raw)
+    cpu_seconds = cpu_value * tasks if cpu_value is not None and cpu_time_is_average else cpu_value
+    effective_cpus = None
+    utilization = None
+    if cpu_seconds is not None and elapsed_seconds and elapsed_seconds > 0:
+        effective_cpus = cpu_seconds / elapsed_seconds
+        if allocated_cpus and allocated_cpus > 0:
+            utilization = 100.0 * effective_cpus / allocated_cpus
+    pids = {
+        pid.strip() for pid in (pids_raw or "").split(",") if pid.strip() and pid.strip().isdigit()
+    }
+    ave_rss = _parse_mem(ave_rss_raw or "")
+    result: dict[str, Any] = {
+        "available": True,
+        "source": source,
+        "job_step": job_step,
+        "allocated_cpus": allocated_cpus,
+        "slurm_tasks": slurm_tasks,
+        "elapsed": elapsed_raw,
+        "elapsed_seconds": elapsed_seconds,
+        "cpu_time": cpu_time_raw,
+        "cpu_time_seconds": cpu_seconds,
+        "effective_cpus": round(effective_cpus, 2) if effective_cpus is not None else None,
+        "cpu_utilization_percent": round(utilization, 1) if utilization is not None else None,
+        "ave_rss_bytes": ave_rss,
+        "estimated_total_rss_bytes": ave_rss * tasks if ave_rss is not None else None,
+        "max_rss_bytes": _parse_mem(max_rss_raw or ""),
+    }
+    if source == "sstat" and pids_raw not in (None, ""):
+        result["live_pids"] = len(pids)
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def parse_sstat_usage(
+    stdout: str, *, elapsed: str | None = None, allocated_cpus: int | None = None
+) -> dict[str, Any] | None:
+    """Parse one live batch-step sample produced with :data:`SSTAT_USAGE_FIELDS`."""
+    rows = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < len(SSTAT_USAGE_FIELDS):
+            parts += [""] * (len(SSTAT_USAGE_FIELDS) - len(parts))
+        rows.append(dict(zip([f.lower() for f in SSTAT_USAGE_FIELDS], parts, strict=False)))
+    if not rows:
+        return None
+    row = next((item for item in rows if item["jobid"].endswith(".batch")), rows[0])
+    return _usage_derived(
+        source="sstat",
+        job_step=row["jobid"],
+        allocated_cpus=_allocated_cpus(row["alloctres"]) or allocated_cpus,
+        slurm_tasks=_parse_int(row["ntasks"]),
+        elapsed_raw=elapsed,
+        cpu_time_raw=row["avecpu"] or None,
+        cpu_time_is_average=True,
+        ave_rss_raw=row["averss"] or None,
+        max_rss_raw=row["maxrss"] or None,
+        pids_raw=row["pids"],
+    )
+
+
+def parse_sacct_usage(stdout: str, job_id: str) -> dict[str, Any] | None:
+    """Parse terminal allocation and batch-step accounting into the live-usage schema."""
+    rows: list[dict[str, str]] = []
+    fields = [f.lower() for f in SACCT_USAGE_FIELDS]
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < len(fields):
+            parts += [""] * (len(fields) - len(parts))
+        rows.append(dict(zip(fields, parts, strict=False)))
+    if not rows:
+        return None
+    allocation = next((row for row in rows if row["jobid"] == job_id), rows[0])
+    batch = next((row for row in rows if row["jobid"] == job_id + ".batch"), allocation)
+    return _usage_derived(
+        source="sacct",
+        job_step=batch["jobid"],
+        allocated_cpus=_parse_int(allocation["alloccpus"] or batch["alloccpus"]),
+        slurm_tasks=_parse_int(batch["ntasks"]),
+        elapsed_raw=allocation["elapsed"] or batch["elapsed"] or None,
+        cpu_time_raw=allocation["totalcpu"] or batch["totalcpu"] or None,
+        cpu_time_is_average=False,
+        ave_rss_raw=batch["averss"] or allocation["averss"] or None,
+        max_rss_raw=batch["maxrss"] or allocation["maxrss"] or None,
+    )
 
 
 def parse_sacct(stdout: str) -> dict[str, dict[str, Any]]:
@@ -731,6 +890,9 @@ class JobStatus:
     registry_available: bool | None = None
     registry_error: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    allocated_cpus: int | None = None
+    usage: dict[str, Any] | None = None
+    progress: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

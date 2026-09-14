@@ -10,7 +10,7 @@ import re
 import shlex
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -37,6 +37,53 @@ ACCOUNTING_GRACE_SECONDS = 600.0  # how long after last sighting we report "acco
 MAX_SWEEP_TASKS = 1000  # guard: refuse sweeps larger than a typical Slurm MaxArraySize
 MAX_PACK_BATCHES = 1000  # same scheduler-facing guard for packed command arrays
 LEARNED_NOTES_CAP = 50
+
+
+def normalize_progress_spec(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Validate a bounded, declarative progress observer for a submitted job."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise InvalidArgument("progress must be a table")
+    data = dict(value)
+    allowed = {"kind", "path", "pattern", "total", "max_depth", "max_scan", "hidden"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise InvalidArgument(f"progress contains unknown keys: {sorted(unknown)}")
+    kind = data.get("kind", "file_count")
+    if kind != "file_count":
+        raise InvalidArgument("progress kind must be 'file_count'")
+    path = data.get("path")
+    pattern = data.get("pattern", "*")
+    total = data.get("total")
+    max_depth = data.get("max_depth", 10)
+    max_scan = data.get("max_scan", 1_000_000)
+    hidden = data.get("hidden", False)
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise InvalidArgument("progress path must be non-empty text without NUL")
+    if not isinstance(pattern, str) or not pattern or "\x00" in pattern:
+        raise InvalidArgument("progress pattern must be non-empty text without NUL")
+    if isinstance(total, bool) or not isinstance(total, int) or total <= 0:
+        raise InvalidArgument("progress total must be a positive integer")
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or not 0 <= max_depth <= 100:
+        raise InvalidArgument("progress max_depth must be an integer from 0 to 100")
+    if (
+        isinstance(max_scan, bool)
+        or not isinstance(max_scan, int)
+        or not 1 <= max_scan <= 10_000_000
+    ):
+        raise InvalidArgument("progress max_scan must be an integer from 1 to 10000000")
+    if not isinstance(hidden, bool):
+        raise InvalidArgument("progress hidden must be true or false")
+    return {
+        "kind": kind,
+        "path": path,
+        "pattern": pattern,
+        "total": total,
+        "max_depth": max_depth,
+        "max_scan": max_scan,
+        "hidden": hidden,
+    }
 
 
 def _slurm_timestamp(value: str | None) -> float:
@@ -508,7 +555,9 @@ class Job:
     def __repr__(self) -> str:
         return f"Job({self.job_id!r} on {self.cluster.host.name!r})"
 
-    def status(self, refresh: bool = False) -> slurm.JobStatus:
+    def status(self, refresh: bool = False, *, usage: bool = False) -> slurm.JobStatus:
+        if usage:
+            return self.cluster.job_status(self.job_id, refresh=refresh, usage=True)
         return self.cluster.job_status(self.job_id, refresh=refresh)
 
     def wait(self, *, poll: float = 15.0, timeout: float | None = None) -> slurm.JobStatus:
@@ -620,6 +669,7 @@ class SlurmOps:
         force_preamble: bool = False,
         array: str | None = None,
         dependency: str | None = None,
+        progress: Mapping[str, Any] | None = None,
         **options: Any,
     ) -> Job:
         """Submit a batch job.
@@ -641,6 +691,7 @@ class SlurmOps:
         """
         if (script is None) == (path is None):
             raise InvalidArgument("provide exactly one of script= or path=")
+        progress_spec = normalize_progress_spec(progress)
         # Refuse before the remote side effect if the local recovery handle cannot be persisted.
         self.registry.preflight()
         opts: dict[str, Any] = dict(self.host.defaults or {})
@@ -700,6 +751,7 @@ class SlurmOps:
                 "options": dict(opts),
                 "array": array,
                 "dependency": dependency,
+                "progress": progress_spec,
             },
         )
         # Fill in stdout/stderr/workdir from scontrol (best effort; job may be gone already).
@@ -840,6 +892,134 @@ class SlurmOps:
             raise SlurmError("sacct failed: " + res["stderr"].strip(), rc=res["rc"])
         return slurm.parse_sacct(res["stdout"])
 
+    def _accounting_usage(self, job_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        res = self.call(
+            "sacct",
+            _timeout=180,
+            fields=slurm.SACCT_USAGE_FIELDS,
+            jobs=[job_id],
+            all_steps=True,
+        )
+        if res["rc"] != 0:
+            return None, res.get("stderr", "").strip() or "sacct failed"
+        return slurm.parse_sacct_usage(res.get("stdout", ""), job_id), None
+
+    def job_usage(self, status: slurm.JobStatus) -> dict[str, Any]:
+        """Sample normalized resource telemetry for one batch job.
+
+        Running jobs prefer ``sstat`` and fall back to ``sacct`` when the site's accounting
+        plugin exposes live records there. Terminal jobs use ``sacct``. This method is opt-in
+        because ``sstat`` contacts Slurm's controller and must not be polled aggressively.
+        """
+        sampled_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        if (status.extra or {}).get("array"):
+            return {
+                "available": False,
+                "sampled_at": sampled_at,
+                "reason": "usage sampling requires a single job or array task id",
+            }
+        error: str | None = None
+        usage: dict[str, Any] | None = None
+        if not status.terminal and status.state == "RUNNING":
+            step_id = status.job_id + ".batch"
+            try:
+                res = self.call(
+                    "sstat",
+                    fields=slurm.SSTAT_USAGE_FIELDS,
+                    jobs=[step_id],
+                    _timeout=60,
+                )
+                if res["rc"] == 0:
+                    usage = slurm.parse_sstat_usage(
+                        res.get("stdout", ""),
+                        elapsed=status.elapsed,
+                        allocated_cpus=status.allocated_cpus,
+                    )
+                else:
+                    error = res.get("stderr", "").strip() or "sstat failed"
+            except RemoteSlurmError as exc:
+                error = exc.message
+            if usage is None:
+                try:
+                    usage, accounting_error = self._accounting_usage(status.job_id)
+                    error = accounting_error or error
+                except RemoteSlurmError as exc:
+                    error = error or exc.message
+            if usage is not None and usage.get("allocated_cpus") is None:
+                try:
+                    raw_cpus = self.scontrol_job(status.job_id).get("NumCPUs")
+                    allocated_cpus = int(raw_cpus) if raw_cpus else None
+                    if allocated_cpus is not None:
+                        usage["allocated_cpus"] = allocated_cpus
+                        cpu_seconds = usage.get("cpu_time_seconds")
+                        elapsed_seconds = usage.get("elapsed_seconds")
+                        if cpu_seconds is not None and elapsed_seconds and allocated_cpus > 0:
+                            usage["cpu_utilization_percent"] = round(
+                                100.0
+                                * float(cpu_seconds)
+                                / float(elapsed_seconds)
+                                / allocated_cpus,
+                                1,
+                            )
+                except (RemoteSlurmError, ValueError):
+                    pass
+        elif status.terminal:
+            try:
+                usage, error = self._accounting_usage(status.job_id)
+            except RemoteSlurmError as exc:
+                error = exc.message
+        else:
+            return {
+                "available": False,
+                "sampled_at": sampled_at,
+                "reason": "job has not started",
+            }
+        if usage is None:
+            return {
+                "available": False,
+                "sampled_at": sampled_at,
+                "reason": error or "Slurm returned no resource telemetry",
+            }
+        usage["sampled_at"] = sampled_at
+        return usage
+
+    def job_progress(
+        self, progress: Mapping[str, Any], *, base: str | None = None
+    ) -> dict[str, Any]:
+        """Evaluate one declared file-count progress observer on the remote filesystem."""
+        spec = normalize_progress_spec(progress)
+        assert spec is not None
+        sampled_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            result = self.call(
+                "progress_count",
+                path=spec["path"],
+                base=base,
+                pattern=spec["pattern"],
+                max_depth=spec["max_depth"],
+                max_scan=spec["max_scan"],
+                hidden=spec["hidden"],
+                _timeout=300,
+            )
+        except RemoteSlurmError as exc:
+            return {
+                "available": False,
+                "sampled_at": sampled_at,
+                "kind": spec["kind"],
+                "reason": exc.message,
+            }
+        observed = int(result.get("observed", 0))
+        total = spec["total"]
+        result.update(
+            available=not bool(result.get("truncated")),
+            total=total,
+            percent=round(100.0 * observed / total, 1),
+            sampled_at=sampled_at,
+        )
+        if result.get("truncated"):
+            result["reason"] = "progress scan limit reached; observed is a lower bound"
+        return result
+
     def scontrol_job(self, job_id: str) -> dict[str, str]:
         base, _ = slurm.parse_job_id(job_id)
         res = self.call("scontrol", what="job", id=job_id if "_" in job_id else base)
@@ -861,6 +1041,8 @@ class SlurmOps:
         job_id: str,
         *,
         refresh: bool = False,
+        usage: bool = False,
+        progress: Mapping[str, Any] | None = None,
         _reset_registry_error: bool = True,
     ) -> slurm.JobStatus:
         """Merge squeue -> scontrol -> sacct -> registry into one status record.
@@ -877,7 +1059,17 @@ class SlurmOps:
 
         all_rows = self.squeue(refresh=refresh)
         if task is None and self._is_array(base, all_rows, rec):
-            return self._mark_registry_status(self._array_status(base, all_rows))
+            status = self._array_status(base, all_rows)
+            if usage:
+                status.usage = self.job_usage(status)
+                progress_spec = progress
+                if progress_spec is None and rec is not None:
+                    stored_progress = rec.meta.get("progress")
+                    if isinstance(stored_progress, Mapping):
+                        progress_spec = stored_progress
+                if progress_spec is not None:
+                    status.progress = self.job_progress(progress_spec, base=status.workdir)
+            return self._mark_registry_status(status)
 
         rows = [r for r in all_rows if r["job_id"] == job_id]
         if not rows and refresh:
@@ -984,6 +1176,17 @@ class SlurmOps:
                     if params is not None:
                         st.extra["params"] = params
         st.terminal = slurm.is_terminal(st.state) and not st.accounting_pending
+        if usage:
+            st.usage = self.job_usage(st)
+            if st.usage.get("allocated_cpus") is not None:
+                st.allocated_cpus = int(st.usage["allocated_cpus"])
+            progress_spec = progress
+            if progress_spec is None and rec is not None:
+                stored_progress = rec.meta.get("progress")
+                if isinstance(stored_progress, Mapping):
+                    progress_spec = stored_progress
+            if progress_spec is not None:
+                st.progress = self.job_progress(progress_spec, base=st.workdir)
         return self._mark_registry_status(st)
 
     # -- arrays -------------------------------------------------------------------------------

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `status --usage`, rate-limited `watch --usage`, Python job status, and MCP `jobs` can now
+  normalize running `sstat` and terminal `sacct` telemetry: allocated CPUs, live PIDs, CPU time,
+  effective CPU use, utilization, and RSS. Submissions and durable task manifests can declare a
+  bounded file-count progress observer, kept separate from completion and output validation.
+  Durable verification also allows a bounded 30-second shared-filesystem metadata settling period
+  after Slurm reports completion before declaring required outputs missing.
 - Generated batch wrappers now default to `~/.remoteslurm/scripts` independently of the requested
   working directory. A submission with `--cwd` set to a clean Git checkout therefore no longer
   creates an untracked `.remoteslurm/scripts/...` file that can fail reproducibility checks.

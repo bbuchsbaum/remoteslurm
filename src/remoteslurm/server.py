@@ -491,6 +491,7 @@ async def submit(
     template: str | None = None,
     force_preamble: bool = False,
     host: str | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Submit a batch job with sbatch. Give exactly one of ``script`` (content) or ``path``.
 
@@ -513,6 +514,7 @@ async def submit(
             args=args,
             template=template,
             force_preamble=force_preamble,
+            progress=progress,
             **(options or {}),
         )
         status = _submitted_status(job)
@@ -677,12 +679,17 @@ async def jobs(
     refresh: bool = False,
     include_finished: bool = True,
     host: str | None = None,
+    usage: bool = False,
+    progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Job status. With ``job_id``: one merged record (squeue/sacct/scontrol/local registry).
 
     Without it: ``{"jobs": [...], "count": n}`` covering your live queue plus jobs submitted
     through remoteslurm (finished ones too unless ``include_finished=False``). Each record has
     ``state``, ``terminal`` (done?), ``exit_code``, ``reason``, ``elapsed``, paths.
+    With one ``job_id``, ``usage=True`` samples normalized ``sstat`` telemetry while running and
+    ``sacct`` after completion. A declared ``progress`` file-count table is sampled at the same
+    time; submit can persist that table so later usage queries recover it automatically.
     squeue is cached ~10 s; ``refresh=True`` bypasses the cache. A job array is one record
     keyed by its base id, with an ``extra`` block (``tasks`` counts, ``failed_tasks``,
     ``task_states``); pass a task id (``123_4``) for a single task.
@@ -690,6 +697,10 @@ async def jobs(
 
     def f(c: Cluster) -> dict[str, Any]:
         if job_id:
+            if usage or progress is not None:
+                return c.job_status(
+                    job_id, refresh=refresh, usage=True, progress=progress
+                ).to_dict()
             return c.job_status(job_id, refresh=refresh).to_dict()
         lst = c.jobs(include_finished=include_finished, refresh=refresh)
         result: dict[str, Any] = {

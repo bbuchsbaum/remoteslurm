@@ -730,6 +730,65 @@ def cmd_projects(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _progress_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
+    path = getattr(args, "progress_path", None)
+    total = getattr(args, "progress_total", None)
+    pattern = getattr(args, "progress_pattern", "*")
+    max_depth = getattr(args, "progress_max_depth", 10)
+    if path is None:
+        if total is not None or pattern != "*" or max_depth != 10:
+            raise InvalidArgument("--progress-path is required with other progress options")
+        return None
+    if total is None:
+        raise InvalidArgument("--progress-total is required with --progress-path")
+    return {
+        "kind": "file_count",
+        "path": path,
+        "pattern": pattern,
+        "total": total,
+        "max_depth": max_depth,
+    }
+
+
+def _print_observation(data: dict[str, Any], *, prefix: str | None = None) -> None:
+    usage = data.get("usage") or {}
+    progress = data.get("progress") or {}
+    lead = (prefix + "  ") if prefix else "  "
+    if usage:
+        if usage.get("available"):
+            parts = []
+            if usage.get("live_pids") is not None:
+                parts.append(f"{usage['live_pids']} live PIDs")
+            if usage.get("cpu_time"):
+                parts.append(f"CPU {usage['cpu_time']}")
+            if usage.get("effective_cpus") is not None:
+                parts.append(f"{usage['effective_cpus']} effective CPUs")
+            if usage.get("cpu_utilization_percent") is not None:
+                parts.append(f"{usage['cpu_utilization_percent']}% allocated CPU")
+            rss = usage.get("estimated_total_rss_bytes")
+            if rss is not None:
+                parts.append(f"RSS {fmt_size(rss)}")
+            if parts:
+                print(lead + "usage       " + ", ".join(parts))
+            if usage.get("sampled_at"):
+                print(lead + f"usage source {usage.get('source')} at {usage['sampled_at']}")
+        else:
+            print(lead + "usage       unavailable: " + str(usage.get("reason", "no data")))
+    if progress:
+        if not progress.get("available") and not progress.get("truncated"):
+            print(lead + "progress    unavailable: " + str(progress.get("reason", "no data")))
+            return
+        observed = progress.get("observed", 0)
+        total = progress.get("total")
+        percent = progress.get("percent")
+        value = f"{observed}/{total}" if total is not None else str(observed)
+        if percent is not None:
+            value += f" ({percent}%)"
+        if progress.get("truncated"):
+            value += " lower bound"
+        print(lead + f"progress    {value} files at {progress.get('path')}")
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     c = get_cluster(args)
     options: dict[str, Any] = {}
@@ -771,6 +830,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         force_preamble=args.force_preamble,
         array=args.array,
         dependency=args.dependency,
+        progress=_progress_from_args(args),
         **options,
     )
     d = _submitted_status(job)
@@ -818,6 +878,8 @@ def cmd_ensure(args: argparse.Namespace) -> int:
         print(f"{state} {str(data.get('task_id', ''))[:16]}{job}")
         if data.get("reason"):
             print(f"  {data['reason']}")
+        if data.get("scheduler"):
+            _print_observation(data["scheduler"])
         for output in data.get("outputs") or []:
             print(f"  {output['path']}  sha256:{output['sha256'][:16]}")
         if data.get("action"):
@@ -1131,7 +1193,12 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     c = get_cluster(args)
-    out = [c.job_status(j, refresh=True).to_dict() for j in args.job_id]
+    progress = _progress_from_args(args)
+    observe = bool(getattr(args, "usage", False) or progress is not None)
+    out = [
+        c.job_status(j, refresh=True, usage=observe, progress=progress).to_dict()
+        for j in args.job_id
+    ]
 
     def human(rows: list[dict[str, Any]]) -> None:
         for d in rows:
@@ -1154,12 +1221,14 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "start_time",
                 "end_time",
                 "max_rss",
+                "allocated_cpus",
                 "stdout_path",
                 "script_path",
             ):
                 if d.get(k) is not None:
                     v = fmt_size(d[k]) if k == "max_rss" else d[k]
                     print(f"  {k:12} {v}")
+            _print_observation(d)
             if extra.get("params"):
                 print(
                     f"  {'params':12} " + " ".join(f"{k}={v}" for k, v in extra["params"].items())
@@ -1549,7 +1618,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
     for j in ids:
         slurm.parse_job_id(j)
     poll = max(2.0, args.poll)
+    usage_enabled = bool(getattr(args, "usage", False))
+    usage_interval = float(getattr(args, "usage_interval", 60.0))
+    if usage_enabled and usage_interval < 60:
+        raise InvalidArgument("--usage-interval must be at least 60 seconds")
+    progress = _progress_from_args(args)
+    usage_enabled = usage_enabled or progress is not None
     last_state: dict[str, str] = {}
+    last_usage: dict[str, float] = {}
     done: dict[str, Any] = {}
     t0 = time.time()
     all_ok = True
@@ -1558,18 +1634,28 @@ def cmd_watch(args: argparse.Namespace) -> int:
             for j in ids:
                 if j in done:
                     continue
-                st = c.job_status(j, refresh=True)
+                now = time.monotonic()
+                sample_usage = usage_enabled and (
+                    j not in last_usage or now - last_usage[j] >= usage_interval
+                )
+                st = c.job_status(j, refresh=True, usage=sample_usage, progress=progress)
+                if sample_usage:
+                    last_usage[j] = now
                 prev = last_state.get(j)
+                stamp = time.strftime("%H:%M:%S")
                 if st.state != prev:
-                    stamp = time.strftime("%H:%M:%S")
                     extra = f" ({st.reason})" if st.reason else ""
                     if not args.json:
                         print(f"{stamp}  {j}: {prev or '-'} -> {st.state}{extra}")
                     last_state[j] = st.state
+                if sample_usage and not args.json:
+                    _print_observation(st.to_dict(), prefix=f"{stamp}  {j}")
                 # A job unknown to squeue/scontrol/sacct (bad id, or aged past the accounting
                 # grace) is never terminal — stop watching it instead of polling forever.
                 finished = st.terminal or st.source == "unknown"
                 if finished:
+                    if usage_enabled and not sample_usage:
+                        st = c.job_status(j, refresh=True, usage=True, progress=progress)
                     done[j] = st
                     ev = {
                         "t": time.time(),
@@ -1707,6 +1793,28 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help, description=help, parents=[common], **kw)
         sp.set_defaults(func=fn)
         return sp
+
+    def add_progress_options(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument(
+            "--progress-path",
+            help="remote directory whose matching files represent completed work units",
+        )
+        sp.add_argument(
+            "--progress-total",
+            type=int,
+            help="expected number of progress files (required with --progress-path)",
+        )
+        sp.add_argument(
+            "--progress-pattern",
+            default="*",
+            help="file glob below --progress-path (default: *)",
+        )
+        sp.add_argument(
+            "--progress-max-depth",
+            type=int,
+            default=10,
+            help="maximum directory depth scanned for progress files (default: 10)",
+        )
 
     sp = add("connect", cmd_connect, "establish the persistent ssh connection (do MFA once)")
     sp.add_argument("host_name", nargs="?")
@@ -1904,6 +2012,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--sbatch-arg", action="append", metavar="ARG", help="raw extra sbatch argument"
     )
+    add_progress_options(sp)
 
     sp = add("adopt", cmd_adopt, "reconstruct local history for an existing Slurm job")
     sp.add_argument("job_id")
@@ -1995,6 +2104,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("status", cmd_status, "detailed status of job(s)")
     sp.add_argument("job_id", nargs="+")
     sp.add_argument("--tasks", action="store_true", help="for an array, list every task's state")
+    sp.add_argument(
+        "--usage",
+        action="store_true",
+        help="sample normalized CPU, process and memory telemetry (single jobs/tasks)",
+    )
+    add_progress_options(sp)
 
     sp = add(
         "wait",
@@ -2078,6 +2193,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--notify", action="store_true", help="desktop notification on each finish")
     sp.add_argument("--poll", type=float, default=30.0, help="seconds between polls (default 30)")
     sp.add_argument("--timeout", type=float, help="give up after this many seconds")
+    sp.add_argument(
+        "--usage",
+        action="store_true",
+        help="sample normalized CPU, process and memory telemetry while watching",
+    )
+    sp.add_argument(
+        "--usage-interval",
+        type=float,
+        default=60.0,
+        help="seconds between Slurm usage samples; minimum/default 60",
+    )
+    add_progress_options(sp)
 
     sp = add("events", cmd_events, "show job-finish events recorded by `watch` (unseen by default)")
     sp.add_argument("--since", help="only events at/after this ISO time (or epoch)")

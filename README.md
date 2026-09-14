@@ -103,6 +103,29 @@ rslurm watch 12345 --notify
 rslurm output 12345 -n 100
 ```
 
+Sample live resource use without dropping to SSH or parsing cluster-specific command output:
+
+```bash
+rslurm status 12345 --usage
+rslurm watch 12345 --usage --usage-interval 60
+```
+
+Running jobs use `sstat`; terminal jobs use compatible `sacct` fields. The result records the
+source and sample time and normalizes allocated CPUs, live PIDs, CPU time, effective CPU use,
+allocation utilization, and RSS. Live PIDs are processes rather than inferred worker counts.
+`watch` refuses usage intervals below 60 seconds because `sstat` contacts the Slurm controller.
+
+For computations with countable artifacts, declare what constitutes progress at submission:
+
+```bash
+rslurm submit scripts/fit.sh --cwd '$WORK/analysis' \
+  --progress-path results/null-plans --progress-pattern '*.rds' --progress-total 800
+rslurm status 12345 --usage
+```
+
+The bounded file scan then reports observed, total, percentage, and whether its scan was
+truncated. Progress remains observational; completion and durable-task validation are separate.
+
 Before calling `sbatch`, remoteslurm verifies that its local job registry can be updated. If the
 registry becomes unavailable after Slurm accepts the job, the command still succeeds and returns
 `submitted: true`, `recorded: false`, the Slurm job ID, and a recovery command. Recover that same
@@ -158,7 +181,8 @@ rslurm ensure fit.toml
 ```
 
 The task identity covers the script, remote input fingerprints, resolved resources, declared
-environment, outputs, and validation command. Intent is persisted on the cluster before `sbatch`;
+environment, outputs, validation command, and an optional `[progress]` observer. Intent is persisted
+on the cluster before `sbatch`;
 an interrupted submission is reconciled by its unique attempt marker and ambiguous submission is
 reported as `UNKNOWN` without an automatic retry. `VERIFIED` means the validation command passed
 and declared output fingerprints still match the receipt. See [durable tasks](docs/durable-tasks.md)
@@ -231,6 +255,7 @@ with Cluster.connect("mycluster") as cluster:
     )
     status = job.wait(poll=10)
     print(status.state)
+    print(job.status(refresh=True, usage=True).usage)
     print(job.output(tail=20)["content"])
 ```
 

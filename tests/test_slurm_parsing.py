@@ -101,3 +101,56 @@ def test_job_status_to_dict_drops_none() -> None:
     st = slurm.JobStatus(job_id="1", state="RUNNING", source="squeue")
     d = st.to_dict()
     assert d["job_id"] == "1" and "exit_code" not in d and "extra" not in d
+
+
+def test_parse_live_sstat_usage() -> None:
+    text = "2308782.batch|cpu=192,mem=767000M,node=1|1|1-03:33:11|66678456K|67906044K|101,102,103\n"
+    usage = slurm.parse_sstat_usage(text, elapsed="34:30")
+
+    assert usage is not None
+    assert usage["source"] == "sstat"
+    assert usage["allocated_cpus"] == 192
+    assert usage["live_pids"] == 3
+    assert usage["cpu_time_seconds"] == 99_191
+    assert usage["effective_cpus"] == 47.92
+    assert usage["cpu_utilization_percent"] == 25.0
+    assert usage["estimated_total_rss_bytes"] == 66_678_456 * 1024
+    assert usage["max_rss_bytes"] == 67_906_044 * 1024
+
+
+def test_sstat_usage_accounts_for_multiple_slurm_tasks() -> None:
+    text = "42.0|cpu=8,mem=32G|4|10:00.000|1G|2G|10,11\n"
+    usage = slurm.parse_sstat_usage(text, elapsed="20:00")
+
+    assert usage is not None
+    assert usage["cpu_time_seconds"] == 2400
+    assert usage["effective_cpus"] == 2.0
+    assert usage["cpu_utilization_percent"] == 25.0
+    assert usage["estimated_total_rss_bytes"] == 4 * 1024**3
+
+
+def test_sstat_usage_accepts_scontrol_cpu_fallback() -> None:
+    usage = slurm.parse_sstat_usage(
+        "42.batch||1|10:00|1G|2G|10,11\n", elapsed="20:00", allocated_cpus=8
+    )
+
+    assert usage is not None
+    assert usage["allocated_cpus"] == 8
+    assert usage["cpu_utilization_percent"] == 6.2
+
+
+def test_parse_terminal_sacct_usage() -> None:
+    text = (
+        "2308782|FAILED|192||00:40:29|1-10:38:11|||\n"
+        "2308782.batch|FAILED|192|1|00:40:29|1-10:38:11|67906044K|67906044K\n"
+        "2308782.extern|COMPLETED|192|1|00:40:29|00:00:00|||\n"
+    )
+    usage = slurm.parse_sacct_usage(text, "2308782")
+
+    assert usage is not None
+    assert usage["source"] == "sacct"
+    assert usage["allocated_cpus"] == 192
+    assert usage["cpu_time_seconds"] == 124_691
+    assert usage["effective_cpus"] == 51.33
+    assert usage["cpu_utilization_percent"] == 26.7
+    assert "live_pids" not in usage

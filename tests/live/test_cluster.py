@@ -92,6 +92,73 @@ def test_job_lifecycle(cluster: Cluster, workdir: str | None) -> None:
 
 
 @pytest.mark.timeout(660)
+def test_live_usage_and_declared_progress(cluster: Cluster, workdir: str | None) -> None:
+    if workdir is None:
+        pytest.skip("REMOTESLURM_LIVE_CWD is required for the usage telemetry test")
+    options = {
+        key: value
+        for key, value in {
+            "partition": PARTITION,
+            "time": TIME,
+            "nodes": 1,
+            "ntasks": 1,
+            "cpus_per_task": 2,
+        }.items()
+        if value
+    }
+    job = cluster.submit(
+        "#!/bin/bash\nmkdir -p progress\ntouch progress/fit-{1,2,3}.rds\nsleep 75\n",
+        name="rs_live_usage",
+        cwd=workdir,
+        progress={
+            "kind": "file_count",
+            "path": "progress",
+            "pattern": "*.rds",
+            "total": 5,
+        },
+        **options,
+    )
+    try:
+        deadline = time.monotonic() + 300
+        sample = None
+        while time.monotonic() < deadline:
+            status = job.status(refresh=True, usage=True)
+            if (
+                status.state == "RUNNING"
+                and status.usage
+                and status.usage.get("source") == "sstat"
+                and status.progress
+                and status.progress.get("observed") == 3
+            ):
+                sample = status
+                break
+            if status.terminal:
+                break
+            time.sleep(5)
+        assert sample is not None
+        assert sample.usage is not None and sample.usage["available"] is True
+        control = cluster.scontrol_job(job.job_id)
+        assert sample.usage["allocated_cpus"] == int(control["NumCPUs"])
+        assert sample.usage["live_pids"] >= 1
+        assert sample.progress is not None
+        assert sample.progress["observed"] == 3
+        assert sample.progress["total"] == 5
+        assert sample.progress["percent"] == 60.0
+
+        terminal = job.wait(poll=5, timeout=600)
+        assert terminal.state == "COMPLETED" and terminal.exit_code == 0
+        accounted = job.status(refresh=True, usage=True)
+        assert accounted.usage is not None and accounted.usage["source"] == "sacct"
+        assert accounted.usage["allocated_cpus"] == int(control["NumCPUs"])
+    finally:
+        status = cluster.job_status(job.job_id, refresh=True)
+        if not status.terminal:
+            cluster.cancel(job.job_id, confirm=True)
+        if status.script_path:
+            cluster.rm(status.script_path)
+
+
+@pytest.mark.timeout(660)
 def test_submit_from_clean_git_checkout_keeps_it_clean(
     cluster: Cluster, workdir: str | None
 ) -> None:
@@ -168,7 +235,10 @@ def test_durable_task_reuse_and_output_validation(cluster: Cluster, workdir: str
             time.sleep(5)
             result = cluster.ensure(spec)
 
-        assert result["state"] == "VERIFIED"
+        assert result["state"] == "VERIFIED", {
+            "reason": result.get("reason"),
+            "validation_stderr": (result.get("validation") or {}).get("stderr"),
+        }
         assert result["receipt"]["outputs"][0]["sha256"]
         job_id = result["job_id"]
 
@@ -238,7 +308,10 @@ def test_durable_task_recovers_after_lost_scheduler_acceptance(
             time.sleep(5)
             result = cluster.ensure(spec)
 
-        assert result["state"] == "VERIFIED"
+        assert result["state"] == "VERIFIED", {
+            "reason": result.get("reason"),
+            "validation_stderr": (result.get("validation") or {}).get("stderr"),
+        }
         assert result["submitted"] is False
         assert len(result["attempts"]) == 1
         assert result["attempts"][0]["recovered"] is True

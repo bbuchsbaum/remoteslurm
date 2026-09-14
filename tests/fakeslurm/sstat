@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""FakeSlurm sstat: live batch-step resource telemetry."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _fakeslurm as fs  # noqa: E402
+
+
+def row(job, fields):
+    values = {
+        "jobid": fs.job_label(job) + ".batch",
+        "alloctres": "cpu=4,mem=8G,node=1,billing=4",
+        "ntasks": "1",
+        "avecpu": "00:01:30",
+        "averss": "64000K",
+        "maxrss": "70000K",
+        "pids": "101,102,103",
+    }
+    return "|".join(values.get(field.lower(), "") for field in fields)
+
+
+def main():
+    args = sys.argv[1:]
+    fields = ["JobID", "AllocTRES", "NTasks", "AveCPU", "AveRSS", "MaxRSS", "Pids"]
+    ids = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-n", "--noheader", "-P", "--parsable2"):
+            pass
+        elif arg.startswith("--format="):
+            fields = arg.split("=", 1)[1].split(",")
+        elif arg in ("--format", "-o"):
+            i += 1
+            fields = args[i].split(",")
+        elif arg in ("-j", "--jobs"):
+            i += 1
+            ids = fs.query_tokens(args[i])
+        i += 1
+    if ids is None:
+        fs.die("sstat: job id required")
+    with fs.locked_state() as state:
+        matched, _missing = fs.match_jobs(state, ids)
+        jobs = [state["jobs"][key] for key in matched]
+        lines = [row(job, fields) for job in jobs if job["state"] == "RUNNING"]
+    sys.stdout.write("".join(line + "\n" for line in lines))
+
+
+if __name__ == "__main__":
+    main()

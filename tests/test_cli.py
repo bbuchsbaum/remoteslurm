@@ -218,6 +218,53 @@ def test_submit_unrecorded_result_and_adopt_recovery(
     assert adopted["adopted"] is True and adopted["recorded"] is True
 
 
+def test_status_usage_and_persisted_progress(
+    cli_env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    progress = cli_env / "proj" / "null-plans"
+    progress.mkdir()
+    for index in range(3):
+        (progress / f"fit-{index}.rds").write_text("done\n")
+    rc, out, _ = run(
+        capsys,
+        "--json",
+        "submit",
+        "echo fit\n",
+        "--cwd",
+        str(cli_env / "proj"),
+        "--progress-path",
+        "null-plans",
+        "--progress-pattern",
+        "*.rds",
+        "--progress-total",
+        "5",
+    )
+    assert rc == 0
+    job_id = json.loads(out)["job_id"]
+
+    rc, out, _ = run(capsys, "--json", "status", job_id, "--usage")
+    status = json.loads(out)
+
+    assert rc == 0
+    assert status["usage"]["available"] is True
+    assert status["progress"]["observed"] == 3
+    assert status["progress"]["total"] == 5
+    assert status["progress"]["percent"] == 60.0
+
+
+def test_progress_path_requires_total(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    rc, out, _ = run(capsys, "--json", "status", "12345", "--progress-path", "null-plans")
+    assert rc == 1
+    assert json.loads(out)["error"] == "invalid_arg"
+
+
+def test_human_progress_reports_probe_failure(capsys: pytest.CaptureFixture[str]) -> None:
+    cli._print_observation(
+        {"progress": {"available": False, "reason": "accounting filesystem unavailable"}}
+    )
+    assert "progress    unavailable: accounting filesystem unavailable" in capsys.readouterr().out
+
+
 def test_run_detach_proc_and_wait(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
     rc, out, _ = run(
         capsys,

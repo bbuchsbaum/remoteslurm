@@ -26,6 +26,13 @@ validate = [
 validation_timeout = 300
 template = "cpu"
 
+[progress]
+kind = "file_count"
+path = "results/null-plans"         # relative paths resolve below cwd
+pattern = "*.rds"
+total = 800
+max_depth = 10
+
 [resources]
 time = "02:00:00"
 mem = "8G"
@@ -40,6 +47,11 @@ renv_lock_sha256 = "..."
 `outputs` are remote regular files. Relative remote paths are resolved under `cwd`; `~` and remote
 environment variables are expanded by the stub. Inputs are SHA-256 hashed before the task identity
 is computed. Directories, job arrays, and dependencies are outside the version 1 contract.
+
+The optional progress table is identity-bearing and observational. During `RUNNING`, each repeated
+`ensure` returns a bounded count of matching regular files together with the declared total and
+percentage. It does not make those files valid outputs and cannot promote a task to `VERIFIED`.
+That still requires scheduler completion, the validation command, and output fingerprints.
 
 The validator is an argv array and runs on the login node after Slurm reports `COMPLETED`. It is
 also run on every later `ensure`. There is no implicit shell expansion; put environment setup in an

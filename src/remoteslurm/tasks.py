@@ -15,13 +15,20 @@ from typing import TYPE_CHECKING, Any
 from . import slurm
 from .errors import ExecutionMismatch, InvalidArgument, RemoteSlurmError
 from .identity import control_identity
-from .jobs import JobRecord, append_learned_notes, compose_templated_script
+from .jobs import (
+    JobRecord,
+    append_learned_notes,
+    compose_templated_script,
+    normalize_progress_spec,
+)
 
 if TYPE_CHECKING:
     from .cluster import Cluster
 
 
 TASK_VERSION = 1
+OUTPUT_SETTLE_TIMEOUT = 30.0
+OUTPUT_SETTLE_POLL = 1.0
 _ALLOWED_KEYS = {
     "version",
     "name",
@@ -36,6 +43,7 @@ _ALLOWED_KEYS = {
     "validation_timeout",
     "resources",
     "environment",
+    "progress",
 }
 
 
@@ -104,6 +112,7 @@ class TaskSpec:
     environment: dict[str, Any] = field(default_factory=dict)
     validation_timeout: int = 300
     source: str | None = None
+    progress: dict[str, Any] | None = None
 
     @classmethod
     def from_mapping(
@@ -152,6 +161,7 @@ class TaskSpec:
         inputs = _paths(data.get("inputs", []), "inputs")
         resources = data.get("resources", {})
         environment = data.get("environment", {})
+        progress = normalize_progress_spec(data.get("progress"))
         if not isinstance(resources, dict):
             raise InvalidArgument("resources must be a table")
         if not isinstance(environment, dict):
@@ -187,6 +197,7 @@ class TaskSpec:
             inputs=inputs,
             resources=dict(resources),
             environment=dict(environment),
+            progress=progress,
             validation_timeout=timeout,
             source=source,
         )
@@ -278,6 +289,8 @@ def _resolve(cluster: Cluster, spec: TaskSpec) -> dict[str, Any]:
         "environment": spec.environment,
         "validate": {"command": validate, "timeout": spec.validation_timeout},
     }
+    if spec.progress is not None:
+        contract["progress"] = spec.progress
     task_id = hashlib.sha256(_canonical(contract).encode("utf-8")).hexdigest()
     limitations: list[str] = []
     if not spec.inputs:
@@ -330,6 +343,7 @@ def _remember_job(cluster: Cluster, record: Mapping[str, Any], attempt: Mapping[
         meta={
             "durable_task_id": record.get("task_id"),
             "durable_attempt_id": attempt.get("attempt_id"),
+            "progress": (record.get("contract") or {}).get("progress"),
         },
     )
     try:
@@ -362,6 +376,28 @@ def _update(
         **fields,
     )
     return dict(result["record"])
+
+
+def _wait_for_declared_outputs(
+    cluster: Cluster, paths: list[str], *, timeout: float = OUTPUT_SETTLE_TIMEOUT
+) -> list[str]:
+    """Wait briefly for terminal-job output metadata to become visible on the login node."""
+    deadline = time.monotonic() + timeout
+    while True:
+        files = cluster.call(
+            "task_fingerprint",
+            paths=paths,
+            required=False,
+            hash=False,
+            _timeout=max(1.0, min(OUTPUT_SETTLE_TIMEOUT, timeout)),
+        )["files"]
+        missing = [str(item["path"]) for item in files if not item.get("exists")]
+        if not missing:
+            return []
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return missing
+        time.sleep(min(OUTPUT_SETTLE_POLL, remaining))
 
 
 def ensure_task(
@@ -440,7 +476,13 @@ def ensure_task(
             base["action"] = "repeat ensure with retry=True to create a new visible attempt"
             return base
     else:
-        status = cluster.job_status(job_id, refresh=True)
+        progress_spec = resolved["contract"].get("progress")
+        status = cluster.job_status(
+            job_id,
+            refresh=True,
+            usage=progress_spec is not None,
+            progress=progress_spec,
+        )
         scheduler = status.to_dict()
         base.update(job_id=job_id, attempt_id=attempt["attempt_id"], scheduler=scheduler)
         if status.state == "UNKNOWN" or status.source == "registry":
@@ -479,6 +521,36 @@ def ensure_task(
             return base
 
     _update(cluster, resolved, attempt["attempt_id"], "COMPLETED", scheduler=scheduler)
+    try:
+        missing_outputs = _wait_for_declared_outputs(cluster, resolved["contract"]["outputs"])
+    except RemoteSlurmError as e:
+        reason = f"declared output evidence is unavailable: {e.message}"
+        _update(
+            cluster,
+            resolved,
+            attempt["attempt_id"],
+            "INVALID",
+            scheduler=scheduler,
+            reason=reason,
+        )
+        base.update(state="INVALID", reason=reason)
+        base["action"] = "repair the outputs or repeat ensure with retry=True"
+        return base
+    if missing_outputs:
+        reason = "declared outputs did not appear after scheduler completion: " + ", ".join(
+            missing_outputs
+        )
+        _update(
+            cluster,
+            resolved,
+            attempt["attempt_id"],
+            "INVALID",
+            scheduler=scheduler,
+            reason=reason,
+        )
+        base.update(state="INVALID", reason=reason)
+        base["action"] = "repair the outputs or repeat ensure with retry=True"
+        return base
     validation = cluster.run(
         resolved["contract"]["validate"]["command"],
         cwd=str(resolved["cwd"]),

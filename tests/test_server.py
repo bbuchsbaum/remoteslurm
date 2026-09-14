@@ -264,7 +264,16 @@ def test_submit_and_jobs(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) 
         return Job(self, "4242")
 
     monkeypatch.setattr(Cluster, "submit", fake_submit)
-    monkeypatch.setattr(Cluster, "job_status", lambda self, jid, refresh=False: _st(jid, "PENDING"))
+
+    def fake_status(self, jid, refresh=False, usage=False, progress=None):
+        status = _st(jid, "PENDING")
+        if usage:
+            status.usage = {"available": False, "reason": "job has not started"}
+        if progress is not None:
+            status.progress = {"observed": 3, "total": progress["total"], "percent": 60.0}
+        return status
+
+    monkeypatch.setattr(Cluster, "job_status", fake_status)
     monkeypatch.setattr(Cluster, "jobs", lambda self, **kw: [_st("1"), _st("2", "COMPLETED")])
 
     r = call(
@@ -273,14 +282,24 @@ def test_submit_and_jobs(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) 
         name="t",
         options={"time": "1:00:00"},
         args=["--exclusive"],
+        progress={"kind": "file_count", "path": "null-plans", "total": 5},
     )
     assert r["job_id"] == "4242" and r["state"] == "PENDING"
     assert r["submitted"] is True and r["recorded"] is True
     assert r["stdout_path"].endswith(".out")
     assert seen["time"] == "1:00:00" and seen["args"] == ["--exclusive"]
+    assert seen["progress"]["total"] == 5
 
     r = call("jobs", job_id="4242")
     assert r["job_id"] == "4242" and r["state"] == "PENDING"
+    r = call(
+        "jobs",
+        job_id="4242",
+        usage=True,
+        progress={"kind": "file_count", "path": "null-plans", "total": 5},
+    )
+    assert r["usage"]["available"] is False
+    assert r["progress"]["observed"] == 3
     r = call("jobs")
     assert r["count"] == 2 and [j["job_id"] for j in r["jobs"]] == ["1", "2"]
     assert r["registry_available"] is True

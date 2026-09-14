@@ -111,6 +111,53 @@ def test_watch_cli_all_no_jobs(cluster: Cluster, monkeypatch: pytest.MonkeyPatch
     assert cli.cmd_watch(args) == 0  # nothing queued -> clean exit
 
 
+def test_watch_rate_limits_usage_samples(
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from remoteslurm.slurm import JobStatus
+
+    states = iter(["RUNNING", "RUNNING", "COMPLETED"])
+    sampled: list[bool] = []
+
+    def status(self, job_id, refresh=False, usage=False, progress=None):
+        state = next(states)
+        sampled.append(usage)
+        result = JobStatus(
+            job_id=job_id,
+            state=state,
+            source="sacct" if state == "COMPLETED" else "squeue",
+            terminal=state == "COMPLETED",
+        )
+        if usage:
+            result.usage = {
+                "available": True,
+                "source": "sstat" if state == "RUNNING" else "sacct",
+                "live_pids": 3 if state == "RUNNING" else None,
+                "cpu_time": "00:01:30",
+                "sampled_at": "2026-09-14T10:00:00-04:00",
+            }
+        return result
+
+    monkeypatch.setattr(cli, "get_cluster", lambda args, host=None: cluster)
+    monkeypatch.setattr(Cluster, "job_status", status)
+    ticks = iter([100.0, 150.0, 161.0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(ticks))
+    args = types.SimpleNamespace(
+        job_id=["42"],
+        all=False,
+        notify=False,
+        poll=2.0,
+        timeout=None,
+        json=False,
+        usage=True,
+        usage_interval=60.0,
+    )
+
+    assert cli.cmd_watch(args) == 0  # type: ignore[arg-type]
+    assert sampled == [True, False, True]
+    assert "3 live PIDs" in capsys.readouterr().out
+
+
 # --------------------------------------------------------------------------- MCP wait / events
 def test_mcp_wait_completes(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "_get_cluster", lambda host: cluster)

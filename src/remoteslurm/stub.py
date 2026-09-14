@@ -66,7 +66,7 @@ SLOW_WORKERS = 4
 LONG_WORKERS = 6
 # Ops that spawn a genuinely long-lived subprocess; they register their Popen so `cancel`
 # can reach the whole process group.
-SLOW_OPS = frozenset(("run", "srun", "sbatch", "task_ensure", "task_fingerprint"))
+SLOW_OPS = frozenset(("run", "srun", "sbatch", "task_ensure", "task_fingerprint", "progress_count"))
 # Ops that can stream multi-frame responses when the request carries ``stream: true``.
 STREAM_OPS = frozenset(("run", "srun"))
 # Long-lived ops with no subprocess, served by the long pool and cancelled via a per-request
@@ -119,6 +119,8 @@ MAX_GREP_MATCHES = 5000
 GREP_MAX_FILE_SIZE = 50 * 1024 * 1024
 DEFAULT_GLOB_LIMIT = 500
 MAX_GLOB_LIMIT = 10000
+DEFAULT_PROGRESS_SCAN = 1000000
+MAX_PROGRESS_SCAN = 10000000
 DEFAULT_RUN_TIMEOUT = 60
 MAX_RUN_TIMEOUT = 3600
 DEFAULT_RUN_OUTPUT = 64 * 1024
@@ -656,7 +658,7 @@ def op_info(args):
         "slurm_version": slurm_version,
         "slurm_tools": {
             n: bool(_which(n))
-            for n in ("sbatch", "squeue", "sacct", "scancel", "scontrol", "sinfo")
+            for n in ("sbatch", "squeue", "sstat", "sacct", "scancel", "scontrol", "sinfo")
         },
     }
 
@@ -1146,6 +1148,78 @@ def op_glob(args):
         if truncated:
             break
     return {"root": root, "matches": results, "scanned": scanned, "truncated": truncated}
+
+
+def op_progress_count(args):
+    """Count matching files without returning a potentially huge artifact listing."""
+    raw = args.get("path")
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise StubError("invalid_arg", "progress path must be non-empty text without NUL")
+    if not os.path.isabs(os.path.expanduser(os.path.expandvars(raw))):
+        base = _path(args.get("base") or "~")
+        raw = os.path.join(base, raw)
+    root = _path(raw)
+    pattern = args.get("pattern", "*")
+    if not isinstance(pattern, str) or not pattern or "\x00" in pattern:
+        raise StubError("invalid_arg", "progress pattern must be non-empty text without NUL")
+    max_depth = _clamp(args.get("max_depth"), 10, 100, lo=0)
+    max_scan = _clamp(args.get("max_scan"), DEFAULT_PROGRESS_SCAN, MAX_PROGRESS_SCAN, lo=1)
+    hidden = bool(args.get("hidden", False))
+    if not os.path.lexists(root):
+        return {
+            "kind": "file_count",
+            "path": root,
+            "pattern": pattern,
+            "exists": False,
+            "observed": 0,
+            "scanned": 0,
+            "truncated": False,
+        }
+    if not os.path.isdir(root):
+        name = os.path.basename(root)
+        observed = int(os.path.isfile(root) and fnmatch.fnmatch(name, pattern))
+        return {
+            "kind": "file_count",
+            "path": root,
+            "pattern": pattern,
+            "exists": True,
+            "observed": observed,
+            "scanned": 1,
+            "truncated": False,
+        }
+    observed = 0
+    scanned = 0
+    truncated = False
+    root_depth = root.rstrip("/").count("/")
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.rstrip("/").count("/") - root_depth
+        if not hidden:
+            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            filenames = [name for name in filenames if not name.startswith(".")]
+        if depth >= max_depth:
+            dirnames[:] = []
+        for name in filenames:
+            if scanned >= max_scan:
+                truncated = True
+                break
+            scanned += 1
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root)
+            if (fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(rel, pattern)) and os.path.isfile(
+                full
+            ):
+                observed += 1
+        if truncated:
+            break
+    return {
+        "kind": "file_count",
+        "path": root,
+        "pattern": pattern,
+        "exists": True,
+        "observed": observed,
+        "scanned": scanned,
+        "truncated": truncated,
+    }
 
 
 def op_grep(args):
@@ -2552,6 +2626,19 @@ def op_sacct(args):
     return _slurm(argv, timeout=120)
 
 
+def op_sstat(args):
+    fields = args.get("fields")
+    jobs = args.get("jobs")
+    if not isinstance(fields, list) or not fields:
+        raise StubError("invalid_arg", "fields required")
+    if not isinstance(jobs, list) or not jobs:
+        raise StubError("invalid_arg", "jobs required")
+    if not all(re.match(r"^\d+(?:_\d+)?(?:\.(?:batch|extern|\d+))?$", str(job)) for job in jobs):
+        raise StubError("invalid_arg", "malformed job step id", jobs=jobs)
+    argv = ["sstat", "-n", "-P", "--format=" + ",".join(fields), "-j", ",".join(jobs)]
+    return _slurm(argv, timeout=60)
+
+
 def op_scontrol(args):
     what = args.get("what", "job")
     ident = args.get("id")
@@ -2687,6 +2774,7 @@ OPS = {
     "mkdir": op_mkdir,
     "rm": op_rm,
     "glob": op_glob,
+    "progress_count": op_progress_count,
     "grep": op_grep,
     "run": op_run,
     "srun": op_srun,
@@ -2701,6 +2789,7 @@ OPS = {
     "task_ensure": op_task_ensure,
     "task_update": op_task_update,
     "squeue": op_squeue,
+    "sstat": op_sstat,
     "sacct": op_sacct,
     "scontrol": op_scontrol,
     "scancel": op_scancel,

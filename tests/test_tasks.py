@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from remoteslurm.errors import ExecutionMismatch, SessionDied
-from remoteslurm.tasks import TaskSpec
+from remoteslurm.tasks import TaskSpec, _wait_for_declared_outputs
 
 
 def spec_for(sandbox: Path, *, script: str = "#!/bin/bash\necho fit\n") -> TaskSpec:
@@ -46,6 +47,32 @@ def drop_fake_jobs(sandbox: Path) -> None:
     path.write_text(json.dumps(state))
 
 
+def test_terminal_output_visibility_waits_for_shared_filesystem(monkeypatch) -> None:
+    observations = iter(
+        [
+            {"files": [{"path": "/scratch/result.txt", "exists": False}]},
+            {"files": [{"path": "/scratch/result.txt", "exists": True}]},
+        ]
+    )
+
+    class FakeCluster:
+        def call(self, *_args, **_kwargs):
+            return next(observations)
+
+    monkeypatch.setattr("remoteslurm.tasks.time.sleep", lambda _seconds: None)
+    assert _wait_for_declared_outputs(FakeCluster(), ["/scratch/result.txt"]) == []
+
+
+def test_terminal_output_visibility_reports_missing_paths() -> None:
+    class FakeCluster:
+        def call(self, *_args, **_kwargs):
+            return {"files": [{"path": "/scratch/missing.txt", "exists": False}]}
+
+    assert _wait_for_declared_outputs(FakeCluster(), ["/scratch/missing.txt"], timeout=0) == [
+        "/scratch/missing.txt"
+    ]
+
+
 def test_ensure_reuses_verified_job_and_detects_output_corruption(cluster, sandbox: Path) -> None:
     spec = spec_for(sandbox)
     first = run_to_terminal(cluster, spec)
@@ -74,6 +101,29 @@ def test_changed_input_produces_a_different_task_identity(cluster, sandbox: Path
     assert changed["task_id"] != original["task_id"]
     assert changed["job_id"] != original["job_id"]
     assert len(fake_jobs(sandbox)) == 2
+
+
+def test_declared_progress_is_identity_bearing_and_reported(cluster, sandbox: Path) -> None:
+    progress_dir = sandbox / "null-plans"
+    progress_dir.mkdir()
+    (progress_dir / "fit-1.rds").write_text("done\n")
+    plain = spec_for(sandbox)
+    observed = replace(
+        plain,
+        progress={
+            "kind": "file_count",
+            "path": "null-plans",
+            "pattern": "*.rds",
+            "total": 5,
+        },
+    )
+
+    plain_result = cluster.ensure(plain)
+    result = cluster.ensure(observed)
+
+    assert result["task_id"] != plain_result["task_id"]
+    assert result["scheduler"]["progress"]["observed"] == 1
+    assert result["scheduler"]["progress"]["percent"] == 20.0
 
 
 def test_verified_receipt_survives_scheduler_accounting_expiry(cluster, sandbox: Path) -> None:
@@ -177,6 +227,8 @@ def test_manifest_loads_script_relative_to_it(tmp_path: Path) -> None:
     manifest.write_text(
         'version = 1\nname = "fit"\nscript = "fit.sh"\n'
         'outputs = ["~/result.txt"]\nvalidate = ["test", "-s", "~/result.txt"]\n'
+        '[progress]\nkind = "file_count"\npath = "null-plans"\ntotal = 800\n'
     )
     spec = TaskSpec.load(manifest)
     assert spec.script.startswith("#!/bin/bash\necho fit")
+    assert spec.progress is not None and spec.progress["total"] == 800

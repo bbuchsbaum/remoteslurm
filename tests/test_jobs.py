@@ -242,6 +242,64 @@ def test_status_progression(cluster):
     assert ranks == sorted(ranks)
 
 
+def test_running_status_can_sample_normalized_usage(cluster):
+    job = cluster.submit(SCRIPT)
+    assert cluster.job_status(job.job_id, refresh=True).state == "PENDING"
+
+    status = cluster.job_status(job.job_id, refresh=True, usage=True)
+
+    assert status.state == "RUNNING"
+    assert status.allocated_cpus == 4
+    assert status.usage is not None
+    assert status.usage["source"] == "sstat"
+    assert status.usage["live_pids"] == 3
+    assert status.usage["cpu_time_seconds"] == 90
+    assert status.usage["estimated_total_rss_bytes"] == 64_000 * 1024
+
+
+def test_terminal_status_normalizes_sacct_usage(cluster):
+    job = cluster.submit(SCRIPT)
+    job.wait(poll=5)
+
+    status = cluster.job_status(job.job_id, refresh=True, usage=True)
+
+    assert status.terminal is True
+    assert status.usage is not None
+    assert status.usage["source"] == "sacct"
+    assert status.usage["allocated_cpus"] == 1
+    assert status.usage["cpu_time_seconds"] == 90
+    assert "live_pids" not in status.usage
+
+
+def test_declared_file_count_progress_is_recovered_from_registry(cluster, sandbox, _isolated_state):
+    progress_dir = sandbox / "proj" / "null-plans"
+    progress_dir.mkdir()
+    for index in range(3):
+        (progress_dir / f"fit-{index}.rds").write_text("done\n")
+    (progress_dir / "notes.txt").write_text("ignore\n")
+    job = cluster.submit(
+        SCRIPT,
+        cwd=str(sandbox / "proj"),
+        progress={
+            "kind": "file_count",
+            "path": "null-plans",
+            "pattern": "*.rds",
+            "total": 5,
+        },
+    )
+
+    status = cluster.job_status(job.job_id, refresh=True, usage=True)
+
+    assert status.progress is not None
+    assert status.progress["available"] is True
+    assert status.progress["observed"] == 3
+    assert status.progress["total"] == 5
+    assert status.progress["percent"] == 60.0
+    assert status.progress["path"] == str(progress_dir)
+    rec = registry_jobs(_isolated_state)[job.job_id]
+    assert rec["meta"]["progress"]["pattern"] == "*.rds"
+
+
 def test_squeue_cache_and_refresh(cluster, sandbox):
     cluster.submit(SCRIPT)  # invalidates the cache
     cluster.squeue()

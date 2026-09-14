@@ -46,8 +46,10 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
 - Use `diagnose <job_id>` instead of manually reading logs. It returns a plain-English
   `verdict` (out-of-memory, timeout, missing module, cancelled, pending-reason, …), concrete
   `hints`, the stderr/stdout tails, the sacct steps, and the sync marker. Act on the hints.
-- To check progress, call `jobs` (all) or `jobs(job_id=...)` (one). Each record has
-  `terminal` (done?), `state`, `exit_code`, `reason`. Poll `jobs`; avoid tight `wait` loops
+- To check state, call `jobs` (all) or `jobs(job_id=...)` (one). Each record has
+  `terminal` (done?), `state`, `exit_code`, `reason`. For one job, `jobs(job_id=..., usage=True)`
+  adds normalized live `sstat` or terminal `sacct` telemetry; submit may persist a bounded
+  `file_count` progress observer. Poll `jobs`; avoid tight `wait` loops
   (MCP `wait` is bounded and returns `terminal:false` on timeout — loop only if needed). When
   `registry_available` is false, the result contains scheduler-visible data without local history.
 
