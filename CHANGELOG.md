@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Generated batch wrappers now default to `~/.remoteslurm/scripts` independently of the requested
+  working directory. A submission with `--cwd` set to a clean Git checkout therefore no longer
+  creates an untracked `.remoteslurm/scripts/...` file that can fail reproducibility checks.
 - Batch submission now preflights local registry writes before `sbatch`. A rare failure after
   scheduler acceptance returns a successful `submitted: true, recorded: false` result with the job
   ID and `rslurm adopt JOB_ID` recovery command instead of encouraging a duplicate submission.

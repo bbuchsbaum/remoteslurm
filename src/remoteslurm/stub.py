@@ -2087,7 +2087,7 @@ def op_sbatch(args):
             name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:64]
             jobdir = _path(
                 args.get("script_dir")
-                or os.path.join(cwd or os.path.expanduser("~"), ".remoteslurm", "scripts")
+                or os.path.join(os.path.expanduser("~"), ".remoteslurm", "scripts")
             )
             os.makedirs(jobdir, exist_ok=True)
             path = os.path.join(

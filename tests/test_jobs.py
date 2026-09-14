@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,54 @@ def test_submit_returns_job_and_records_registry(cluster, sandbox, _isolated_sta
     # the stdout path lives in the sandbox, next to the generated script
     # jobs run from $HOME by default (not from the generated-script directory)
     assert Path(rec["stdout_path"]).parent == Path(cluster.home)
+
+
+def test_submit_stages_generated_script_outside_git_workdir(cluster, sandbox, _isolated_state):
+    checkout = sandbox / "checkout"
+    checkout.mkdir()
+    (checkout / "tracked.txt").write_text("baseline\n")
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    subprocess.run(["git", "add", "tracked.txt"], cwd=checkout, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=RemoteSlurm Test",
+            "-c",
+            "user.email=remoteslurm@example.invalid",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+        cwd=checkout,
+        check=True,
+    )
+    log = sandbox / "logs" / "job-%j.out"
+
+    job = cluster.submit(SCRIPT, cwd=str(checkout), output=str(log))
+
+    rec = registry_jobs(_isolated_state)[job.job_id]
+    script_path = Path(rec["script_path"])
+    assert script_path.parent == sandbox / ".remoteslurm" / "scripts"
+    assert rec["workdir"] == str(checkout)
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+
+def test_submit_respects_configured_script_directory(make_cluster, sandbox, _isolated_state):
+    custom = sandbox / "job-wrappers"
+    cluster = make_cluster(script_dir=str(custom))
+
+    job = cluster.submit(SCRIPT, cwd=str(sandbox / "proj"))
+
+    rec = registry_jobs(_isolated_state)[job.job_id]
+    assert Path(rec["script_path"]).parent == custom
 
 
 def test_submit_argument_validation(cluster):

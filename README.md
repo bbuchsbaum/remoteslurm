@@ -120,6 +120,10 @@ state location is not writable, including sandboxed agent sessions:
 REMOTESLURM_STATE_DIR=/tmp/remoteslurm-state rslurm --no-daemon submit scripts/fit.sh
 ```
 
+Generated batch wrappers are staged under `~/.remoteslurm/scripts` by default, independently of
+`--cwd`, so submitting from a clean Git checkout does not modify that checkout. Configure a remote
+`script_dir` for a different staging location. Submission results expose the exact `script_path`.
+
 Pack independent shell commands onto one or more one-node allocations with GNU Parallel. The two
 limits are intentionally separate: `--max-processes` controls concurrent processes inside each
 node, while `--max-concurrent` throttles the packed array allocations in Slurm.

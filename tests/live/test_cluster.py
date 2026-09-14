@@ -91,6 +91,53 @@ def test_job_lifecycle(cluster: Cluster, workdir: str | None) -> None:
         cluster.rm(st.script_path)
 
 
+@pytest.mark.timeout(660)
+def test_submit_from_clean_git_checkout_keeps_it_clean(
+    cluster: Cluster, workdir: str | None
+) -> None:
+    if workdir is None:
+        pytest.skip("REMOTESLURM_LIVE_CWD is required for the checkout cleanliness test")
+    checkout = f"{workdir}/checkout"
+    cluster.mkdir(checkout)
+    initialized = cluster.run(
+        "git init -q && printf 'baseline\\n' > tracked.txt && git add tracked.txt && "
+        "git -c user.name='RemoteSlurm Test' -c user.email=remoteslurm@example.invalid "
+        "commit -qm baseline",
+        cwd=checkout,
+    )
+    assert initialized["rc"] == 0, initialized
+    options = {
+        key: value
+        for key, value in {
+            "partition": PARTITION,
+            "time": TIME,
+            "nodes": 1,
+            "ntasks": 1,
+            "output": f"{workdir}/clean-%j.out",
+            "error": f"{workdir}/clean-%j.err",
+        }.items()
+        if value
+    }
+    job = cluster.submit(
+        '#!/bin/bash\ntest -z "$(git status --porcelain)"\necho checkout-clean\n',
+        name="rs_git_clean",
+        cwd=checkout,
+        **options,
+    )
+    try:
+        st = job.wait(poll=5, timeout=600)
+        assert st.state == "COMPLETED" and st.exit_code == 0
+        assert st.script_path and not st.script_path.startswith(checkout + "/")
+        status = cluster.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=checkout
+        )
+        assert status["rc"] == 0 and status["stdout"] == ""
+    finally:
+        st = cluster.job_status(job.job_id, refresh=True)
+        if st.script_path:
+            cluster.rm(st.script_path)
+
+
 def test_durable_task_reuse_and_output_validation(cluster: Cluster, workdir: str | None) -> None:
     if workdir is None:
         pytest.skip("REMOTESLURM_LIVE_CWD is required for a durable live task")
