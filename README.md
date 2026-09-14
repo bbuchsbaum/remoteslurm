@@ -129,13 +129,27 @@ rslurm diagnose 12345
 `diagnose` combines job state, exit status, resource use, pending reason, scheduler metadata, and
 bounded log tails into a verdict with concrete next steps.
 
+For work that must be recoverable across lost clients and independently validated, describe one
+batch job as a durable task and repeat `ensure` until it is verified:
+
+```bash
+rslurm ensure fit.toml
+```
+
+The task identity covers the script, remote input fingerprints, resolved resources, declared
+environment, outputs, and validation command. Intent is persisted on the cluster before `sbatch`;
+an interrupted submission is reconciled by its unique attempt marker and ambiguous submission is
+reported as `UNKNOWN` without an automatic retry. `VERIFIED` means the validation command passed
+and declared output fingerprints still match the receipt. See [durable tasks](docs/durable-tasks.md)
+for the manifest, retry semantics, Python API, and MCP tool.
+
 ## What you can do
 
 | Goal | Commands |
 |---|---|
 | Inspect the remote workspace | `info`, `ls`, `cat`, `tail`, `grep`, `find`, `diff` |
 | Move or update work | `sync`, `put`, `get`, `edit` |
-| Run work through Slurm | `submit`, `pack`, `sweep`, `run --compute` |
+| Run work through Slurm | `submit`, `ensure`, `pack`, `sweep`, `run --compute` |
 | Keep login-node work running | `run --detach`, `proc`, `wait --pid`/`--path` |
 | Observe jobs | `jobs`, `status`, `wait`, `watch`, `events` |
 | Understand or stop a job | `output`, `diagnose`, `cancel` |
@@ -160,7 +174,7 @@ remoteslurm mcp-config --host mycluster
 ```
 
 The default `core` tool set covers cluster information, bounded file operations, execution
-(including detached login-node processes), submission, job monitoring, diagnosis,
+(including detached login-node processes), submission and durable `ensure`, job monitoring, diagnosis,
 synchronization, cancellation, waiting, and connection state. Set `REMOTESLURM_MCP_TOOLS=all` to
 add project and queue inspection, quota, sweeps, output, events, globbing, and diffs. `run` and
 `sync` stay under 25 minutes (`REMOTESLURM_MCP_MAX_CALL`, default 1500 s) because clients such as

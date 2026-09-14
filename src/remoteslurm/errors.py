@@ -75,6 +75,18 @@ class ConfigError(RemoteSlurmError):
     code = "config_error"
 
 
+class ExecutionMismatch(RemoteSlurmError):
+    """The client, local daemon, and remote stub are not the same execution build."""
+
+    code = "execution_mismatch"
+
+
+class TaskBusy(RemoteSlurmError):
+    """Another process currently holds the short remote durable-task lease."""
+
+    code = "task_busy"
+
+
 class Cancelled(RemoteSlurmError):
     """The caller abandoned the call (e.g. an MCP client cancelled or timed out the tool call)."""
 
@@ -109,6 +121,8 @@ _BY_CODE: dict[str, type[RemoteSlurmError]] = {
         SessionDied,
         InvalidArgument,
         ConfigError,
+        ExecutionMismatch,
+        TaskBusy,
         Cancelled,
         ConfirmationRequired,
     )

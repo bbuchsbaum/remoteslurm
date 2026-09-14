@@ -212,6 +212,7 @@ class HostConfig:
     session_lifetime: str | int | None = None
     allow_run: bool | str = True  # true | false | "safe" (argv-only + run_allowlist)
     script_dir: str | None = None  # where generated sbatch scripts are written (remote)
+    task_dir: str | None = None  # durable ensure records; default ~/.remoteslurm/tasks
     ssh_opts: list[str] = field(default_factory=list)
     defaults: dict[str, Any] = field(
         default_factory=dict
@@ -397,6 +398,7 @@ mfa = true                  # interactive auth: run `remoteslurm connect myclust
 # control_persist = "12h"
 # session_lifetime = "24h"  # only if the site cuts ssh connections after a fixed time
 # allow_run = true          # true | false | "safe" (argv-only + run_allowlist) for `run`/srun
+# task_dir = "$WORK/.remoteslurm/tasks"  # durable `ensure` records; shared home by default
 # env_vars = ["WORK", "LAB_STORAGE"]              # extra variables returned by `info`
 # quota_paths = ["~", "$WORK", "$LAB_STORAGE"]  # portable `df -h` fallback
 # protected_roots = ["$WORK", "$LAB_STORAGE"]    # recursive rm refuses these roots

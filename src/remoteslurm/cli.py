@@ -764,6 +764,34 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_ensure(args: argparse.Namespace) -> int:
+    from .tasks import TaskSpec
+
+    spec = TaskSpec.load(args.manifest)
+    c = get_cluster(args, args.host or spec.host)
+    result = c.ensure(spec, retry=args.retry, retry_unknown=args.retry_unknown)
+
+    def human(data: dict[str, Any]) -> None:
+        state = data.get("state", "UNKNOWN")
+        job = f" job {data['job_id']}" if data.get("job_id") else ""
+        print(f"{state} {str(data.get('task_id', ''))[:16]}{job}")
+        if data.get("reason"):
+            print(f"  {data['reason']}")
+        for output in data.get("outputs") or []:
+            print(f"  {output['path']}  sha256:{output['sha256'][:16]}")
+        if data.get("action"):
+            print(f"  -> {data['action']}")
+        for limitation in data.get("limitations") or []:
+            print(f"  reuse limitation: {limitation}")
+
+    emit(args, result, human)
+    return (
+        EXIT_ERROR
+        if result.get("state") in {"INVALID", "FAILED", "REJECTED", "UNKNOWN"}
+        else EXIT_OK
+    )
+
+
 def cmd_sweep(args: argparse.Namespace) -> int:
     c = get_cluster(args)
     params: dict[str, list[str]] = {}
@@ -1745,6 +1773,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("projects", cmd_projects, "list the host's configured sync projects")
     sp.add_argument(
         "-v", "--verbose", action="store_true", help="also read each remote sync marker (slower)"
+    )
+
+    sp = add(
+        "ensure",
+        cmd_ensure,
+        "recover, submit, or verify a durable task manifest",
+    )
+    sp.add_argument("manifest", help="local TOML task manifest")
+    sp.add_argument(
+        "--retry",
+        action="store_true",
+        help="create a new attempt after FAILED, INVALID, or REJECTED",
+    )
+    sp.add_argument(
+        "--retry-unknown",
+        action="store_true",
+        help="submit despite an ambiguous prior attempt (duplicate execution is possible)",
     )
 
     sp = add(

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added durable single-job contracts through `Cluster.ensure`, `rslurm ensure`, and the core MCP
+  `ensure` tool. Canonical task identities cover script content, remote input hashes, resolved
+  resources, environment declarations, outputs, and validation. Intent and attempt history are
+  stored on the cluster before `sbatch`; interrupted submissions reconcile unique scheduler
+  markers, ambiguous submissions remain `UNKNOWN`, retries are explicit, and completed jobs become
+  `VERIFIED` only while their validation and output fingerprints match the retained receipt.
+- Added exact client/daemon/stub build checks for durable submission. A stale local daemon or remote
+  stub now fails before `sbatch` with an actionable `execution_mismatch` error.
 - Added packed command jobs: `Cluster.pack`, `rslurm pack`, and the core MCP `pack` tool split a
   command list across one-node array allocations and use GNU Parallel to enforce a per-node
   process cap. A separate array throttle controls how many packed allocations run concurrently.

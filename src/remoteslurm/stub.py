@@ -22,6 +22,7 @@ import difflib
 import errno
 import fnmatch
 import getpass
+import hashlib
 import io
 import json
 import os
@@ -37,10 +38,20 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 PROTOCOL = 2
 RS = "\x1e"
+
+
+def _stub_sha():
+    try:
+        with io.open(__file__, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
 # Two pools so a long `run` (slow) can never queue behind a `ping`/`ls` (fast). Only the
 # escape-hatch ops that spawn a genuinely long-lived subprocess go to the slow pool; they
 # register their Popen so `cancel` can reach them. Everything else (including the short,
@@ -53,7 +64,7 @@ SLOW_WORKERS = 4
 LONG_WORKERS = 6
 # Ops that spawn a genuinely long-lived subprocess; they register their Popen so `cancel`
 # can reach the whole process group.
-SLOW_OPS = frozenset(("run", "srun", "sbatch"))
+SLOW_OPS = frozenset(("run", "srun", "sbatch", "task_ensure", "task_fingerprint"))
 # Ops that can stream multi-frame responses when the request carries ``stream: true``.
 STREAM_OPS = frozenset(("run", "srun"))
 # Long-lived ops with no subprocess, served by the long pool and cancelled via a per-request
@@ -605,7 +616,12 @@ def _which(name):
 
 
 def op_ping(args):
-    return {"pid": os.getpid(), "time": time.time(), "protocol": PROTOCOL}
+    return {
+        "pid": os.getpid(),
+        "time": time.time(),
+        "protocol": PROTOCOL,
+        "stub_sha": _stub_sha(),
+    }
 
 
 def op_info(args):
@@ -633,6 +649,7 @@ def op_info(args):
         "python": sys.version.split()[0],
         "stub": os.path.abspath(__file__),
         "protocol": PROTOCOL,
+        "stub_sha": _stub_sha(),
         "env": env,
         "slurm_version": slurm_version,
         "slurm_tools": {
@@ -2096,6 +2113,406 @@ def op_sbatch(args):
     return res
 
 
+TASK_SCHEMA = 1
+TASK_LOCK_WAIT = 10.0
+TASK_LOCK_STALE = 180.0
+TASK_STATES = frozenset(
+    (
+        "PREPARED",
+        "SUBMITTING",
+        "ACCEPTED",
+        "PENDING",
+        "RUNNING",
+        "COMPLETED",
+        "VERIFIED",
+        "INVALID",
+        "FAILED",
+        "REJECTED",
+        "UNKNOWN",
+    )
+)
+
+
+def _task_location(args, task_id):
+    if not isinstance(task_id, str) or not re.match(r"^[0-9a-f]{64}$", task_id):
+        raise StubError("invalid_arg", "task_id must be a 64-character lowercase sha256")
+    root = _path(args.get("task_dir") or "~/.remoteslurm/tasks")
+    return os.path.join(root, task_id[:2], task_id)
+
+
+def _task_read(path):
+    try:
+        with io.open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+    except OSError:
+        return None
+    except ValueError as e:
+        raise StubError("error", "invalid durable task record %s: %s" % (path, e), path=path)
+    if not isinstance(value, dict):
+        raise StubError("error", "durable task record is not an object: %s" % path, path=path)
+    return value
+
+
+def _task_write(path, value):
+    value["updated_at"] = time.time()
+    data = json.dumps(value, indent=1, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    _atomic_write(path, data, keep_mode=False, mode=0o600)
+
+
+def _task_lock_owner_dead(lockdir):
+    try:
+        with io.open(os.path.join(lockdir, "owner.json"), "r", encoding="utf-8") as f:
+            owner = json.load(f)
+    except (OSError, ValueError):
+        owner = {}
+    if owner.get("hostname") == socket.gethostname():
+        try:
+            os.kill(int(owner.get("pid")), 0)
+        except (OSError, TypeError, ValueError):
+            return True
+    try:
+        return time.time() - os.path.getmtime(lockdir) > TASK_LOCK_STALE
+    except OSError:
+        return False
+
+
+def _task_break_stale_lock(lockdir):
+    stale = "%s.stale.%d.%s" % (lockdir, os.getpid(), uuid.uuid4().hex[:8])
+    try:
+        os.rename(lockdir, stale)
+    except OSError:
+        return False
+    shutil.rmtree(stale, ignore_errors=True)
+    return True
+
+
+@contextmanager
+def _task_lock(taskdir):
+    os.makedirs(taskdir, exist_ok=True)
+    lockdir = taskdir + ".lock"
+    deadline = time.time() + TASK_LOCK_WAIT
+    while True:
+        try:
+            os.mkdir(lockdir, 0o700)
+            owner = {
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "created_at": time.time(),
+            }
+            _atomic_write(
+                os.path.join(lockdir, "owner.json"),
+                json.dumps(owner, sort_keys=True).encode("utf-8"),
+                keep_mode=False,
+                mode=0o600,
+            )
+            break
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise _os_error(e, lockdir)
+            if _task_lock_owner_dead(lockdir) and _task_break_stale_lock(lockdir):
+                continue
+            if time.time() >= deadline:
+                raise StubError(
+                    "task_busy",
+                    "another ensure request holds the durable task lease",
+                    task_dir=taskdir,
+                    action="retry ensure; a stale lease is recovered after %d seconds"
+                    % TASK_LOCK_STALE,
+                )
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            os.remove(os.path.join(lockdir, "owner.json"))
+        except OSError:
+            pass
+        try:
+            os.rmdir(lockdir)
+        except OSError:
+            pass
+
+
+def _fingerprint_file(raw, required=True, hash_content=True, base=None):
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    if not os.path.isabs(expanded) and base:
+        expanded = os.path.join(base, expanded)
+    p = _path(expanded)
+    if not os.path.lexists(p):
+        if required:
+            raise StubError("not_found", "no such declared file: %s" % p, path=p)
+        return {"path": p, "exists": False}
+    if not os.path.isfile(p):
+        raise StubError(
+            "invalid_arg",
+            "durable task fingerprints support regular files only: %s" % p,
+            path=p,
+        )
+    st = os.stat(p)
+    out = {"path": p, "exists": True, "size": st.st_size}
+    if hash_content:
+        digest = hashlib.sha256()
+        try:
+            with io.open(p, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as e:
+            raise _os_error(e, p)
+        out["sha256"] = digest.hexdigest()
+    return out
+
+
+def op_task_fingerprint(args):
+    paths = args.get("paths")
+    if not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
+        raise StubError("invalid_arg", "paths must be a list of non-empty strings")
+    if len(paths) > 1024:
+        raise StubError("invalid_arg", "at most 1024 files may be fingerprinted per request")
+    required = bool(args.get("required", True))
+    hash_content = bool(args.get("hash", True))
+    base = args.get("base")
+    if base is not None:
+        base = _path(base, must_exist=True)
+    return {
+        "files": [
+            _fingerprint_file(
+                p, required=required, hash_content=hash_content, base=base
+            )
+            for p in paths
+        ]
+    }
+
+
+def _task_find_jobs(marker, since):
+    """Find an attempt marker in live queue and accounting without relying on client state."""
+    found = {}
+    user = getpass.getuser()
+    sq = _slurm_soft(["squeue", "-h", "-u", user, "-o", "%i|%j|%T"], timeout=30)
+    if sq.get("rc") == 0:
+        for line in sq.get("stdout", "").splitlines():
+            fields = line.split("|")
+            if len(fields) >= 3 and fields[1] == marker:
+                found[fields[0]] = {"job_id": fields[0], "state": fields[2], "source": "squeue"}
+    start = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(max(0, float(since or time.time()) - 86400))
+    )
+    sa = _slurm_soft(
+        [
+            "sacct",
+            "-X",
+            "-n",
+            "-P",
+            "-u",
+            user,
+            "-S",
+            start,
+            "-o",
+            "JobID,JobName,State",
+        ],
+        timeout=30,
+    )
+    if sa.get("rc") == 0:
+        for line in sa.get("stdout", "").splitlines():
+            fields = line.split("|")
+            if len(fields) >= 3 and fields[1] == marker:
+                jid = fields[0].split(".", 1)[0]
+                found[jid] = {"job_id": jid, "state": fields[2], "source": "sacct"}
+    return list(found.values())
+
+
+def _task_current(record):
+    current = record.get("current_attempt")
+    for attempt in reversed(record.get("attempts") or []):
+        if attempt.get("attempt_id") == current:
+            return attempt
+    return None
+
+
+def op_task_ensure(args):
+    """Persist intent remotely, recover an attempt, or submit exactly one marked batch job."""
+    task_id = args.get("task_id")
+    taskdir = _task_location(args, task_id)
+    record_path = os.path.join(taskdir, "task.json")
+    contract = args.get("contract")
+    script = args.get("script")
+    flags = args.get("args") or []
+    cwd = args.get("cwd")
+    attempt_id = args.get("attempt_id")
+    if not isinstance(contract, dict):
+        raise StubError("invalid_arg", "contract must be an object")
+    canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != task_id:
+        raise StubError("invalid_arg", "task_id does not match the canonical contract")
+    if not isinstance(script, str) or not script.strip():
+        raise StubError("invalid_arg", "script must be non-empty content")
+    if hashlib.sha256(script.encode("utf-8")).hexdigest() != contract.get("script_sha256"):
+        raise StubError("invalid_arg", "script content does not match contract script_sha256")
+    if not isinstance(flags, list) or not all(isinstance(v, str) for v in flags):
+        raise StubError("invalid_arg", "args must be a list of strings")
+    if cwd is not None:
+        cwd = _path(cwd, must_exist=True)
+    if not isinstance(attempt_id, str) or not re.match(r"^[0-9a-f]{32}$", attempt_id):
+        raise StubError("invalid_arg", "attempt_id must be a 32-character lowercase hex id")
+
+    with _task_lock(taskdir):
+        record = _task_read(record_path)
+        if record is None:
+            record = {
+                "schema": TASK_SCHEMA,
+                "task_id": task_id,
+                "name": args.get("name"),
+                "contract": contract,
+                "created_at": time.time(),
+                "state": "PREPARED",
+                "attempts": [],
+                "receipt_history": [],
+            }
+            _task_write(record_path, record)
+        elif record.get("contract") != contract:
+            raise StubError(
+                "error",
+                "durable task hash collision or incompatible canonicalization",
+                task_id=task_id,
+            )
+
+        current = _task_current(record)
+        if current and current.get("state") == "SUBMITTING" and not current.get("job_id"):
+            matches = _task_find_jobs(current.get("marker"), current.get("created_at"))
+            if len(matches) == 1:
+                current["job_id"] = matches[0]["job_id"]
+                current["state"] = "ACCEPTED"
+                current["recovered"] = True
+                current["recovered_from"] = matches[0]["source"]
+                record["state"] = "ACCEPTED"
+                _task_write(record_path, record)
+            else:
+                current["state"] = "UNKNOWN"
+                current["reconciliation_matches"] = matches
+                record["state"] = "UNKNOWN"
+                record["reason"] = (
+                    "submission may have reached Slurm but no unique scheduler record was found"
+                    if not matches
+                    else "multiple scheduler jobs carry the same durable attempt marker"
+                )
+                _task_write(record_path, record)
+
+        state = record.get("state")
+        current = _task_current(record)
+        retry = bool(args.get("retry"))
+        retry_unknown = bool(args.get("retry_unknown"))
+        if current is not None:
+            if state == "UNKNOWN" and not retry_unknown:
+                return {"record": record, "task_dir": taskdir, "submitted": False}
+            if state in ("FAILED", "INVALID", "REJECTED") and not retry:
+                return {"record": record, "task_dir": taskdir, "submitted": False}
+            if state not in ("FAILED", "INVALID", "REJECTED", "UNKNOWN"):
+                return {"record": record, "task_dir": taskdir, "submitted": False}
+
+        if record.get("receipt") is not None:
+            record.setdefault("receipt_history", []).append(record["receipt"])
+            record.pop("receipt", None)
+        record.pop("reason", None)
+        marker = "rse-%s-%s" % (task_id[:10], attempt_id[:10])
+        script_path = os.path.join(taskdir, "attempt-%s.sh" % attempt_id)
+        if not script.endswith("\n"):
+            script += "\n"
+        _atomic_write(script_path, script.encode("utf-8"), keep_mode=False, mode=0o700)
+        attempt = {
+            "attempt_id": attempt_id,
+            "marker": marker,
+            "state": "SUBMITTING",
+            "created_at": time.time(),
+            "script_path": script_path,
+            "control": args.get("control") or {},
+        }
+        record.setdefault("attempts", []).append(attempt)
+        record["current_attempt"] = attempt_id
+        record["state"] = "SUBMITTING"
+        _task_write(record_path, record)
+
+        argv = ["sbatch", "--parsable", "--job-name=" + marker] + flags + [script_path]
+        result = _slurm(
+            argv,
+            timeout=120,
+            cwd=cwd or os.path.expanduser("~"),
+            on_spawn=args.get("_register"),
+            new_session=True,
+        )
+        attempt["sbatch_rc"] = result.get("rc")
+        attempt["sbatch_stderr"] = (result.get("stderr") or "")[-4000:]
+        if result.get("rc") != 0:
+            attempt["state"] = "REJECTED"
+            record["state"] = "REJECTED"
+            record["reason"] = attempt["sbatch_stderr"] or "sbatch rejected the submission"
+            _task_write(record_path, record)
+            return {"record": record, "task_dir": taskdir, "submitted": False}
+        match = re.match(r"^\s*(\d+)", result.get("stdout") or "")
+        if not match:
+            attempt["state"] = "UNKNOWN"
+            record["state"] = "UNKNOWN"
+            record["reason"] = "sbatch returned success without a parseable job id"
+            _task_write(record_path, record)
+            return {"record": record, "task_dir": taskdir, "submitted": False}
+        if os.environ.get("REMOTESLURM_TEST_LOSE_AFTER_ACCEPT") == "1":
+            # Fault injection models a lost response after scheduler acceptance. The real
+            # client-disconnect path lets this worker finish and release its lease; remove it
+            # explicitly before the hard process exit so the test exercises reconciliation.
+            lockdir = taskdir + ".lock"
+            try:
+                os.remove(os.path.join(lockdir, "owner.json"))
+                os.rmdir(lockdir)
+            except OSError:
+                pass
+            os._exit(91)
+        attempt["job_id"] = match.group(1)
+        attempt["state"] = "ACCEPTED"
+        attempt["accepted_at"] = time.time()
+        record["state"] = "ACCEPTED"
+        _task_write(record_path, record)
+        return {"record": record, "task_dir": taskdir, "submitted": True}
+
+
+def op_task_update(args):
+    task_id = args.get("task_id")
+    taskdir = _task_location(args, task_id)
+    record_path = os.path.join(taskdir, "task.json")
+    state = args.get("state")
+    if state not in TASK_STATES:
+        raise StubError("invalid_arg", "invalid durable task state: %r" % state)
+    with _task_lock(taskdir):
+        record = _task_read(record_path)
+        if record is None:
+            raise StubError("not_found", "durable task record does not exist", task_id=task_id)
+        attempt = _task_current(record)
+        if attempt is None or attempt.get("attempt_id") != args.get("attempt_id"):
+            raise StubError("invalid_arg", "attempt is not the task's current attempt")
+        progress = {"SUBMITTING": 0, "ACCEPTED": 1, "PENDING": 2, "RUNNING": 3, "COMPLETED": 4}
+        previous = attempt.get("state")
+        if state in progress and (
+            previous not in progress or progress[state] < progress.get(previous, -1)
+        ):
+            return {"record": record, "task_dir": taskdir}
+        if state == "UNKNOWN" and previous in ("COMPLETED", "VERIFIED", "INVALID", "FAILED"):
+            return {"record": record, "task_dir": taskdir}
+        attempt["state"] = state
+        if isinstance(args.get("scheduler"), dict):
+            attempt["scheduler"] = args["scheduler"]
+        record["state"] = state
+        if isinstance(args.get("validation"), dict):
+            record["last_validation"] = args["validation"]
+        if isinstance(args.get("receipt"), dict):
+            record["receipt"] = args["receipt"]
+        if args.get("reason"):
+            record["reason"] = str(args["reason"])
+        elif state in ("ACCEPTED", "PENDING", "RUNNING", "COMPLETED", "VERIFIED"):
+            record.pop("reason", None)
+        _task_write(record_path, record)
+        return {"record": record, "task_dir": taskdir}
+
+
 def op_squeue(args):
     fmt = args.get("format")
     if not isinstance(fmt, str) or not fmt:
@@ -2280,6 +2697,9 @@ OPS = {
     "proc_kill": op_proc_kill,
     "waitfor": op_waitfor,
     "sbatch": op_sbatch,
+    "task_fingerprint": op_task_fingerprint,
+    "task_ensure": op_task_ensure,
+    "task_update": op_task_update,
     "squeue": op_squeue,
     "sacct": op_sacct,
     "scontrol": op_scontrol,
@@ -2507,7 +2927,10 @@ def main():
         os.chdir(os.path.expanduser("~"))
     except OSError:
         pass
-    out.write("REMOTESLURM-READY %d %d %s\n" % (PROTOCOL, os.getpid(), sys.version.split()[0]))
+    out.write(
+        "REMOTESLURM-READY %d %d %s %s\n"
+        % (PROTOCOL, os.getpid(), sys.version.split()[0], _stub_sha() or "unknown")
+    )
     out.flush()
     srv = Server(out)
     try:

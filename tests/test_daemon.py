@@ -12,7 +12,7 @@ import pytest
 
 from remoteslurm import daemon
 from remoteslurm.config import Config
-from remoteslurm.errors import NotFound
+from remoteslurm.errors import ExecutionMismatch, NotFound
 
 FAKESLURM = Path(__file__).parent / "fakeslurm"
 
@@ -91,6 +91,19 @@ def test_cli_uses_daemon(daemon_env: Path, capsys: pytest.CaptureFixture[str]) -
 def test_no_daemon_env_bypasses(daemon_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REMOTESLURM_NO_DAEMON", "1")
     assert daemon.connect_via_daemon("fake", Config.load(), autostart=False) is None
+
+
+def test_stale_daemon_build_is_rejected(
+    daemon_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        daemon,
+        "daemon_status",
+        lambda path=None: {"build_id": "old-build", "pid": 99},
+    )
+    with pytest.raises(ExecutionMismatch) as exc:
+        daemon.connect_via_daemon("fake", Config.load(), autostart=False)
+    assert "daemon stop" in str(exc.value)
 
 
 def test_stale_socket_is_cleaned() -> None:

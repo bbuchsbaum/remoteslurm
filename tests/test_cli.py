@@ -4,6 +4,7 @@ import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -23,6 +24,7 @@ def cli_env(sandbox: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> I
     )
     monkeypatch.setenv("REMOTESLURM_CONFIG", str(cfg))
     monkeypatch.setenv("REMOTESLURM_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("REMOTESLURM_SOCKET", str(tmp_path / "daemon.sock"))
     monkeypatch.delenv("REMOTESLURM_DEFAULT_HOST", raising=False)
     yield sandbox
     for c in list(cluster_mod._clusters.values()):
@@ -108,6 +110,35 @@ def test_pack_command_file(
     assert result["max_processes"] == 2
 
 
+def test_ensure_manifest_reaches_verified(
+    cli_env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = tmp_path / "fit.sh"
+    script.write_text("echo fit\n")
+    output = cli_env / "result.txt"
+    output.write_text("valid\n")
+    input_path = cli_env / "proj" / "a.txt"
+    manifest = tmp_path / "fit.toml"
+    manifest.write_text(
+        f'name = "fit"\nscript = "fit.sh"\ncwd = "{cli_env}"\n'
+        f'inputs = ["{input_path}"]\n'
+        f'outputs = ["{output}"]\nvalidate = ["test", "-s", "{output}"]\n'
+        '[environment]\ncontainer = "example@sha256:' + "a" * 64 + '"\n'
+    )
+    result: dict[str, Any] = {}
+    rc = 1
+    for _ in range(10):
+        rc, out, _ = run(capsys, "--json", "ensure", str(manifest))
+        result = json.loads(out)
+        if result["state"] == "VERIFIED":
+            break
+        assert rc == 0
+    assert rc == 0
+    assert result["state"] == "VERIFIED"
+    receipt = result["receipt"]
+    assert isinstance(receipt, dict) and receipt["outputs"][0]["sha256"]
+
+
 def test_errors_are_structured(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
     rc, out, err = run(capsys, "cat", "~/nope")
     assert rc == 1 and "error [not_found]" in err
@@ -121,12 +152,14 @@ def test_not_connected_exit_code(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    from remoteslurm import daemon
     from remoteslurm.transport import SSHTransport
 
     monkeypatch.setattr(SSHTransport, "master_alive", lambda self: False)
     monkeypatch.setattr(SSHTransport, "master_exit", lambda self: None)
+    monkeypatch.setattr(daemon, "spawn_daemon", lambda path=None: False)
     rc, out, err = run(capsys, "--json", "ls", "someMfaHost:~")
-    assert rc == 3
+    assert rc == 3, (out, err)
     d = json.loads(out)
     assert d["error"] == "not_connected" and "remoteslurm connect someMfaHost" in d["action"]
 

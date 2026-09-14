@@ -52,6 +52,7 @@ CORE_TOOLS = {
     "proc_tail",
     "proc_kill",
     "submit",
+    "ensure",
     "pack",
     "jobs",
     "diagnose",
@@ -518,6 +519,30 @@ async def submit(
     return await _guard(host, f)
 
 
+async def ensure(
+    manifest: dict[str, Any],
+    retry: bool = False,
+    retry_unknown: bool = False,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Recover, submit, or verify a durable single-job contract.
+
+    ``manifest`` uses the same fields as ``rslurm ensure``. MCP callers should normally provide
+    ``script_inline`` because ``script`` is resolved on the MCP server's local filesystem.
+    ``retry`` creates another visible attempt after FAILED/INVALID/REJECTED. An UNKNOWN attempt
+    remains blocked unless ``retry_unknown`` explicitly accepts possible duplicate execution.
+    """
+    from .tasks import TaskSpec
+
+    def f(c: Cluster) -> dict[str, Any]:
+        return c.ensure(
+            TaskSpec.from_mapping(manifest), retry=retry, retry_unknown=retry_unknown
+        )
+
+    selected_host = host or manifest.get("host")
+    return await _guard(selected_host, f)
+
+
 async def sweep(
     params: dict[str, list[Any]] | list[dict[str, Any]],
     script: str | None = None,
@@ -982,6 +1007,7 @@ ALL_TOOLS: dict[str, Any] = {
     "proc_tail": proc_tail,
     "proc_kill": proc_kill,
     "submit": submit,
+    "ensure": ensure,
     "pack": pack,
     "sweep": sweep,
     "jobs": jobs,

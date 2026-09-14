@@ -119,6 +119,18 @@ class Cluster(SlurmOps):
             if _clusters.get(self.host.name) is self:
                 del _clusters[self.host.name]
 
+    def ensure(
+        self,
+        spec: Any,
+        *,
+        retry: bool = False,
+        retry_unknown: bool = False,
+    ) -> dict[str, Any]:
+        """Recover, submit, or verify a durable task contract."""
+        from .tasks import ensure_task
+
+        return ensure_task(self, spec, retry=retry, retry_unknown=retry_unknown)
+
     def __enter__(self) -> Cluster:
         return self
 

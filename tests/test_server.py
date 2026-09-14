@@ -26,6 +26,7 @@ CORE_EXPECTED = {
     "proc_tail",
     "proc_kill",
     "submit",
+    "ensure",
     "pack",
     "jobs",
     "diagnose",
@@ -285,6 +286,27 @@ def test_submit_and_jobs(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) 
 def test_submit_invalid_arg(mcp_cluster: Cluster) -> None:
     r = call("submit")
     assert r["error"] == "invalid_arg"
+
+
+def test_ensure_tool_recovers_one_task(mcp_cluster: Cluster, sandbox) -> None:
+    output = sandbox / "mcp-result.txt"
+    output.write_text("valid\n")
+    manifest = {
+        "name": "mcp-fit",
+        "script_inline": "#!/bin/bash\necho fit\n",
+        "cwd": str(sandbox),
+        "inputs": [str(sandbox / "proj" / "a.txt")],
+        "outputs": [str(output)],
+        "validate": ["test", "-s", str(output)],
+        "environment": {"container": "example@sha256:" + "a" * 64},
+    }
+    result: dict[str, Any] = {}
+    for _ in range(10):
+        result = call("ensure", manifest=manifest)
+        if result["state"] == "VERIFIED":
+            break
+    assert result["state"] == "VERIFIED"
+    assert len(result["attempts"]) == 1
 
 
 def test_pack_tool_submits_commands(mcp_cluster: Cluster) -> None:

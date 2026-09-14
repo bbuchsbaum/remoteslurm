@@ -19,6 +19,10 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   whole file and `write` it back. `diff` checks a remote file against what you expect.
 
 ## Running jobs
+- Use `ensure` for a single job whose result must survive a lost client and be checked before
+  reuse. Repeat the same manifest object to recover it. Treat `VERIFIED` as the result state;
+  `COMPLETED` is only scheduler completion. Never retry `UNKNOWN` unless the user explicitly accepts
+  possible duplicate execution.
 - Submit with `submit`. Prefer a **template**: `submit(template="cpu", script=...)` fills in
   options and prepends the module-load/venv preamble. Give either `script` (content) or
   `path` (an existing remote script), never both.

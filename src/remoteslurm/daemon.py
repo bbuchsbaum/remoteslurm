@@ -37,6 +37,7 @@ from typing import Any
 from .cluster import Cluster
 from .config import Config, state_dir
 from .errors import RemoteSlurmError, RemoteTimeout, SessionDied, from_stub_error
+from .identity import control_identity
 
 log = logging.getLogger(__name__)
 
@@ -187,8 +188,12 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
         if op == "_status":
             from .cluster import _clusters
 
+            ident = control_identity()
             return {
                 "pid": os.getpid(),
+                "build_id": ident["build_id"],
+                "version": ident["version"],
+                "stub_sha": ident["stub_sha"],
                 "socket": str(self.path),
                 "uptime": round(time.time() - self.started, 1),
                 "idle_seconds": self.idle_seconds,
@@ -197,6 +202,7 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
                     n: {
                         "alive": c.session.alive,
                         "remote_pid": c.session.remote_pid,
+                        "remote_stub_sha": c.session.remote_stub_sha,
                         "spawns": c.session.spawn_count,
                         "transport": c.transport.describe(),
                     }
@@ -352,6 +358,13 @@ def spawn_daemon(path: Path | None = None) -> bool:
     path = path or socket_path()
     env = dict(os.environ)
     env[ENV_SOCKET] = str(path)
+    # A source checkout may be running against an installed remoteslurm of the same version.
+    # Start the daemon from the exact package tree that made this request so the build-identity
+    # handshake is meaningful in editable installs as well as wheels.
+    package_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = package_root + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
     logdir = state_dir()
     logdir.mkdir(parents=True, exist_ok=True)
     logf = open(logdir / "daemon.log", "ab")
@@ -396,6 +409,9 @@ class DaemonSession:
         self.path = path
         self.host = host
         self.remote_pid: int | None = None
+        self.remote_protocol: int | None = None
+        self.remote_python: str | None = None
+        self.remote_stub_sha: str | None = None
         self.spawn_count = 0
 
     @property
@@ -547,6 +563,18 @@ def connect_via_daemon(
     path = socket_path()
     if not daemon_available(path) and not (autostart and spawn_daemon(path)):
         return None
+    status = daemon_status(path)
+    expected = control_identity()
+    if status.get("build_id") != expected["build_id"]:
+        from .errors import ExecutionMismatch
+
+        raise ExecutionMismatch(
+            "the running remoteslurm daemon was loaded from a different build",
+            action="run `rslurm daemon stop`, then repeat the command so the daemon restarts",
+            client_build=expected["build_id"],
+            daemon_build=status.get("build_id"),
+            daemon_pid=status.get("pid"),
+        )
     from .transport import SSHTransport
 
     # The stub calls go through the daemon, but client-side rsync (sync/put/get) reads this

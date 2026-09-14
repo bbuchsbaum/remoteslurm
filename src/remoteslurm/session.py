@@ -99,6 +99,7 @@ class Session:
         self.remote_pid: int | None = None
         self.remote_protocol: int | None = None
         self.remote_python: str | None = None
+        self.remote_stub_sha: str | None = None
         self.spawn_count = 0
         self.last_used = 0.0
 
@@ -123,6 +124,7 @@ class Session:
         self._ready_error = None
         self.remote_pid = None
         self.remote_protocol = None
+        self.remote_stub_sha = None
         self.preamble = []
         self.stderr_tail = []
         self._proc = self.transport.spawn()
@@ -219,6 +221,7 @@ class Session:
                         self.remote_protocol = int(parts[1])
                         self.remote_pid = int(parts[2])
                         self.remote_python = parts[3]
+                        self.remote_stub_sha = parts[4] if len(parts) > 4 else None
                     except (IndexError, ValueError):
                         pass
                     self._ready.set()
