@@ -48,6 +48,28 @@ def emit(args: argparse.Namespace, data: Any, human: Callable[[Any], None] | Non
         human(data)
 
 
+def _warn_unrecorded(job: Any) -> None:
+    if job.recorded:
+        return
+    print(
+        f"WARNING: Slurm accepted job {job.job_id}, but its local registry record could not "
+        f"be saved. Do not submit it again. Recover with: rslurm adopt {job.job_id}",
+        file=sys.stderr,
+    )
+
+
+def _submitted_status(job: Any) -> dict[str, Any]:
+    """Best-effort initial status that never hides an accepted scheduler job."""
+    try:
+        return job.status().to_dict()
+    except RemoteSlurmError as e:
+        return {
+            "job_id": job.job_id,
+            "state": "UNKNOWN",
+            "status_error": e.to_dict(),
+        }
+
+
 def fmt_size(n: int | None) -> str:
     if n is None:
         return "-"
@@ -751,15 +773,34 @@ def cmd_submit(args: argparse.Namespace) -> int:
         dependency=args.dependency,
         **options,
     )
-    st = job.status()
-    d = st.to_dict()
+    d = _submitted_status(job)
+    d.update(job.submission())
+
+    def human(data: dict[str, Any]) -> None:
+        print(
+            f"Submitted job {job.job_id} ({data.get('state')})\n"
+            f"  script: {data.get('script_path')}\n  stdout: {data.get('stdout_path')}"
+        )
+        _warn_unrecorded(job)
+
     emit(
         args,
         d,
-        lambda d: print(
-            f"Submitted job {job.job_id} ({d.get('state')})\n"
-            f"  script: {d.get('script_path')}\n  stdout: {d.get('stdout_path')}"
-        ),
+        human,
+    )
+    return EXIT_OK
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    c = get_cluster(args)
+    job = c.adopt(args.job_id)
+    st = job.status(refresh=True)
+    d = st.to_dict()
+    d.update({"adopted": True, "recorded": True})
+    emit(
+        args,
+        d,
+        lambda data: print(f"Adopted job {job.job_id} ({data.get('state')})"),
     )
     return EXIT_OK
 
@@ -835,20 +876,27 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         cwd=args.cwd,
         **options,
     )
-    rec = c.registry.get(job.job_id)
-    sweep_meta = (rec.meta.get("sweep") if rec else None) or {}
-    st = job.status()
-    d = st.to_dict()
+    rec = c.registry.get(job.job_id) if job.recorded else None
+    sweep_meta = (rec.meta.get("sweep") if rec else None) or job.metadata.get("sweep", {})
+    d = _submitted_status(job)
     d["n"] = sweep_meta.get("n")
     d["params_path"] = sweep_meta.get("params_path")
+    d["names"] = sweep_meta.get("names")
+    d["array"] = rec.meta.get("array") if rec else None
+    d.update(job.submission())
+
+    def human(data: dict[str, Any]) -> None:
+        print(
+            f"Submitted sweep {job.job_id} ({sweep_meta.get('n')} tasks, "
+            f"array {rec.meta.get('array') if rec else '?'})\n"
+            f"  params: {sweep_meta.get('params_path')}\n  script: {data.get('script_path')}"
+        )
+        _warn_unrecorded(job)
+
     emit(
         args,
         d,
-        lambda d: print(
-            f"Submitted sweep {job.job_id} ({sweep_meta.get('n')} tasks, "
-            f"array {rec.meta.get('array') if rec else '?'})\n"
-            f"  params: {sweep_meta.get('params_path')}\n  script: {d.get('script_path')}"
-        ),
+        human,
     )
     return EXIT_OK
 
@@ -882,19 +930,25 @@ def cmd_pack(args: argparse.Namespace) -> int:
         cwd=args.cwd,
         **options,
     )
-    rec = c.registry.get(job.job_id)
-    meta = (rec.meta.get("pack") if rec else None) or {}
-    st = job.status()
-    d = st.to_dict()
+    rec = c.registry.get(job.job_id) if job.recorded else None
+    meta = (rec.meta.get("pack") if rec else None) or job.metadata.get("pack", {})
+    d = _submitted_status(job)
     d.update(meta)
+    d.update(job.submission())
+
+    def human(data: dict[str, Any]) -> None:
+        print(
+            f"Submitted packed job {job.job_id} ({data.get('n')} commands, "
+            f"{data.get('batches')} allocation(s), up to "
+            f"{data.get('max_processes')} processes each)\n"
+            f"  commands: {data.get('commands_path')}\n  script: {data.get('script_path')}"
+        )
+        _warn_unrecorded(job)
+
     emit(
         args,
         d,
-        lambda d: print(
-            f"Submitted packed job {job.job_id} ({d.get('n')} commands, "
-            f"{d.get('batches')} allocation(s), up to {d.get('max_processes')} processes each)\n"
-            f"  commands: {d.get('commands_path')}\n  script: {d.get('script_path')}"
-        ),
+        human,
     )
     return EXIT_OK
 
@@ -1045,6 +1099,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     c = get_cluster(args)
     pruned: dict[str, Any] | None = None
     if getattr(args, "prune", False):
+        c.registry.preflight()
         pruned = c.registry.prune(force=True)
         if not args.json:
             print(f"pruned {pruned['pruned']} stale record(s)", file=sys.stderr)
@@ -1055,9 +1110,22 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         if cell:
             r["tasks"] = cell
     out: dict[str, Any] = {"jobs": rows, "count": len(rows)}
+    out["registry_available"] = c.registry_error is None
+    if c.registry_error:
+        out["registry_error"] = c.registry_error
     if pruned is not None:
         out["pruned"] = pruned
-    emit(args, out, lambda d: _print_jobs(d["jobs"]))
+
+    def human(data: dict[str, Any]) -> None:
+        _print_jobs(data["jobs"])
+        if data.get("registry_error"):
+            print(
+                "WARNING: local job history is unavailable; showing scheduler-visible jobs only: "
+                + str(data["registry_error"]),
+                file=sys.stderr,
+            )
+
+    emit(args, out, human)
     return EXIT_OK
 
 
@@ -1096,6 +1164,13 @@ def cmd_status(args: argparse.Namespace) -> int:
                 print(
                     f"  {'params':12} " + " ".join(f"{k}={v}" for k, v in extra["params"].items())
                 )
+        errors = {str(d["registry_error"]) for d in rows if d.get("registry_error")}
+        for error in sorted(errors):
+            print(
+                "WARNING: local job history is unavailable; status came from the scheduler: "
+                + error,
+                file=sys.stderr,
+            )
 
     emit(args, out if len(out) > 1 else out[0], lambda d: human(d if isinstance(d, list) else [d]))
     return EXIT_OK
@@ -1829,6 +1904,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--sbatch-arg", action="append", metavar="ARG", help="raw extra sbatch argument"
     )
+
+    sp = add("adopt", cmd_adopt, "reconstruct local history for an existing Slurm job")
+    sp.add_argument("job_id")
 
     sp = add(
         "pack",

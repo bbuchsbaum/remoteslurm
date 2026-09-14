@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import remoteslurm.jobs as jobs_mod
-from remoteslurm.errors import InvalidArgument, SlurmError
+from remoteslurm.errors import InvalidArgument, RegistryUnavailable, SlurmError
 
 SCRIPT = "#!/bin/bash\n#SBATCH -J rs_test\necho hello\n"
 
@@ -67,6 +67,93 @@ def test_submit_argument_validation(cluster):
         cluster.submit()
     with pytest.raises(InvalidArgument):
         cluster.submit(SCRIPT, path="/some/where.sh")
+
+
+def test_submit_preflight_failure_creates_no_scheduler_job(cluster, sandbox, _isolated_state):
+    _isolated_state.write_text("state path is a file\n")
+
+    with pytest.raises(RegistryUnavailable) as exc:
+        cluster.submit(SCRIPT)
+
+    assert exc.value.code == "registry_unavailable"
+    assert "REMOTESLURM_STATE_DIR" in str(exc.value.action)
+    assert not (sandbox / ".fakeslurm.json").exists()
+
+
+def test_post_submit_registry_failure_returns_recoverable_handle(
+    cluster, sandbox, monkeypatch: pytest.MonkeyPatch
+):
+    def fail_put(_rec):
+        raise PermissionError("registry became read-only")
+
+    monkeypatch.setattr(cluster.registry, "put", fail_put)
+    job = cluster.submit(SCRIPT)
+
+    assert job.recorded is False
+    assert job.submission() == {
+        "submitted": True,
+        "recorded": False,
+        "job_id": job.job_id,
+        "registry_error": "PermissionError: registry became read-only",
+        "recovery": f"rslurm adopt {job.job_id}",
+    }
+    assert set(fake_state(sandbox)["jobs"]) == {job.job_id}
+
+
+def test_adopt_reconstructs_a_missing_registry_record(cluster):
+    job = cluster.submit(SCRIPT, name="recover-me")
+    assert cluster.registry.forget(job.job_id)
+
+    adopted = cluster.adopt(job.job_id)
+
+    assert adopted.job_id == job.job_id and adopted.recorded is True
+    rec = cluster.registry.get(job.job_id)
+    assert rec is not None
+    assert rec.name == "recover-me"
+    assert rec.meta["adopted"] is True
+    assert rec.stdout_path and rec.script_path
+
+
+def test_status_and_jobs_degrade_when_registry_is_unreadable(
+    cluster, monkeypatch: pytest.MonkeyPatch
+):
+    job = cluster.submit(SCRIPT)
+
+    def unavailable(*_args, **_kwargs):
+        raise PermissionError("registry cannot be read")
+
+    for method in ("get", "all", "update", "prune"):
+        monkeypatch.setattr(cluster.registry, method, unavailable)
+
+    status = cluster.job_status(job.job_id, refresh=True)
+    assert status.job_id == job.job_id
+    assert status.source in {"squeue", "scontrol", "sacct"}
+    assert status.registry_available is False
+    assert "registry cannot be read" in str(status.registry_error)
+
+    listed = cluster.jobs(refresh=True)
+    assert [row.job_id for row in listed] == [job.job_id]
+    assert listed[0].registry_available is False
+    assert "registry cannot be read" in str(cluster.registry_error)
+
+
+def test_pack_and_sweep_preflight_before_remote_support_files(
+    cluster, sandbox, monkeypatch: pytest.MonkeyPatch
+):
+    error = RegistryUnavailable("registry unavailable")
+
+    def fail_preflight() -> None:
+        raise error
+
+    monkeypatch.setattr(cluster.registry, "preflight", fail_preflight)
+
+    with pytest.raises(RegistryUnavailable):
+        cluster.pack(["echo one"])
+    with pytest.raises(RegistryUnavailable):
+        cluster.sweep({"x": [1]}, script=SCRIPT)
+
+    assert not (sandbox / ".remoteslurm").exists()
+    assert not (sandbox / ".fakeslurm.json").exists()
 
 
 def test_sbatch_rejection_raises(cluster):

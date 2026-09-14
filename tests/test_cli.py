@@ -173,11 +173,49 @@ def test_config_and_mcp_config(
     rc, out, _ = run(capsys, "--json", "config")
     d = json.loads(out)
     assert rc == 0 and d["default_host"] == "local" and "local" in d["hosts"]
+    assert d["state_dir"] == os.environ["REMOTESLURM_STATE_DIR"]
     monkeypatch.setenv("REMOTESLURM_CONFIG", str(tmp_path / "fresh.toml"))
     rc, out, _ = run(capsys, "config", "--init")
     assert rc == 0 and (tmp_path / "fresh.toml").exists()
     rc, out, _ = run(capsys, "config", "--init")
     assert rc == 1
+
+
+def test_submit_unrecorded_result_and_adopt_recovery(
+    cli_env: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from remoteslurm.cluster import Cluster
+    from remoteslurm.errors import SessionDied
+    from remoteslurm.jobs import JobRegistry
+
+    original_put = JobRegistry.put
+    original_status = Cluster.job_status
+
+    def fail_put(self: JobRegistry, rec: Any) -> None:
+        raise PermissionError("registry became read-only")
+
+    def fail_status(self: Cluster, job_id: str, **_kwargs: Any) -> Any:
+        raise SessionDied(f"lost connection after accepting {job_id}")
+
+    monkeypatch.setattr(JobRegistry, "put", fail_put)
+    monkeypatch.setattr(Cluster, "job_status", fail_status)
+    rc, out, _ = run(capsys, "--json", "submit", "echo recover\n")
+    result = json.loads(out)
+    assert rc == 0
+    assert result["submitted"] is True and result["recorded"] is False
+    assert result["recovery"] == f"rslurm adopt {result['job_id']}"
+    assert result["state"] == "UNKNOWN"
+    assert result["status_error"]["error"] == "session_died"
+
+    monkeypatch.setattr(JobRegistry, "put", original_put)
+    monkeypatch.setattr(Cluster, "job_status", original_status)
+    rc, out, _ = run(capsys, "--json", "adopt", result["job_id"])
+    adopted = json.loads(out)
+    assert rc == 0
+    assert adopted["job_id"] == result["job_id"]
+    assert adopted["adopted"] is True and adopted["recorded"] is True
 
 
 def test_run_detach_proc_and_wait(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:

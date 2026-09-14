@@ -103,6 +103,23 @@ rslurm watch 12345 --notify
 rslurm output 12345 -n 100
 ```
 
+Before calling `sbatch`, remoteslurm verifies that its local job registry can be updated. If the
+registry becomes unavailable after Slurm accepts the job, the command still succeeds and returns
+`submitted: true`, `recorded: false`, the Slurm job ID, and a recovery command. Recover that same
+job once local state is writable:
+
+```bash
+rslurm adopt 12345
+```
+
+`jobs` and `status` continue with scheduler-visible data when local history is unavailable and
+mark the result with `registry_available: false`. Set `REMOTESLURM_STATE_DIR` when the default
+state location is not writable, including sandboxed agent sessions:
+
+```bash
+REMOTESLURM_STATE_DIR=/tmp/remoteslurm-state rslurm --no-daemon submit scripts/fit.sh
+```
+
 Pack independent shell commands onto one or more one-node allocations with GNU Parallel. The two
 limits are intentionally separate: `--max-processes` controls concurrent processes inside each
 node, while `--max-concurrent` throttles the packed array allocations in Slurm.
@@ -151,7 +168,7 @@ for the manifest, retry semantics, Python API, and MCP tool.
 | Move or update work | `sync`, `put`, `get`, `edit` |
 | Run work through Slurm | `submit`, `ensure`, `pack`, `sweep`, `run --compute` |
 | Keep login-node work running | `run --detach`, `proc`, `wait --pid`/`--path` |
-| Observe jobs | `jobs`, `status`, `wait`, `watch`, `events` |
+| Observe or recover jobs | `jobs`, `status`, `adopt`, `wait`, `watch`, `events` |
 | Understand or stop a job | `output`, `diagnose`, `cancel` |
 | Inspect capacity and storage | `sinfo`, `queue`, `quota` |
 

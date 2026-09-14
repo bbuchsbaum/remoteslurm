@@ -82,6 +82,11 @@ def test_job_lifecycle(cluster: Cluster, workdir: str | None) -> None:
     st = job.wait(poll=5, timeout=600)
     assert st.state == "COMPLETED" and st.exit_code == 0
     assert "live-ok" in job.output(tail=50)["content"]
+    assert cluster.registry.forget(job.job_id)
+    adopted = cluster.adopt(job.job_id)
+    rec = cluster.registry.get(job.job_id)
+    assert adopted.job_id == job.job_id
+    assert rec is not None and rec.meta["adopted"] is True
     if st.script_path:
         cluster.rm(st.script_path)
 

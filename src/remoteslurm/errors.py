@@ -87,6 +87,12 @@ class TaskBusy(RemoteSlurmError):
     code = "task_busy"
 
 
+class RegistryUnavailable(RemoteSlurmError):
+    """Local durable state cannot be read or updated safely."""
+
+    code = "registry_unavailable"
+
+
 class Cancelled(RemoteSlurmError):
     """The caller abandoned the call (e.g. an MCP client cancelled or timed out the tool call)."""
 
@@ -123,6 +129,7 @@ _BY_CODE: dict[str, type[RemoteSlurmError]] = {
         ConfigError,
         ExecutionMismatch,
         TaskBusy,
+        RegistryUnavailable,
         Cancelled,
         ConfirmationRequired,
     )

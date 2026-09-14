@@ -52,6 +52,7 @@ CORE_TOOLS = {
     "proc_tail",
     "proc_kill",
     "submit",
+    "adopt",
     "ensure",
     "pack",
     "jobs",
@@ -71,6 +72,14 @@ def _get_cluster(host: str | None) -> Cluster:
 
 def _max_chars() -> int:
     return int(os.environ.get(ENV_MAX_CHARS, str(MAX_CHARS)))
+
+
+def _submitted_status(job: Any) -> dict[str, Any]:
+    """Best-effort initial status that preserves a scheduler-accepted result."""
+    try:
+        return job.status().to_dict()
+    except RemoteSlurmError as e:
+        return {"job_id": job.job_id, "state": "UNKNOWN", "status_error": e.to_dict()}
 
 
 def _cap(result: dict[str, Any]) -> dict[str, Any]:
@@ -506,15 +515,35 @@ async def submit(
             force_preamble=force_preamble,
             **(options or {}),
         )
-        st = job.status()
-        return {
+        status = _submitted_status(job)
+        result = {
             "job_id": job.job_id,
-            "script_path": st.script_path,
-            "stdout_path": st.stdout_path,
-            "stderr_path": st.stderr_path,
-            "workdir": st.workdir,
-            "state": st.state,
+            "script_path": status.get("script_path"),
+            "stdout_path": status.get("stdout_path"),
+            "stderr_path": status.get("stderr_path"),
+            "workdir": status.get("workdir"),
+            "state": status.get("state"),
         }
+        if status.get("status_error"):
+            result["status_error"] = status["status_error"]
+        result.update(job.submission())
+        return result
+
+    return await _guard(host, f)
+
+
+async def adopt(job_id: str, host: str | None = None) -> dict[str, Any]:
+    """Recover local history for a Slurm job that was accepted but not recorded locally.
+
+    The job must belong to the configured remote user and still be visible through ``scontrol``
+    or ``sacct``. Returns the reconstructed status with ``adopted=true``.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        job = c.adopt(job_id)
+        result = job.status(refresh=True).to_dict()
+        result.update({"adopted": True, "recorded": True})
+        return result
 
     return await _guard(host, f)
 
@@ -570,17 +599,21 @@ async def sweep(
             name=name,
             max_concurrent=max_concurrent,
         )
-        rec = c.registry.get(job.job_id)
-        sweep_meta = (rec.meta.get("sweep") if rec else None) or {}
-        st = job.status()
-        return {
+        rec = c.registry.get(job.job_id) if job.recorded else None
+        sweep_meta = (rec.meta.get("sweep") if rec else None) or job.metadata.get("sweep", {})
+        status = _submitted_status(job)
+        result = {
             "job_id": job.job_id,
             "n": sweep_meta.get("n"),
             "names": sweep_meta.get("names"),
             "params_path": sweep_meta.get("params_path"),
             "array": rec.meta.get("array") if rec else None,
-            "state": st.state,
+            "state": status.get("state"),
         }
+        if status.get("status_error"):
+            result["status_error"] = status["status_error"]
+        result.update(job.submission())
+        return result
 
     return await _guard(host, f)
 
@@ -618,19 +651,23 @@ async def pack(
             cwd=cwd,
             **(options or {}),
         )
-        rec = c.registry.get(job.job_id)
-        meta = (rec.meta.get("pack") if rec else None) or {}
-        st = job.status()
-        return {
+        rec = c.registry.get(job.job_id) if job.recorded else None
+        meta = (rec.meta.get("pack") if rec else None) or job.metadata.get("pack", {})
+        status = _submitted_status(job)
+        result = {
             "job_id": job.job_id,
-            "state": st.state,
-            "script_path": st.script_path,
-            "stdout_path": st.stdout_path,
+            "state": status.get("state"),
+            "script_path": status.get("script_path"),
+            "stdout_path": status.get("stdout_path"),
             "commands_path": meta.get("commands_path"),
             "n": meta.get("n"),
             "batches": meta.get("batches"),
             "max_processes": meta.get("max_processes"),
         }
+        if status.get("status_error"):
+            result["status_error"] = status["status_error"]
+        result.update(job.submission())
+        return result
 
     return await _guard(host, f)
 
@@ -655,7 +692,14 @@ async def jobs(
         if job_id:
             return c.job_status(job_id, refresh=refresh).to_dict()
         lst = c.jobs(include_finished=include_finished, refresh=refresh)
-        return {"jobs": [s.to_dict() for s in lst], "count": len(lst)}
+        result: dict[str, Any] = {
+            "jobs": [s.to_dict() for s in lst],
+            "count": len(lst),
+            "registry_available": c.registry_error is None,
+        }
+        if c.registry_error:
+            result["registry_error"] = c.registry_error
+        return result
 
     return await _guard(host, f)
 
@@ -1005,6 +1049,7 @@ ALL_TOOLS: dict[str, Any] = {
     "proc_tail": proc_tail,
     "proc_kill": proc_kill,
     "submit": submit,
+    "adopt": adopt,
     "ensure": ensure,
     "pack": pack,
     "sweep": sweep,

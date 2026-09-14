@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Batch submission now preflights local registry writes before `sbatch`. A rare failure after
+  scheduler acceptance returns a successful `submitted: true, recorded: false` result with the job
+  ID and `rslurm adopt JOB_ID` recovery command instead of encouraging a duplicate submission.
+  `adopt` reconstructs history from Slurm, `jobs` and `status` expose scheduler data when local
+  history is unavailable, and `REMOTESLURM_STATE_DIR` is documented for sandboxed clients.
 - Added durable single-job contracts through `Cluster.ensure`, `rslurm ensure`, and the core MCP
   `ensure` tool. Canonical task identities cover script content, remote input hashes, resolved
   resources, environment declarations, outputs, and validation. Intent and attempt history are

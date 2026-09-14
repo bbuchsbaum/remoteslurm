@@ -35,7 +35,8 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   possible duplicate execution.
 - Submit with `submit`. Prefer a **template**: `submit(template="cpu", script=...)` fills in
   options and prepends the module-load/venv preamble. Give either `script` (content) or
-  `path` (an existing remote script), never both.
+  `path` (an existing remote script), never both. If submission returns `recorded: false`, Slurm
+  accepted the job: do not submit again; run `adopt(job_id=...)` to recover its local record.
 - Use `pack` for independent shell commands that should share one or more one-node allocations.
   `max_processes` caps GNU Parallel children inside each allocation; `max_concurrent` separately
   throttles array allocations. GNU Parallel must be available in the template's job environment.
@@ -57,7 +58,8 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   `hints`, the stderr/stdout tails, the sacct steps, and the sync marker. Act on the hints.
 - To check progress, call `jobs` (all) or `jobs(job_id=...)` (one). Each record has
   `terminal` (done?), `state`, `exit_code`, `reason`. Poll `jobs`; avoid tight `wait` loops
-  (MCP `wait` is bounded and returns `terminal:false` on timeout — loop only if needed).
+  (MCP `wait` is bounded and returns `terminal:false` on timeout — loop only if needed). When
+  `registry_available` is false, the result contains scheduler-visible data without local history.
 
 ## Rules of thumb
 - Read `notes` before submitting; obey the cluster's walltime/account/partition rules.

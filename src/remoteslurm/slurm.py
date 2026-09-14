@@ -728,6 +728,8 @@ class JobStatus:
     script_path: str | None = None
     accounting_pending: bool = False
     terminal: bool = False
+    registry_available: bool | None = None
+    registry_error: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

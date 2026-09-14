@@ -311,7 +311,14 @@ def _current(record: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _remember_job(cluster: Cluster, record: Mapping[str, Any], attempt: Mapping[str, Any]) -> None:
     job_id = attempt.get("job_id")
-    if not job_id or cluster.registry.get(str(job_id)) is not None:
+    if not job_id:
+        return
+    try:
+        if cluster.registry.get(str(job_id)) is not None:
+            return
+    except OSError:
+        # The remote task record is authoritative. A read-only local state directory must not
+        # prevent ensure from recovering the accepted scheduler attempt.
         return
     rec = JobRecord(
         job_id=str(job_id),
@@ -332,7 +339,10 @@ def _remember_job(cluster: Cluster, record: Mapping[str, Any], attempt: Mapping[
         rec.workdir = sc.get("WorkDir") or None
     except RemoteSlurmError:
         pass
-    cluster.registry.put(rec)
+    try:
+        cluster.registry.put(rec)
+    except OSError:
+        pass
 
 
 def _update(

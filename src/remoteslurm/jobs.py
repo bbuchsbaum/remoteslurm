@@ -13,6 +13,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,8 @@ from .config import Template, state_dir
 from .errors import (
     ConfirmationRequired,
     InvalidArgument,
+    PermissionDenied,
+    RegistryUnavailable,
     RemoteSlurmError,
     RemoteTimeout,
     SlurmError,
@@ -34,6 +37,15 @@ ACCOUNTING_GRACE_SECONDS = 600.0  # how long after last sighting we report "acco
 MAX_SWEEP_TASKS = 1000  # guard: refuse sweeps larger than a typical Slurm MaxArraySize
 MAX_PACK_BATCHES = 1000  # same scheduler-facing guard for packed command arrays
 LEARNED_NOTES_CAP = 50
+
+
+def _slurm_timestamp(value: str | None) -> float:
+    if value and value not in {"Unknown", "N/A", "None"}:
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            pass
+    return time.time()
 
 
 # --------------------------------------------------------------------------- learned notes
@@ -306,14 +318,17 @@ class JobRegistry:
         self.path = (base or state_dir()) / host / "jobs.json"
         self._lock = threading.Lock()
 
-    def _read_raw(self) -> dict[str, Any]:
+    def _read_raw(self, *, strict_io: bool = False) -> dict[str, Any]:
         """The whole registry file as a dict (``{"jobs": [...], "last_pruned": ...}``)."""
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text("utf-8"))
                 if isinstance(data, dict):
                     return data
-            except (OSError, ValueError):
+            except OSError:
+                if strict_io:
+                    raise
+            except ValueError:
                 pass
         return {}
 
@@ -329,12 +344,33 @@ class JobRegistry:
         return jobs
 
     def _read_file(self) -> dict[str, JobRecord]:
-        return self._jobs_from_raw(self._read_raw())
+        return self._jobs_from_raw(self._read_raw(strict_io=True))
 
     def _write_raw(self, raw: dict[str, Any]) -> None:
         tmp = self.path.with_name(f"jobs.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(raw, indent=1), "utf-8")
         os.replace(tmp, self.path)
+
+    def preflight(self) -> None:
+        """Prove that the registry lock and atomic replacement are writable.
+
+        This deliberately exercises the same path as a later ``put`` instead of relying on
+        ``os.access``, which cannot establish that locking and replacement will work.
+        """
+        try:
+            with self._locked_raw():
+                pass
+        except OSError as e:
+            raise RegistryUnavailable(
+                f"local job registry is not writable: {self.path}",
+                action=(
+                    "set REMOTESLURM_STATE_DIR to a writable directory, for example "
+                    "`REMOTESLURM_STATE_DIR=/tmp/remoteslurm-state rslurm ...`"
+                ),
+                path=str(self.path),
+                operation="preflight",
+                cause=str(e),
+            ) from e
 
     @contextmanager
     def _locked_raw(self) -> Iterator[dict[str, Any]]:
@@ -347,7 +383,7 @@ class JobRegistry:
             with open(self.path.with_suffix(".lock"), "w") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
                 try:
-                    raw = self._read_raw()
+                    raw = self._read_raw(strict_io=True)
                     yield raw
                     self._write_raw(raw)
                 finally:
@@ -440,9 +476,34 @@ class JobRegistry:
 class Job:
     """A lightweight handle; all state lives on the cluster / in the registry."""
 
-    def __init__(self, cluster: Cluster, job_id: str) -> None:
+    def __init__(
+        self,
+        cluster: Cluster,
+        job_id: str,
+        *,
+        recorded: bool = True,
+        registry_error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         self.cluster = cluster
         self.job_id = job_id
+        self.recorded = recorded
+        self.registry_error = registry_error
+        self.metadata = metadata or {}
+
+    def submission(self) -> dict[str, Any]:
+        """Machine-readable scheduler/local-registry outcome for this handle."""
+        out: dict[str, Any] = {
+            "submitted": True,
+            "recorded": self.recorded,
+            "job_id": self.job_id,
+        }
+        if not self.recorded:
+            out.update(
+                registry_error=self.registry_error,
+                recovery=f"rslurm adopt {self.job_id}",
+            )
+        return out
 
     def __repr__(self) -> str:
         return f"Job({self.job_id!r} on {self.cluster.host.name!r})"
@@ -467,6 +528,7 @@ class SlurmOps:
     _squeue_cache: tuple[float, list[dict[str, str]]] | None = None
     _squeue_lock = threading.Lock()
     _registry: JobRegistry | None = None
+    _registry_error: str | None = None
     _sweep_params_cache: dict[str, list[dict[str, Any]]] | None = None
 
     def call(
@@ -502,6 +564,49 @@ class SlurmOps:
             self._registry = JobRegistry(self.host.name)
         return self._registry
 
+    @property
+    def registry_error(self) -> str | None:
+        return self._registry_error
+
+    def _note_registry_error(self, error: OSError) -> None:
+        self._registry_error = f"{type(error).__name__}: {error}"
+
+    def _registry_get(self, job_id: str) -> JobRecord | None:
+        try:
+            return self.registry.get(job_id)
+        except OSError as e:
+            self._note_registry_error(e)
+            return None
+
+    def _registry_all(self) -> list[JobRecord]:
+        try:
+            return self.registry.all()
+        except OSError as e:
+            self._note_registry_error(e)
+            return []
+
+    def _registry_update(self, job_id: str, **fields: Any) -> bool:
+        try:
+            self.registry.update(job_id, **fields)
+            return True
+        except OSError as e:
+            self._note_registry_error(e)
+            return False
+
+    def _mark_registry_status(self, status: slurm.JobStatus) -> slurm.JobStatus:
+        if self._registry_error:
+            status.registry_available = False
+            status.registry_error = self._registry_error
+        return status
+
+    def _probe_registry(self) -> None:
+        """Record local-state failure without turning a scheduler status query into an error."""
+        try:
+            self.registry.preflight()
+        except RegistryUnavailable as e:
+            cause = e.details.get("cause")
+            self._registry_error = f"{e.message}: {cause}" if cause else e.message
+
     # -- submit ---------------------------------------------------------------------------
     def submit(
         self,
@@ -536,6 +641,8 @@ class SlurmOps:
         """
         if (script is None) == (path is None):
             raise InvalidArgument("provide exactly one of script= or path=")
+        # Refuse before the remote side effect if the local recovery handle cannot be persisted.
+        self.registry.preflight()
         opts: dict[str, Any] = dict(self.host.defaults or {})
         if self.host.account:
             opts.setdefault("account", self.host.account)
@@ -602,17 +709,86 @@ class SlurmOps:
             rec.stderr_path = sc.get("StdErr") or None
             rec.workdir = sc.get("WorkDir") or None
             rec.name = rec.name or sc.get("JobName")
-        except SlurmError:
+        except RemoteSlurmError:
             pass
-        self.registry.put(rec)
+        recorded = True
+        registry_error = None
+        try:
+            self.registry.put(rec)
+        except OSError as e:
+            # Slurm already accepted the job. Preserve that success and make recovery explicit;
+            # raising here invites callers to repeat the submission and create a duplicate.
+            recorded = False
+            self._note_registry_error(e)
+            registry_error = self.registry_error
         self.registry.audit("submit", job_id=job_id, script=rec.script_path, args=flags)
         self._invalidate_squeue()
-        return Job(self, job_id)  # type: ignore[arg-type]
+        return Job(
+            self,  # type: ignore[arg-type]
+            job_id,
+            recorded=recorded,
+            registry_error=registry_error,
+        )
 
     # -- raw queries -----------------------------------------------------------------------
     def _invalidate_squeue(self) -> None:
         with self._squeue_lock:
             self._squeue_cache = None
+
+    def adopt(self, job_id: str) -> Job:
+        """Reconstruct a local registry record for an existing scheduler job."""
+        base, task = slurm.parse_job_id(job_id)
+        self.registry.preflight()
+        accounting = self.sacct([job_id], all_steps=True)
+        acct = accounting.get(job_id) or accounting.get(base)
+        control: dict[str, str] = {}
+        try:
+            control = self.scontrol_job(job_id)
+        except SlurmError:
+            pass
+        if acct is None and not control:
+            raise SlurmError(
+                f"job {job_id} is not known to scontrol or sacct",
+                job_id=job_id,
+                action="check the job id and scheduler accounting retention",
+            )
+        owner = str(acct.get("user") or "") if acct else ""
+        if control.get("UserId"):
+            owner = control["UserId"].split("(", 1)[0]
+        expected_owner = str(self.user)  # type: ignore[attr-defined]
+        if owner and owner != expected_owner:
+            raise PermissionDenied(
+                f"job {job_id} belongs to {owner}, not {expected_owner}",
+                job_id=job_id,
+                owner=owner,
+            )
+
+        status = self.job_status(job_id, refresh=True)
+        if status.source == "unknown":
+            raise SlurmError(
+                f"job {job_id} has no usable scheduler status",
+                job_id=job_id,
+                action="check scheduler accounting retention",
+            )
+        array = task is None and any(
+            key.startswith(base + "_") for key in accounting if "." not in key
+        )
+        rec = JobRecord(
+            job_id=job_id,
+            name=status.name or control.get("JobName") or None,
+            script_path=control.get("Command") or status.script_path,
+            stdout_path=control.get("StdOut") or status.stdout_path,
+            stderr_path=control.get("StdErr") or status.stderr_path,
+            workdir=control.get("WorkDir") or status.workdir,
+            submit_time=_slurm_timestamp(status.submit_time),
+            last_state=status.state,
+            last_seen=time.time(),
+            meta={"adopted": True, "array": "adopted" if array else None},
+        )
+        self.registry.put(rec)
+        self.registry.audit("adopt", job_id=job_id, source=status.source)
+        self._registry_error = None
+        return Job(self, job_id)  # type: ignore[arg-type]
 
     def squeue(self, *, refresh: bool = False, user: str | None = None) -> list[dict[str, str]]:
         """My queued/running jobs (cached ~10 s unless ``refresh``)."""
@@ -680,19 +856,28 @@ class SlurmOps:
         return slurm.parse_sinfo(res["stdout"])
 
     # -- status -------------------------------------------------------------------------------
-    def job_status(self, job_id: str, *, refresh: bool = False) -> slurm.JobStatus:
+    def job_status(
+        self,
+        job_id: str,
+        *,
+        refresh: bool = False,
+        _reset_registry_error: bool = True,
+    ) -> slurm.JobStatus:
         """Merge squeue -> scontrol -> sacct -> registry into one status record.
 
         A bare array id (``123``) is rolled up across its tasks (see :meth:`_array_status`);
         a task id (``123_4``) is reported on its own.
         """
+        if _reset_registry_error:
+            self._registry_error = None
+            self._probe_registry()
         base, task = slurm.parse_job_id(job_id)
-        rec = self.registry.get(job_id)
+        rec = self._registry_get(job_id)
         st: slurm.JobStatus | None = None
 
         all_rows = self.squeue(refresh=refresh)
         if task is None and self._is_array(base, all_rows, rec):
-            return self._array_status(base, all_rows)
+            return self._mark_registry_status(self._array_status(base, all_rows))
 
         rows = [r for r in all_rows if r["job_id"] == job_id]
         if not rows and refresh:
@@ -783,11 +968,11 @@ class SlurmOps:
             st.workdir = st.workdir or rec.workdir
             st.name = st.name or rec.name
             if st.source != "registry":
-                self.registry.update(job_id, last_state=st.state, last_seen=time.time())
+                self._registry_update(job_id, last_state=st.state, last_seen=time.time())
         # An array task inherits the parent's registered paths (the ``%A_%a`` output template,
         # script, workdir) and, for sweeps, surfaces its row of parameters.
         if task is not None and task.isdigit():
-            parent = self.registry.get(base)
+            parent = self._registry_get(base)
             if parent is not None:
                 st.stdout_path = st.stdout_path or parent.stdout_path
                 st.stderr_path = st.stderr_path or parent.stderr_path
@@ -799,7 +984,7 @@ class SlurmOps:
                     if params is not None:
                         st.extra["params"] = params
         st.terminal = slurm.is_terminal(st.state) and not st.accounting_pending
-        return st
+        return self._mark_registry_status(st)
 
     # -- arrays -------------------------------------------------------------------------------
     def _is_array(
@@ -836,7 +1021,7 @@ class SlurmOps:
                 "task_states": agg["task_states"],
             },
         )
-        rec = self.registry.get(base)
+        rec = self._registry_get(base)
         if rec:
             st.name = rec.name
             st.stdout_path = rec.stdout_path
@@ -852,12 +1037,12 @@ class SlurmOps:
                         failed_params[t] = p
                 if failed_params:
                     st.extra["failed_task_params"] = failed_params
-            self.registry.update(base, last_state=agg["state"], last_seen=time.time())
+            self._registry_update(base, last_state=agg["state"], last_seen=time.time())
         return st
 
     def _sweep_params_for(self, base: str, task: int) -> dict[str, Any] | None:
         """Return the sweep parameters for array ``base`` task ``task`` (cached read of the TSV)."""
-        rec = self.registry.get(base)
+        rec = self._registry_get(base)
         sweep = rec.meta.get("sweep") if rec else None
         if not sweep:
             return None
@@ -891,21 +1076,22 @@ class SlurmOps:
         """
         # Opportunistic housekeeping: drop long-finished records (throttled to once/hour via a
         # timestamp in the registry file). Never let it break a listing.
+        self._registry_error = None
         try:
             self.registry.prune()
-        except OSError:
-            pass
+        except OSError as e:
+            self._note_registry_error(e)
         out: dict[str, slurm.JobStatus] = {}
         for r in self.squeue(refresh=refresh):
             jid = r["array_base"] or r["job_id"]  # arrays roll up under the base id
             if jid not in out:
-                out[jid] = self.job_status(jid)
+                out[jid] = self.job_status(jid, _reset_registry_error=False)
         if include_finished:
-            known = [r.job_id for r in self.registry.all() if r.job_id not in out]
+            known = [r.job_id for r in self._registry_all() if r.job_id not in out]
             if known:
                 acct = self.sacct(known) if known else {}
                 for jid in known:
-                    rec = self.registry.get(jid)
+                    rec = self._registry_get(jid)
                     a = acct.get(jid)
                     if a:
                         st = slurm.JobStatus(
@@ -927,11 +1113,15 @@ class SlurmOps:
                             script_path=rec.script_path if rec else None,
                         )
                         st.terminal = slurm.is_terminal(st.state)
-                        self.registry.update(jid, last_state=st.state, last_seen=time.time())
+                        self._registry_update(jid, last_state=st.state, last_seen=time.time())
                     else:
-                        st = self.job_status(jid)
+                        st = self.job_status(jid, _reset_registry_error=False)
                     out[jid] = st
-        return sorted(out.values(), key=lambda s: int(s.job_id.split("_")[0]))
+        rows = sorted(out.values(), key=lambda s: int(s.job_id.split("_")[0]))
+        if self._registry_error:
+            for status in rows:
+                self._mark_registry_status(status)
+        return rows
 
     def wait(
         self,
@@ -1096,6 +1286,9 @@ class SlurmOps:
         ):
             raise InvalidArgument("max_concurrent must be a positive integer")
 
+        # Do not create remote support files unless the later scheduler handle can be saved.
+        self.registry.preflight()
+
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:48] or "pack"
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base_dir = (self.host.script_dir or "~/.remoteslurm/packs").rstrip("/")
@@ -1134,16 +1327,20 @@ class SlurmOps:
             dependency=dependency,
             **pack_options,
         )
-        rec = self.registry.get(job.job_id)
+        pack_meta = {
+            "commands_path": commands_path,
+            "n": len(clean),
+            "batches": batches,
+            "max_processes": max_processes,
+        }
+        job.metadata["pack"] = pack_meta
+        rec = self._registry_get(job.job_id) if job.recorded else None
         if rec is not None:
             meta = dict(rec.meta)
-            meta["pack"] = {
-                "commands_path": commands_path,
-                "n": len(clean),
-                "batches": batches,
-                "max_processes": max_processes,
-            }
-            self.registry.update(job.job_id, meta=meta)
+            meta["pack"] = pack_meta
+            if not self._registry_update(job.job_id, meta=meta):
+                job.recorded = False
+                job.registry_error = self.registry_error
         self.registry.audit(
             "pack",
             job_id=job.job_id,
@@ -1187,6 +1384,8 @@ class SlurmOps:
                 "Slurm's MaxArraySize is typically ~1000",
                 action="reduce the parameter grid or split the sweep",
             )
+        # The parameter file is part of the submission. Check local recovery state first.
+        self.registry.preflight()
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:48] or "sweep"
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base_dir = (self.host.script_dir or "~/.remoteslurm/sweeps").rstrip("/")
@@ -1205,10 +1404,14 @@ class SlurmOps:
             array=spec,
             **options,
         )
-        rec = self.registry.get(job.job_id)
+        sweep_meta = {"params_path": params_path, "n": n, "names": names}
+        job.metadata["sweep"] = sweep_meta
+        rec = self._registry_get(job.job_id) if job.recorded else None
         if rec is not None:
             meta = dict(rec.meta)
-            meta["sweep"] = {"params_path": params_path, "n": n, "names": names}
-            self.registry.update(job.job_id, meta=meta)
+            meta["sweep"] = sweep_meta
+            if not self._registry_update(job.job_id, meta=meta):
+                job.recorded = False
+                job.registry_error = self.registry_error
         self.registry.audit("sweep", job_id=job.job_id, n=n, params_path=params_path, names=names)
         return job

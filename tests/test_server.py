@@ -26,6 +26,7 @@ CORE_EXPECTED = {
     "proc_tail",
     "proc_kill",
     "submit",
+    "adopt",
     "ensure",
     "pack",
     "jobs",
@@ -274,6 +275,7 @@ def test_submit_and_jobs(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) 
         args=["--exclusive"],
     )
     assert r["job_id"] == "4242" and r["state"] == "PENDING"
+    assert r["submitted"] is True and r["recorded"] is True
     assert r["stdout_path"].endswith(".out")
     assert seen["time"] == "1:00:00" and seen["args"] == ["--exclusive"]
 
@@ -281,6 +283,20 @@ def test_submit_and_jobs(mcp_cluster: Cluster, monkeypatch: pytest.MonkeyPatch) 
     assert r["job_id"] == "4242" and r["state"] == "PENDING"
     r = call("jobs")
     assert r["count"] == 2 and [j["job_id"] for j in r["jobs"]] == ["1", "2"]
+    assert r["registry_available"] is True
+
+
+def test_adopt_tool_reconstructs_record(mcp_cluster: Cluster) -> None:
+    job = mcp_cluster.submit("#!/bin/bash\necho recover\n", name="recover")
+    assert mcp_cluster.registry.forget(job.job_id)
+    assert mcp_cluster.registry.get(job.job_id) is None
+
+    result = call("adopt", job_id=job.job_id)
+
+    assert result["job_id"] == job.job_id
+    assert result["adopted"] is True and result["recorded"] is True
+    rec = mcp_cluster.registry.get(job.job_id)
+    assert rec is not None and rec.meta["adopted"] is True
 
 
 def test_submit_invalid_arg(mcp_cluster: Cluster) -> None:

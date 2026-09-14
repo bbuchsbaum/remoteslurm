@@ -87,6 +87,24 @@ def test_verified_receipt_survives_scheduler_accounting_expiry(cluster, sandbox:
     assert fake_jobs(sandbox) == {}
 
 
+def test_ensure_recovery_does_not_require_writable_local_registry(
+    cluster, sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = spec_for(sandbox)
+    first = cluster.ensure(spec)
+    assert first["job_id"]
+
+    def unavailable(*_args, **_kwargs):
+        raise PermissionError("local registry unavailable")
+
+    monkeypatch.setattr(cluster.registry, "get", unavailable)
+    monkeypatch.setattr(cluster.registry, "put", unavailable)
+    recovered = cluster.ensure(spec)
+
+    assert recovered["job_id"] == first["job_id"]
+    assert recovered["submitted"] is False
+
+
 def test_failed_attempt_needs_explicit_retry(cluster, sandbox: Path) -> None:
     spec = spec_for(sandbox, script="#!/bin/bash\n# FAKESLURM_FAIL\nexit 1\n")
     failed = run_to_terminal(cluster, spec)
