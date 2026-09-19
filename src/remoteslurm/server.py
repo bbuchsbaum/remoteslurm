@@ -56,6 +56,19 @@ CORE_TOOLS = {
     "ensure",
     "pack",
     "jobs",
+    "campaigns",
+    "campaign_start",
+    "campaign_adopt",
+    "campaign_lifecycle",
+    "campaign_failures",
+    "campaign_events",
+    "campaign_verify",
+    "campaign_preflight",
+    "campaign_receipts",
+    "campaign_apply",
+    "campaign_retry",
+    "campaign_cancel",
+    "campaign_drive",
     "diagnose",
     "sync",
     "cancel",
@@ -715,6 +728,349 @@ async def jobs(
     return await _guard(host, f)
 
 
+async def campaigns(
+    name: str | None = None,
+    run_id: str | None = None,
+    refresh: bool = False,
+    include_units: bool = False,
+    offset: int = 0,
+    limit: int = 200,
+    include_archived: bool = False,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """List campaigns, list one campaign's runs, or return its reconciled status.
+
+    With no ``name``, returns campaigns in the remote durable store. With a
+    ``name`` and no ``run_id``, status resolves only when exactly one run is
+    open. Set ``refresh=True`` for one bounded scheduler/filesystem/telemetry
+    observation pass; refresh never submits, retries, cancels, or validates.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        if name is None:
+            return c.campaigns.list(limit=_clamp(limit, 1, 500), offset=max(0, offset))
+        if run_id == "*":
+            return c.campaigns.runs(
+                name,
+                include_archived=include_archived,
+                limit=_clamp(limit, 1, 500),
+                offset=max(0, offset),
+            )
+        return c.campaigns.status(
+            name,
+            run_id=run_id,
+            refresh=refresh,
+            include_units=include_units,
+            offset=max(0, offset),
+            limit=_clamp(limit, 1, 500),
+        )
+
+    return await _guard(host, f)
+
+
+async def campaign_start(
+    file: str,
+    run_id: str | None = None,
+    parent_run: str | None = None,
+    max_units: int = 50_000,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Compile a local campaign TOML file and create its durable remote run.
+
+    This records intent and unit structure only. It does not submit work.
+    """
+
+    def f(c: Cluster) -> dict[str, Any]:
+        from .campaigns.spec import load_campaign
+
+        definition = load_campaign(
+            file,
+            max_units=_clamp(max_units, 1, 50_000),
+            host_config=c.host,
+        )
+        return c.campaigns.start(definition, run_id=run_id, parent_run=parent_run)
+
+    return await _guard(host, f)
+
+
+async def campaign_adopt(
+    name: str,
+    stage: str,
+    run_id: str | None = None,
+    job_id: str | None = None,
+    array_job_id: str | None = None,
+    unit_jobs: dict[str, str] | None = None,
+    output_only: bool = False,
+    refresh: bool = False,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Bind existing jobs or outputs to a campaign stage without submitting."""
+
+    def f(c: Cluster) -> dict[str, Any]:
+        result = c.campaigns.adopt(
+            name,
+            stage,
+            run_id=run_id,
+            job_id=job_id,
+            array_job_id=array_job_id,
+            unit_jobs=unit_jobs,
+            output_only=output_only,
+        )
+        if refresh:
+            return c.campaigns.status(name, run_id=result["run_id"], refresh=True)
+        return result
+
+    return await _guard(host, f)
+
+
+async def campaign_lifecycle(
+    name: str,
+    action: str,
+    run_id: str | None = None,
+    allow_active: bool = False,
+    accept_unresolved: bool = False,
+    reason: str | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Close, archive, or restore a campaign run with explicit lifecycle rules."""
+
+    def f(c: Cluster) -> dict[str, Any]:
+        if action == "close":
+            return c.campaigns.close(name, run_id=run_id, allow_active=allow_active, reason=reason)
+        if action == "archive":
+            if not run_id:
+                from .errors import InvalidArgument
+
+                raise InvalidArgument("archive requires run_id")
+            return c.campaigns.archive(name, run_id=run_id, accept_unresolved=accept_unresolved)
+        if action == "restore":
+            if not run_id:
+                from .errors import InvalidArgument
+
+                raise InvalidArgument("restore requires run_id")
+            return c.campaigns.restore(name, run_id=run_id)
+        from .errors import InvalidArgument
+
+        raise InvalidArgument("action must be close, archive, or restore")
+
+    return await _guard(host, f)
+
+
+async def campaign_failures(
+    name: str,
+    run_id: str | None = None,
+    limit: int = 200,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Return bounded failed, unresolved, missing, changed, or invalid units."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.failures(name, run_id=run_id, limit=_clamp(limit, 1, 500)),
+    )
+
+
+async def campaign_events(
+    name: str,
+    run_id: str | None = None,
+    cursor: str | None = None,
+    limit: int = 200,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Read bounded committed campaign events, newest revision first."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.events(
+            name,
+            run_id=run_id,
+            cursor=cursor,
+            limit=_clamp(limit, 1, 500),
+        ),
+    )
+
+
+async def campaign_verify(
+    name: str,
+    run_id: str | None = None,
+    stage: str | None = None,
+    unit_id: str | None = None,
+    settle: bool = True,
+    offset: int = 0,
+    limit: int = 100,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Validate bounded campaign units and store immutable production receipts."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.verify(
+            name,
+            run_id=run_id,
+            stage=stage,
+            unit_id=unit_id,
+            settle=settle,
+            offset=max(0, offset),
+            limit=_clamp(limit, 1, 500),
+        ),
+    )
+
+
+async def campaign_preflight(
+    file: str,
+    against: str | None = None,
+    max_units: int = 50_000,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Qualify static, remote, fixture, and optional named-pilot contracts."""
+
+    def f(c: Cluster) -> dict[str, Any]:
+        from .campaigns.spec import load_campaign
+
+        definition = load_campaign(
+            file,
+            max_units=_clamp(max_units, 1, 50_000),
+            host_config=c.host,
+        )
+        return c.campaigns.preflight(definition, against=against)
+
+    return await _guard(host, f)
+
+
+async def campaign_receipts(
+    name: str,
+    kind: str,
+    run_id: str | None = None,
+    receipt_id: str | None = None,
+    offset: int = 0,
+    limit: int = 100,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Read bounded immutable preflight or validation receipt history."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.receipts(
+            name,
+            kind,
+            run_id=run_id,
+            receipt_id=receipt_id,
+            offset=max(0, offset),
+            limit=_clamp(limit, 1, 500),
+        ),
+    )
+
+
+async def campaign_apply(
+    name: str,
+    run_id: str | None = None,
+    stage: str | None = None,
+    unit_id: str | None = None,
+    max_groups: int = 100,
+    require_preflight: str | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Submit one bounded pass of eligible deterministic campaign job groups."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.apply(
+            name,
+            run_id=run_id,
+            stage=stage,
+            unit_id=unit_id,
+            max_groups=_clamp(max_groups, 1, 1000),
+            require_preflight=require_preflight,
+        ),
+    )
+
+
+async def campaign_retry(
+    name: str,
+    reason: str,
+    run_id: str | None = None,
+    stage: str | None = None,
+    unit_id: str | None = None,
+    where: dict[str, str] | None = None,
+    states: dict[str, str] | None = None,
+    accept_duplicate_risk: bool = False,
+    dry_run: bool = False,
+    apply: bool = False,
+    max_groups: int = 100,
+    require_preflight: str | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Authorize selected retries; UNKNOWN work requires duplicate-risk acceptance."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.retry(
+            name,
+            run_id=run_id,
+            stage=stage,
+            unit_id=unit_id,
+            where=where,
+            states=states,
+            reason=reason,
+            accept_duplicate_risk=accept_duplicate_risk,
+            dry_run=dry_run,
+            apply=apply,
+            max_groups=_clamp(max_groups, 1, 1000),
+            require_preflight=require_preflight,
+        ),
+    )
+
+
+async def campaign_cancel(
+    name: str,
+    run_id: str | None = None,
+    stage: str | None = None,
+    unit_id: str | None = None,
+    all_active: bool = False,
+    apply: bool = False,
+    confirm: bool = False,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Preview cancellation by default; apply only to recorded selected allocations."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.cancel(
+            name,
+            run_id=run_id,
+            stage=stage,
+            unit_id=unit_id,
+            all_active=all_active,
+            apply=apply,
+            confirm=confirm,
+        ),
+    )
+
+
+async def campaign_drive(
+    name: str,
+    run_id: str | None = None,
+    max_passes: int = 20,
+    interval: float = 10.0,
+    max_groups: int = 100,
+    require_preflight: str | None = None,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Run bounded attached apply/refresh passes without implicit retry or validation."""
+
+    return await _guard(
+        host,
+        lambda c: c.campaigns.drive(
+            name,
+            run_id=run_id,
+            max_passes=_clamp(max_passes, 1, 100),
+            interval=max(0.0, min(float(interval), 3600.0)),
+            max_groups=_clamp(max_groups, 1, 1000),
+            require_preflight=require_preflight,
+        ),
+    )
+
+
 async def diagnose(job_id: str, tail: int = 60, host: str | None = None) -> dict[str, Any]:
     """Explain a job in one call — use this after a failure or when a job won't start.
 
@@ -1065,6 +1421,19 @@ ALL_TOOLS: dict[str, Any] = {
     "pack": pack,
     "sweep": sweep,
     "jobs": jobs,
+    "campaigns": campaigns,
+    "campaign_start": campaign_start,
+    "campaign_adopt": campaign_adopt,
+    "campaign_lifecycle": campaign_lifecycle,
+    "campaign_failures": campaign_failures,
+    "campaign_events": campaign_events,
+    "campaign_verify": campaign_verify,
+    "campaign_preflight": campaign_preflight,
+    "campaign_receipts": campaign_receipts,
+    "campaign_apply": campaign_apply,
+    "campaign_retry": campaign_retry,
+    "campaign_cancel": campaign_cancel,
+    "campaign_drive": campaign_drive,
     "diagnose": diagnose,
     "job_output": job_output,
     "cancel": cancel,

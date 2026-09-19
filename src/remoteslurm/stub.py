@@ -22,6 +22,7 @@ import difflib
 import errno
 import fnmatch
 import getpass
+import glob
 import hashlib
 import io
 import json
@@ -66,7 +67,18 @@ SLOW_WORKERS = 4
 LONG_WORKERS = 6
 # Ops that spawn a genuinely long-lived subprocess; they register their Popen so `cancel`
 # can reach the whole process group.
-SLOW_OPS = frozenset(("run", "srun", "sbatch", "task_ensure", "task_fingerprint", "progress_count"))
+SLOW_OPS = frozenset(
+    (
+        "run",
+        "srun",
+        "sbatch",
+        "task_ensure",
+        "task_fingerprint",
+        "progress_count",
+        "campaign_attempt_ensure",
+        "campaign_markers",
+    )
+)
 # Ops that can stream multi-frame responses when the request carries ``stream: true``.
 STREAM_OPS = frozenset(("run", "srun"))
 # Long-lived ops with no subprocess, served by the long pool and cancelled via a per-request
@@ -142,6 +154,17 @@ STREAM_READ_BYTES = 64 * 1024  # os.read size when streaming a run's pipes
 DEFAULT_DIFF_LINES = 500
 MAX_DIFF_LINES = 5000
 DIFF_MAX_LINE = 2000
+CAMPAIGN_SCHEMA = 1
+CAMPAIGN_MAX_DOCUMENTS = 1024
+CAMPAIGN_MAX_EVENTS = 10000
+CAMPAIGN_MAX_TRANSACTION_BYTES = 64 * 1024 * 1024
+CAMPAIGN_MAX_READ_BYTES = 4 * 1024 * 1024
+CAMPAIGN_LIST_MAX = 500
+CONTRACT_MAX_ITEMS = 1024
+CONTRACT_MAX_MATCHES = 1024
+CONTRACT_MAX_TOTAL_MATCHES = 2048
+CONTRACT_MAX_HASH_BYTES = 256 * 1024 * 1024
+CONTRACT_MAX_TOTAL_HASH_BYTES = 1024 * 1024 * 1024
 
 
 class StubError(Exception):
@@ -413,6 +436,10 @@ def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
     open_reads = set()
     for name, f in (("stdout", proc.stdout), ("stderr", proc.stderr)):
         if f is not None:
+            try:
+                os.set_blocking(f.fileno(), False)
+            except (AttributeError, OSError):  # pragma: no cover - older/non-POSIX fallback
+                pass
             sel.register(f, selectors.EVENT_READ, name)
             open_reads.add(name)
     in_buf = stdin.encode("utf-8") if stdin is not None else b""
@@ -420,6 +447,10 @@ def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
     writing = False
     if proc.stdin is not None:
         if in_buf:
+            try:
+                os.set_blocking(proc.stdin.fileno(), False)
+            except (AttributeError, OSError):  # pragma: no cover - older/non-POSIX fallback
+                pass
             sel.register(proc.stdin, selectors.EVENT_WRITE, "stdin")
             writing = True
         else:
@@ -468,6 +499,8 @@ def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
                 if name == "stdin":
                     try:
                         in_off += os.write(key.fd, in_buf[in_off : in_off + PIPE_BUF])
+                    except BlockingIOError:
+                        continue
                     except OSError:  # EPIPE: the child closed its stdin
                         in_off = len(in_buf)
                     if in_off >= len(in_buf):
@@ -477,6 +510,8 @@ def _communicate(proc, argv, timeout, stdin, max_output, emit, new_session, t0):
                     continue
                 try:
                     data = os.read(key.fd, STREAM_READ_BYTES)
+                except BlockingIOError:
+                    continue
                 except OSError:
                     data = b""
                 if not data:
@@ -2360,16 +2395,24 @@ def op_task_fingerprint(args):
     }
 
 
-def _task_find_jobs(marker, since):
+def _attempt_find_jobs(marker, since):
     """Find an attempt marker in live queue and accounting without relying on client state."""
     found = {}
+
+    def parent_job_id(value):
+        """Collapse array-task and step identifiers to one scheduler submission."""
+        value = value.split(".", 1)[0]
+        match = re.match(r"^(\d+)(?:_.+)?$", value)
+        return match.group(1) if match else value
+
     user = getpass.getuser()
     sq = _slurm_soft(["squeue", "-h", "-u", user, "-o", "%i|%j|%T"], timeout=30)
     if sq.get("rc") == 0:
         for line in sq.get("stdout", "").splitlines():
             fields = line.split("|")
             if len(fields) >= 3 and fields[1] == marker:
-                found[fields[0]] = {"job_id": fields[0], "state": fields[2], "source": "squeue"}
+                jid = parent_job_id(fields[0])
+                found[jid] = {"job_id": jid, "state": fields[2], "source": "squeue"}
     start = time.strftime(
         "%Y-%m-%dT%H:%M:%S", time.localtime(max(0, float(since or time.time()) - 86400))
     )
@@ -2392,17 +2435,41 @@ def _task_find_jobs(marker, since):
         for line in sa.get("stdout", "").splitlines():
             fields = line.split("|")
             if len(fields) >= 3 and fields[1] == marker:
-                jid = fields[0].split(".", 1)[0]
-                found[jid] = {"job_id": jid, "state": fields[2], "source": "sacct"}
+                jid = parent_job_id(fields[0])
+                if jid not in found:
+                    found[jid] = {"job_id": jid, "state": fields[2], "source": "sacct"}
     return list(found.values())
 
 
-def _task_current(record):
+def _attempt_current(record):
     current = record.get("current_attempt")
     for attempt in reversed(record.get("attempts") or []):
         if attempt.get("attempt_id") == current:
             return attempt
     return None
+
+
+def _attempt_reconcile_submitting(record, current, write_record):
+    """Resolve one ambiguous marked submission for every durable attempt owner."""
+    if not current or current.get("state") != "SUBMITTING" or current.get("job_id"):
+        return
+    matches = _attempt_find_jobs(current.get("marker"), current.get("created_at"))
+    if len(matches) == 1:
+        current["job_id"] = matches[0]["job_id"]
+        current["state"] = "ACCEPTED"
+        current["recovered"] = True
+        current["recovered_from"] = matches[0]["source"]
+        record["state"] = "ACCEPTED"
+    else:
+        current["state"] = "UNKNOWN"
+        current["reconciliation_matches"] = matches
+        record["state"] = "UNKNOWN"
+        record["reason"] = (
+            "submission may have reached Slurm but no unique scheduler record was found"
+            if not matches
+            else "multiple scheduler jobs carry the same durable attempt marker"
+        )
+    write_record(record)
 
 
 def op_task_ensure(args):
@@ -2452,29 +2519,13 @@ def op_task_ensure(args):
                 task_id=task_id,
             )
 
-        current = _task_current(record)
-        if current and current.get("state") == "SUBMITTING" and not current.get("job_id"):
-            matches = _task_find_jobs(current.get("marker"), current.get("created_at"))
-            if len(matches) == 1:
-                current["job_id"] = matches[0]["job_id"]
-                current["state"] = "ACCEPTED"
-                current["recovered"] = True
-                current["recovered_from"] = matches[0]["source"]
-                record["state"] = "ACCEPTED"
-                _task_write(record_path, record)
-            else:
-                current["state"] = "UNKNOWN"
-                current["reconciliation_matches"] = matches
-                record["state"] = "UNKNOWN"
-                record["reason"] = (
-                    "submission may have reached Slurm but no unique scheduler record was found"
-                    if not matches
-                    else "multiple scheduler jobs carry the same durable attempt marker"
-                )
-                _task_write(record_path, record)
+        current = _attempt_current(record)
+        _attempt_reconcile_submitting(
+            record, current, lambda value: _task_write(record_path, value)
+        )
 
         state = record.get("state")
-        current = _task_current(record)
+        current = _attempt_current(record)
         retry = bool(args.get("retry"))
         retry_unknown = bool(args.get("retry_unknown"))
         if current is not None:
@@ -2560,7 +2611,7 @@ def op_task_update(args):
         record = _task_read(record_path)
         if record is None:
             raise StubError("not_found", "durable task record does not exist", task_id=task_id)
-        attempt = _task_current(record)
+        attempt = _attempt_current(record)
         if attempt is None or attempt.get("attempt_id") != args.get("attempt_id"):
             raise StubError("invalid_arg", "attempt is not the task's current attempt")
         progress = {"SUBMITTING": 0, "ACCEPTED": 1, "PENDING": 2, "RUNNING": 3, "COMPLETED": 4}
@@ -2585,6 +2636,1218 @@ def op_task_update(args):
             record.pop("reason", None)
         _task_write(record_path, record)
         return {"record": record, "task_dir": taskdir}
+
+
+# --------------------------------------------------------------------------- campaign store
+
+
+def _campaign_name(value, label):
+    if not isinstance(value, str) or not re.match(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$", value):
+        raise StubError("invalid_arg", "%s is not a safe campaign identifier" % label)
+    return value
+
+
+def _campaign_id(value, label):
+    if not isinstance(value, str) or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", value):
+        raise StubError("invalid_arg", "%s is not a safe store identifier" % label)
+    return value
+
+
+def _campaign_root(args):
+    return _path(args.get("campaign_dir") or "~/.remoteslurm/campaigns")
+
+
+def _campaign_base(args):
+    return os.path.join(_campaign_root(args), _campaign_name(args.get("name"), "name"))
+
+
+def _campaign_run(args):
+    return os.path.join(_campaign_base(args), "runs", _campaign_id(args.get("run_id"), "run_id"))
+
+
+def _campaign_json_bytes(value):
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as e:
+        raise StubError("invalid_arg", "value is not canonical JSON: %s" % e)
+
+
+def _campaign_read_json(path, required=True, max_bytes=CAMPAIGN_MAX_READ_BYTES):
+    try:
+        size = os.path.getsize(path)
+        if size > max_bytes:
+            raise StubError(
+                "too_large", "campaign document exceeds read limit", path=path, size=size
+            )
+        with io.open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+    except OSError as e:
+        if not required and e.errno == errno.ENOENT:
+            return None
+        raise _os_error(e, path)
+    except ValueError as e:
+        raise StubError("error", "invalid campaign JSON %s: %s" % (path, e), path=path)
+    return value
+
+
+def _campaign_write_json(path, value):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    _atomic_write(path, _campaign_json_bytes(value), keep_mode=False, mode=0o600)
+
+
+def _campaign_document_path(value):
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise StubError("invalid_arg", "campaign document path must be non-empty text")
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if any(not part or part in (".", "..") for part in parts):
+        raise StubError("invalid_arg", "unsafe campaign document path: %r" % value)
+    return os.path.join(*parts)
+
+
+@contextmanager
+def _campaign_lock(path):
+    os.makedirs(path, exist_ok=True)
+    lockdir = os.path.join(path, ".lock")
+    deadline = time.time() + TASK_LOCK_WAIT
+    while True:
+        try:
+            os.mkdir(lockdir, 0o700)
+            owner = {
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "created_at": time.time(),
+            }
+            _atomic_write(
+                os.path.join(lockdir, "owner.json"),
+                _campaign_json_bytes(owner),
+                keep_mode=False,
+                mode=0o600,
+            )
+            break
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise _os_error(e, lockdir)
+            if _task_lock_owner_dead(lockdir) and _task_break_stale_lock(lockdir):
+                continue
+            if time.time() >= deadline:
+                raise StubError(
+                    "store_conflict",
+                    "another writer holds the campaign store lease",
+                    action="retry the transaction with the same transaction_id",
+                )
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            os.remove(os.path.join(lockdir, "owner.json"))
+        except OSError:
+            pass
+        try:
+            os.rmdir(lockdir)
+        except OSError:
+            pass
+
+
+CAMPAIGN_ATTEMPT_STATES = frozenset(
+    (
+        "INTENDED",
+        "SUBMITTING",
+        "ACCEPTED",
+        "PENDING",
+        "RUNNING",
+        "COMPLETED",
+        "FAILED",
+        "INVALID",
+        "REJECTED",
+        "CANCELLED",
+        "UNKNOWN",
+    )
+)
+
+
+def _campaign_attempt_dir(args):
+    group_id = args.get("group_id")
+    if not isinstance(group_id, str) or not re.match(r"^[0-9a-f]{64}$", group_id):
+        raise StubError("invalid_arg", "group_id must be a 64-character lowercase sha256")
+    return os.path.join(_campaign_run(args), "attempts", group_id), group_id
+
+
+def _campaign_attempt_fault(attempt_dir, step):
+    if os.environ.get("REMOTESLURM_TEST_CAMPAIGN_SUBMIT_FAIL_STEP") != step:
+        return
+    run_dir = os.path.dirname(os.path.dirname(attempt_dir))
+    for lockdir in (
+        os.path.join(attempt_dir, ".lock"),
+        os.path.join(run_dir, "execution", ".lock"),
+    ):
+        try:
+            os.remove(os.path.join(lockdir, "owner.json"))
+            os.rmdir(lockdir)
+        except OSError:
+            pass
+    os._exit(92)
+
+
+def _campaign_execution_paths(args):
+    execution_dir = os.path.join(_campaign_run(args), "execution")
+    return execution_dir, os.path.join(execution_dir, "ledger.json")
+
+
+def _campaign_attempt_path(args, group_id):
+    return os.path.join(_campaign_run(args), "attempts", group_id, "attempt.json")
+
+
+def _campaign_contract_units(contract):
+    mapping = contract.get("mapping") if isinstance(contract, dict) else None
+    if not isinstance(mapping, list) or not mapping:
+        raise StubError("invalid_arg", "campaign group contract requires a non-empty mapping")
+    unit_ids = []
+    for item in mapping:
+        unit_id = item.get("unit_id") if isinstance(item, dict) else None
+        if not isinstance(unit_id, str) or not unit_id:
+            raise StubError("invalid_arg", "campaign group mapping has an invalid unit_id")
+        unit_ids.append(unit_id)
+    if len(set(unit_ids)) != len(unit_ids):
+        raise StubError("invalid_arg", "campaign group mapping repeats a unit_id")
+    return unit_ids
+
+
+def _campaign_execution_ledger(args, ledger_path):
+    """Load the run ledger, importing pre-ledger group records once."""
+    ledger = _campaign_read_json(
+        ledger_path, required=False, max_bytes=CAMPAIGN_MAX_TRANSACTION_BYTES
+    )
+    if ledger is not None:
+        if ledger.get("schema") != 1:
+            raise StubError("store_conflict", "unsupported campaign execution ledger schema")
+        ledger.setdefault("groups", {})
+        ledger.setdefault("units", {})
+        ledger.setdefault("consumed_authorizations", {})
+        return ledger
+
+    ledger = {
+        "schema": 1,
+        "created_at": time.time(),
+        "groups": {},
+        "units": {},
+        "consumed_authorizations": {},
+    }
+    attempts_dir = os.path.join(_campaign_run(args), "attempts")
+    try:
+        names = sorted(os.listdir(attempts_dir))
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            names = []
+        else:
+            raise _os_error(e, attempts_dir)
+    if len(names) > 10000:
+        raise StubError(
+            "too_large",
+            "campaign has too many attempt groups to initialize the execution ledger",
+            count=len(names),
+        )
+    for group_id in names:
+        if not re.match(r"^[0-9a-f]{64}$", group_id):
+            continue
+        record = _campaign_read_json(
+            os.path.join(attempts_dir, group_id, "attempt.json"), required=False
+        )
+        if not isinstance(record, dict) or record.get("group_id") != group_id:
+            continue
+        ledger["groups"][group_id] = record
+        current = _attempt_current(record)
+        if current is None:
+            continue
+        for unit_id in _campaign_contract_units(record.get("contract")):
+            old = ledger["units"].get(unit_id)
+            old_record = ledger["groups"].get(old.get("group_id")) if old else None
+            old_attempt = _attempt_current(old_record or {})
+            if old_attempt is None or float(current.get("created_at", 0)) >= float(
+                old_attempt.get("created_at", 0)
+            ):
+                ledger["units"][unit_id] = {
+                    "group_id": group_id,
+                    "attempt_id": current.get("attempt_id"),
+                }
+    return ledger
+
+
+def _campaign_write_execution(args, ledger_path, ledger, group_ids):
+    """Commit canonical run state, then refresh inspectable group mirrors."""
+    ledger["updated_at"] = time.time()
+    data = _campaign_json_bytes(ledger)
+    if len(data) > CAMPAIGN_MAX_TRANSACTION_BYTES:
+        raise StubError(
+            "too_large",
+            "campaign execution ledger exceeds its durable write limit",
+            size=len(data),
+            limit=CAMPAIGN_MAX_TRANSACTION_BYTES,
+        )
+    os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+    _atomic_write(ledger_path, data, keep_mode=False, mode=0o600)
+    for group_id in group_ids:
+        record = ledger.get("groups", {}).get(group_id)
+        if record is not None:
+            _campaign_write_json(_campaign_attempt_path(args, group_id), record)
+
+
+def _campaign_group_value(group_id, record):
+    value = {"group_id": group_id}
+    value.update(dict(record.get("contract") or {}))
+    return value
+
+
+def _campaign_drive_attempt(args, ledger_path, ledger, group_id):
+    """Reconcile or perform the one scheduler mutation journaled for a group."""
+    record = ledger["groups"][group_id]
+
+    def write_record(value):
+        ledger["groups"][group_id] = value
+        _campaign_write_execution(args, ledger_path, ledger, (group_id,))
+
+    current = _attempt_current(record)
+    _attempt_reconcile_submitting(record, current, write_record)
+    current = _attempt_current(record)
+    if current is None or current.get("state") != "INTENDED":
+        return {
+            "group": _campaign_group_value(group_id, record),
+            "record": record,
+            "submitted": False,
+        }
+
+    current["state"] = "SUBMITTING"
+    record["state"] = "SUBMITTING"
+    write_record(record)
+    attempt_dir = os.path.dirname(_campaign_attempt_path(args, group_id))
+    _campaign_attempt_fault(attempt_dir, "submitting")
+    argv = ["sbatch", "--parsable", "--job-name=" + current["marker"]]
+    argv += list(current.get("args") or []) + [current["script_path"]]
+    result = _slurm(
+        argv,
+        timeout=120,
+        cwd=current.get("cwd") or os.path.expanduser("~"),
+        on_spawn=args.get("_register"),
+        new_session=True,
+    )
+    current["sbatch_rc"] = result.get("rc")
+    current["sbatch_stderr"] = (result.get("stderr") or "")[-4000:]
+    if result.get("rc") != 0:
+        current["state"] = "REJECTED"
+        record["state"] = "REJECTED"
+        record["reason"] = current["sbatch_stderr"] or "sbatch rejected the submission"
+        write_record(record)
+        return {
+            "group": _campaign_group_value(group_id, record),
+            "record": record,
+            "submitted": False,
+        }
+    match = re.match(r"^\s*(\d+)", result.get("stdout") or "")
+    if not match:
+        current["state"] = "UNKNOWN"
+        record["state"] = "UNKNOWN"
+        record["reason"] = "sbatch returned success without a parseable job id"
+        write_record(record)
+        return {
+            "group": _campaign_group_value(group_id, record),
+            "record": record,
+            "submitted": False,
+        }
+    _campaign_attempt_fault(attempt_dir, "accepted")
+    current["job_id"] = match.group(1)
+    current["state"] = "ACCEPTED"
+    current["accepted_at"] = time.time()
+    record["state"] = "ACCEPTED"
+    write_record(record)
+    return {
+        "group": _campaign_group_value(group_id, record),
+        "record": record,
+        "submitted": True,
+    }
+
+
+def op_campaign_attempt_ensure(args):
+    """Reserve units, consume retries, and recover or submit under one run lease."""
+    attempt_dir, group_id = _campaign_attempt_dir(args)
+    contract = args.get("contract")
+    script = args.get("script")
+    flags = args.get("args") or []
+    cwd = args.get("cwd")
+    requested_attempt_id = args.get("attempt_id")
+    if not isinstance(contract, dict):
+        raise StubError("invalid_arg", "contract must be an object")
+    if hashlib.sha256(_campaign_json_bytes(contract)).hexdigest() != group_id:
+        raise StubError("invalid_arg", "group_id does not match the canonical contract")
+    if not isinstance(script, str) or not script.strip():
+        raise StubError("invalid_arg", "script must be non-empty content")
+    script_sha = hashlib.sha256(script.encode("utf-8")).hexdigest()
+    if args.get("script_sha256") != script_sha:
+        raise StubError("invalid_arg", "script bytes do not match script_sha256")
+    if not isinstance(flags, list) or not all(isinstance(value, str) for value in flags):
+        raise StubError("invalid_arg", "args must be a list of strings")
+    if cwd is not None:
+        cwd = _path(cwd, must_exist=True)
+    if not isinstance(requested_attempt_id, str) or not re.match(
+        r"^[0-9a-f]{32}$", requested_attempt_id
+    ):
+        raise StubError("invalid_arg", "attempt_id must be a 32-character lowercase hex id")
+    unit_ids = _campaign_contract_units(contract)
+    claims = args.get("retry_claims") or []
+    if not isinstance(claims, list) or not all(isinstance(value, dict) for value in claims):
+        raise StubError("invalid_arg", "retry_claims must be a list of objects")
+    claims_by_unit = {}
+    for claim in claims:
+        unit_id = claim.get("unit_id")
+        authorization_id = claim.get("authorization_id")
+        if unit_id not in unit_ids or unit_id in claims_by_unit:
+            raise StubError("invalid_arg", "retry_claims do not uniquely match group units")
+        if not isinstance(authorization_id, str) or not re.match(
+            r"^[0-9a-f]{32}$", authorization_id
+        ):
+            raise StubError("invalid_arg", "retry authorization_id must be a lowercase hex id")
+        claims_by_unit[unit_id] = claim
+
+    execution_dir, ledger_path = _campaign_execution_paths(args)
+    with _campaign_lock(execution_dir):
+        ledger = _campaign_execution_ledger(args, ledger_path)
+        reservations = ledger["units"]
+        consumed = ledger["consumed_authorizations"]
+
+        replacements = set()
+        consumed_claims = False
+        for unit_id, claim in claims_by_unit.items():
+            use = consumed.get(claim["authorization_id"] + ":" + unit_id)
+            if use is not None:
+                consumed_claims = True
+                replacements.add(use.get("replacement_group_id"))
+        if consumed_claims:
+            if None in replacements or not replacements:
+                raise StubError(
+                    "store_conflict", "retry authorization has incomplete durable state"
+                )
+            outcomes = [
+                _campaign_drive_attempt(args, ledger_path, ledger, existing_group)
+                for existing_group in sorted(replacements)
+            ]
+            return {
+                "outcomes": outcomes,
+                "record": outcomes[0]["record"],
+                "group": outcomes[0]["group"],
+                "attempt_dir": os.path.dirname(
+                    _campaign_attempt_path(args, outcomes[0]["group"]["group_id"])
+                ),
+                "submitted": any(item["submitted"] for item in outcomes),
+            }
+
+        # An unclaimed reservation is an outstanding exact intent. Recover its whole group
+        # instead of allowing the caller's current selection to create a new group identity.
+        blocking_groups = set()
+        for unit_id in unit_ids:
+            reservation = reservations.get(unit_id)
+            claim = claims_by_unit.get(unit_id)
+            if reservation is None:
+                # Adopted and output-only work has no managed group reservation. Its explicit
+                # retry authorization still becomes durable here before the first managed attempt.
+                if claim is not None and claim.get("expected_group_id") is not None:
+                    raise StubError(
+                        "store_conflict",
+                        "retry claim has no matching durable unit reservation",
+                        unit_id=unit_id,
+                    )
+                continue
+            if claim is None:
+                blocking_groups.add(reservation.get("group_id"))
+                continue
+            if reservation.get("group_id") != claim.get("expected_group_id") or reservation.get(
+                "attempt_id"
+            ) != claim.get("expected_attempt_id"):
+                raise StubError(
+                    "store_conflict",
+                    "retry claim no longer matches the unit's current durable attempt",
+                    unit_id=unit_id,
+                )
+        if blocking_groups:
+            if None in blocking_groups:
+                raise StubError("store_conflict", "unit reservation has no group identity")
+            outcomes = [
+                _campaign_drive_attempt(args, ledger_path, ledger, existing_group)
+                for existing_group in sorted(blocking_groups)
+            ]
+            return {
+                "outcomes": outcomes,
+                "record": outcomes[0]["record"],
+                "group": outcomes[0]["group"],
+                "attempt_dir": os.path.dirname(
+                    _campaign_attempt_path(args, outcomes[0]["group"]["group_id"])
+                ),
+                "submitted": any(item["submitted"] for item in outcomes),
+            }
+
+        # Orphaned script bytes cannot mutate the scheduler. The ledger commit below records
+        # the intent, unit reservations, and retry consumption in one atomic replacement.
+        if not script.endswith("\n"):
+            script += "\n"
+        script_path = os.path.join(attempt_dir, "attempt-%s.sh" % requested_attempt_id)
+        os.makedirs(attempt_dir, exist_ok=True)
+        _atomic_write(script_path, script.encode("utf-8"), keep_mode=False, mode=0o700)
+        record = ledger["groups"].get(group_id)
+        if record is None:
+            record = {
+                "schema": 1,
+                "group_id": group_id,
+                "contract": contract,
+                "created_at": time.time(),
+                "state": "INTENDED",
+                "attempts": [],
+            }
+            ledger["groups"][group_id] = record
+        elif record.get("contract") != contract:
+            raise StubError("store_conflict", "campaign group contract differs from durable record")
+        current = {
+            "attempt_id": requested_attempt_id,
+            "marker": "rsc-%s-%s" % (group_id[:10], requested_attempt_id[:10]),
+            "state": "INTENDED",
+            "created_at": time.time(),
+            "script_path": script_path,
+            "script_sha256": hashlib.sha256(script.encode("utf-8")).hexdigest(),
+            "args": flags,
+            "cwd": cwd,
+            "control": args.get("control") or {},
+        }
+        record.setdefault("attempts", []).append(current)
+        record["current_attempt"] = requested_attempt_id
+        record["state"] = "INTENDED"
+        record.pop("reason", None)
+        for unit_id in unit_ids:
+            reservations[unit_id] = {
+                "group_id": group_id,
+                "attempt_id": requested_attempt_id,
+            }
+            claim = claims_by_unit.get(unit_id)
+            if claim is not None:
+                consumed[claim["authorization_id"] + ":" + unit_id] = {
+                    "authorization_id": claim["authorization_id"],
+                    "unit_id": unit_id,
+                    "previous_group_id": claim.get("expected_group_id"),
+                    "previous_attempt_id": claim.get("expected_attempt_id"),
+                    "replacement_group_id": group_id,
+                    "replacement_attempt_id": requested_attempt_id,
+                    "consumed_at": time.time(),
+                }
+        _campaign_write_execution(args, ledger_path, ledger, (group_id,))
+        _campaign_attempt_fault(attempt_dir, "intent")
+        outcome = _campaign_drive_attempt(args, ledger_path, ledger, group_id)
+        return {
+            "outcomes": [outcome],
+            "record": outcome["record"],
+            "group": outcome["group"],
+            "attempt_dir": attempt_dir,
+            "submitted": outcome["submitted"],
+        }
+
+
+def op_campaign_attempt_update(args):
+    attempt_dir, group_id = _campaign_attempt_dir(args)
+    state = args.get("state")
+    if state not in CAMPAIGN_ATTEMPT_STATES:
+        raise StubError("invalid_arg", "invalid campaign attempt state: %r" % state)
+    execution_dir, ledger_path = _campaign_execution_paths(args)
+    with _campaign_lock(execution_dir):
+        ledger = _campaign_execution_ledger(args, ledger_path)
+        record = ledger.get("groups", {}).get(group_id)
+        if record is None:
+            raise StubError("not_found", "campaign attempt group does not exist")
+        if record.get("group_id") != group_id:
+            raise StubError("store_conflict", "campaign attempt group identity differs")
+        current = _attempt_current(record)
+        if current is None:
+            raise StubError("not_found", "campaign attempt record has no current attempt")
+        if current.get("attempt_id") != args.get("attempt_id"):
+            raise StubError(
+                "store_conflict", "campaign attempt update does not match the current attempt"
+            )
+        current["state"] = state
+        record["state"] = state
+        _campaign_write_execution(args, ledger_path, ledger, (group_id,))
+        return {"record": record, "attempt_dir": attempt_dir}
+
+
+def op_campaign_markers(args):
+    paths = args.get("paths")
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise StubError("invalid_arg", "paths must be a list of non-empty marker directories")
+    if len(paths) > 1024:
+        raise StubError("invalid_arg", "at most 1024 marker directories may be read")
+    root = os.path.realpath(_campaign_root(args))
+    items = []
+    for raw in paths:
+        path = os.path.realpath(_path(raw))
+        try:
+            inside = os.path.commonpath((root, path)) == root
+        except ValueError:
+            inside = False
+        if not inside:
+            raise StubError("permission", "marker path is outside campaign_dir", path=path)
+        item = {"path": path}
+        for name in ("started.json", "finished.json"):
+            value = _campaign_read_json(
+                os.path.join(path, name), required=False, max_bytes=64 * 1024
+            )
+            if value is not None:
+                item[name[:-5]] = value
+        items.append(item)
+    return {"items": items, "count": len(items)}
+
+
+def op_campaign_put_immutable(args):
+    base = _campaign_base(args)
+    kind = args.get("kind")
+    object_id = _campaign_id(args.get("object_id"), "object_id")
+    value = args.get("value")
+    if not isinstance(value, dict):
+        raise StubError("invalid_arg", "immutable campaign value must be an object")
+    if kind == "definition":
+        path = os.path.join(base, "definitions", object_id + ".json")
+    elif kind == "run":
+        path = os.path.join(base, "runs", object_id, "run.json")
+    elif kind == "preflight_receipt":
+        path = os.path.join(base, "receipts", "preflight", object_id + ".json")
+    elif kind == "validation_receipt":
+        run_id = _campaign_id(args.get("run_id"), "run_id")
+        path = os.path.join(base, "runs", run_id, "receipts", "validation", object_id + ".json")
+    else:
+        raise StubError(
+            "invalid_arg",
+            "kind must be definition, run, preflight_receipt, or validation_receipt",
+        )
+    data = _campaign_json_bytes(value)
+    if kind in ("preflight_receipt", "validation_receipt"):
+        expected = hashlib.sha256(data).hexdigest()
+        if object_id != expected:
+            raise StubError(
+                "invalid_arg",
+                "receipt id does not match its canonical bytes",
+                expected=expected,
+                observed=object_id,
+            )
+    if len(data) > CAMPAIGN_MAX_TRANSACTION_BYTES:
+        raise StubError("too_large", "immutable campaign value exceeds store limit")
+    with _campaign_lock(base):
+        existing = _campaign_read_json(path, required=False)
+        if existing is not None:
+            if _campaign_json_bytes(existing) != data:
+                raise StubError(
+                    "store_conflict",
+                    "immutable campaign object already exists with different bytes",
+                    kind=kind,
+                    object_id=object_id,
+                )
+            return {"created": False, "path": path, "value": existing}
+        _campaign_write_json(path, value)
+        return {"created": True, "path": path, "value": value}
+
+
+def _campaign_head(run_dir):
+    head = _campaign_read_json(os.path.join(run_dir, "HEAD"), required=False)
+    if head is None:
+        return {"schema": CAMPAIGN_SCHEMA, "revision": 0, "transaction_id": None}
+    if not isinstance(head, dict) or not isinstance(head.get("revision"), int):
+        raise StubError("error", "invalid campaign HEAD", path=os.path.join(run_dir, "HEAD"))
+    return head
+
+
+def _campaign_quarantine(run_dir, txid, txdir, view_path=None, journal_path=None, reason=None):
+    orphan_root = os.path.join(run_dir, "orphaned")
+    os.makedirs(orphan_root, exist_ok=True)
+    orphan = os.path.join(orphan_root, "%s-%d-%s" % (txid, int(time.time()), uuid.uuid4().hex[:8]))
+    if os.path.exists(txdir):
+        os.rename(txdir, orphan)
+    else:
+        os.makedirs(orphan, exist_ok=True)
+    if view_path and os.path.exists(view_path):
+        os.rename(view_path, os.path.join(orphan, "published-view"))
+    if journal_path and os.path.exists(journal_path):
+        os.rename(journal_path, os.path.join(orphan, "published-journal.json"))
+    _campaign_write_json(
+        os.path.join(orphan, "orphan.json"),
+        {
+            "transaction_id": txid,
+            "quarantined_at": time.time(),
+            "reason": reason or "unreachable",
+        },
+    )
+    return orphan
+
+
+def _campaign_reachable(run_dir, head, target_txid):
+    """Return the target's committed pointer only when linked from current HEAD."""
+    cursor = dict(head)
+    for _unused in range(100000):
+        txid = cursor.get("transaction_id")
+        revision = cursor.get("revision")
+        if txid == target_txid:
+            basename = "%020d-%s" % (revision, txid)
+            return {
+                "schema": CAMPAIGN_SCHEMA,
+                "revision": revision,
+                "transaction_id": txid,
+                "journal": "journal/" + basename + ".json",
+                "view": "views/" + basename,
+            }
+        if not txid or not revision:
+            return None
+        journal_rel = cursor.get("journal")
+        if not journal_rel:
+            journal_rel = "journal/%020d-%s.json" % (revision, txid)
+        journal = _campaign_read_json(os.path.join(run_dir, journal_rel), required=False)
+        if not isinstance(journal, dict):
+            return None
+        parent = journal.get("parent")
+        if not isinstance(parent, dict):
+            return None
+        cursor = parent
+    raise StubError("too_large", "campaign history exceeds reachability traversal limit")
+
+
+def op_campaign_commit(args):
+    run_dir = _campaign_run(args)
+    txid = _campaign_id(args.get("transaction_id"), "transaction_id")
+    expected = args.get("expected_revision")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        raise StubError("invalid_arg", "expected_revision must be a non-negative integer")
+    events = args.get("events")
+    documents = args.get("documents")
+    if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
+        raise StubError("invalid_arg", "events must be an array of objects")
+    if len(events) > CAMPAIGN_MAX_EVENTS:
+        raise StubError("too_large", "campaign transaction contains too many events")
+    if not isinstance(documents, dict) or len(documents) > CAMPAIGN_MAX_DOCUMENTS:
+        raise StubError("invalid_arg", "documents must be a bounded object")
+    normalized_documents = {}
+    for relative, value in documents.items():
+        normalized_documents[_campaign_document_path(relative)] = value
+    request_value = {
+        "schema": CAMPAIGN_SCHEMA,
+        "expected_revision": expected,
+        "events": events,
+        "documents": documents,
+    }
+    request_bytes = _campaign_json_bytes(request_value)
+    if len(request_bytes) > CAMPAIGN_MAX_TRANSACTION_BYTES:
+        raise StubError("too_large", "campaign transaction exceeds byte limit")
+    request_digest = hashlib.sha256(request_bytes).hexdigest()
+    run_record = os.path.join(run_dir, "run.json")
+    if not os.path.isfile(run_record):
+        raise StubError("not_found", "campaign run does not exist", run_id=args.get("run_id"))
+
+    with _campaign_lock(run_dir):
+        head = _campaign_head(run_dir)
+        txdir = os.path.join(run_dir, "transactions", txid)
+        request_path = os.path.join(txdir, "request.json")
+        result_path = os.path.join(txdir, "result.json")
+        prior_request = _campaign_read_json(request_path, required=False)
+        if prior_request is not None:
+            if prior_request.get("request_digest") != request_digest:
+                raise StubError(
+                    "store_conflict", "transaction_id was already used for different content"
+                )
+            result = _campaign_read_json(result_path, required=False)
+            if result is not None:
+                result["idempotent"] = True
+                return result
+            committed_head = _campaign_reachable(run_dir, head, txid)
+            if committed_head is not None:
+                result = {
+                    "revision": committed_head["revision"],
+                    "transaction_id": txid,
+                    "head": committed_head,
+                    "idempotent": True,
+                    "recovered": True,
+                }
+                _campaign_write_json(result_path, result)
+                return result
+
+        revision = expected + 1
+        basename = "%020d-%s" % (revision, txid)
+        view_path = os.path.join(run_dir, "views", basename)
+        journal_path = os.path.join(run_dir, "journal", basename + ".json")
+        if prior_request is not None and os.path.isfile(journal_path) and os.path.isdir(view_path):
+            if head.get("revision") == expected:
+                new_head = {
+                    "schema": CAMPAIGN_SCHEMA,
+                    "revision": revision,
+                    "transaction_id": txid,
+                    "journal": "journal/" + basename + ".json",
+                    "view": "views/" + basename,
+                }
+                _campaign_write_json(os.path.join(run_dir, "HEAD"), new_head)
+                result = {
+                    "revision": revision,
+                    "transaction_id": txid,
+                    "head": new_head,
+                    "recovered": True,
+                }
+                _campaign_write_json(result_path, result)
+                return result
+
+        if head.get("revision") != expected:
+            raise StubError(
+                "store_conflict",
+                "campaign HEAD changed",
+                expected_revision=expected,
+                actual_revision=head.get("revision"),
+                actual_transaction_id=head.get("transaction_id"),
+            )
+
+        if prior_request is not None:
+            _campaign_quarantine(
+                run_dir,
+                txid,
+                txdir,
+                view_path=view_path,
+                journal_path=journal_path,
+                reason="incomplete transaction replayed before HEAD publication",
+            )
+        os.makedirs(txdir, exist_ok=False)
+        _campaign_write_json(
+            request_path,
+            {
+                "request_digest": request_digest,
+                "expected_revision": expected,
+                "created_at": time.time(),
+            },
+        )
+        staged_view = os.path.join(txdir, "view")
+        document_digests = {}
+        for relative, value in normalized_documents.items():
+            target = os.path.join(staged_view, relative)
+            data = _campaign_json_bytes(value)
+            document_digests[relative.replace(os.sep, "/")] = hashlib.sha256(data).hexdigest()
+            _campaign_write_json(target, value)
+        _campaign_write_json(os.path.join(txdir, "events.json"), events)
+        if os.environ.get("REMOTESLURM_TEST_CAMPAIGN_FAIL_STEP") == "staged":
+            raise StubError("error", "injected campaign failure after staging")
+        os.makedirs(os.path.dirname(view_path), exist_ok=True)
+        os.rename(staged_view, view_path)
+        if os.environ.get("REMOTESLURM_TEST_CAMPAIGN_FAIL_STEP") == "view":
+            raise StubError("error", "injected campaign failure after view publication")
+        journal = {
+            "schema": CAMPAIGN_SCHEMA,
+            "revision": revision,
+            "transaction_id": txid,
+            "parent": {
+                "revision": head.get("revision"),
+                "transaction_id": head.get("transaction_id"),
+            },
+            "committed_at": time.time(),
+            "events": events,
+            "events_sha256": hashlib.sha256(_campaign_json_bytes(events)).hexdigest(),
+            "documents": document_digests,
+            "request_digest": request_digest,
+        }
+        _campaign_write_json(journal_path, journal)
+        if os.environ.get("REMOTESLURM_TEST_CAMPAIGN_FAIL_STEP") == "journal":
+            raise StubError("error", "injected campaign failure after journal publication")
+        new_head = {
+            "schema": CAMPAIGN_SCHEMA,
+            "revision": revision,
+            "transaction_id": txid,
+            "journal": "journal/" + basename + ".json",
+            "view": "views/" + basename,
+        }
+        _campaign_write_json(os.path.join(run_dir, "HEAD"), new_head)
+        if os.environ.get("REMOTESLURM_TEST_CAMPAIGN_FAIL_STEP") == "head":
+            raise StubError("error", "injected campaign failure after HEAD publication")
+        result = {"revision": revision, "transaction_id": txid, "head": new_head}
+        _campaign_write_json(result_path, result)
+        return result
+
+
+def op_campaign_read(args):
+    run_dir = _campaign_run(args)
+    head = _campaign_head(run_dir)
+    document = _campaign_document_path(args.get("document") or "summary.json")
+    if head.get("revision") == 0 or not head.get("view"):
+        raise StubError("not_found", "campaign run has no committed snapshot")
+    path = os.path.join(run_dir, head["view"], document)
+    max_bytes = args.get("max_bytes", CAMPAIGN_MAX_READ_BYTES)
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise StubError("invalid_arg", "max_bytes must be an integer")
+    max_bytes = max(1, min(CAMPAIGN_MAX_READ_BYTES, max_bytes))
+    value = _campaign_read_json(path, max_bytes=max_bytes)
+    return {"head": head, "document": document.replace(os.sep, "/"), "value": value}
+
+
+def op_campaign_events(args):
+    run_dir = _campaign_run(args)
+    head = _campaign_head(run_dir)
+    limit = args.get("limit", 200)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+        raise StubError("invalid_arg", "limit must be from 1 to 500")
+    cursor = args.get("cursor")
+    offset = 0
+    if cursor is None:
+        pointer = dict(head)
+    else:
+        if not isinstance(cursor, str):
+            raise StubError("invalid_arg", "cursor must be text")
+        parts = cursor.split(":", 2)
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[2].isdigit():
+            raise StubError("invalid_arg", "invalid campaign event cursor")
+        revision = int(parts[0])
+        txid = _campaign_id(parts[1], "cursor transaction_id")
+        offset = int(parts[2])
+        pointer = _campaign_reachable(run_dir, head, txid)
+        if pointer is None or pointer.get("revision") != revision:
+            raise StubError("store_conflict", "campaign event cursor is not reachable from HEAD")
+    events = []
+    next_cursor = None
+    while pointer and pointer.get("transaction_id") and len(events) < limit:
+        revision = pointer["revision"]
+        txid = pointer["transaction_id"]
+        journal_rel = pointer.get("journal") or "journal/%020d-%s.json" % (revision, txid)
+        journal = _campaign_read_json(os.path.join(run_dir, journal_rel))
+        if journal.get("revision") != revision or journal.get("transaction_id") != txid:
+            raise StubError("error", "campaign journal identity does not match its pointer")
+        batch = journal.get("events")
+        if not isinstance(batch, list):
+            raise StubError("error", "campaign journal events are malformed")
+        remaining = limit - len(events)
+        events.extend(batch[offset : offset + remaining])
+        consumed = offset + min(remaining, max(0, len(batch) - offset))
+        if consumed < len(batch):
+            next_cursor = "%d:%s:%d" % (revision, txid, consumed)
+            break
+        parent = journal.get("parent")
+        if not isinstance(parent, dict) or not parent.get("transaction_id"):
+            pointer = None
+            next_cursor = None
+            break
+        pointer = _campaign_reachable(run_dir, head, parent["transaction_id"])
+        offset = 0
+        if len(events) >= limit and pointer is not None:
+            next_cursor = "%d:%s:0" % (pointer["revision"], pointer["transaction_id"])
+    return {
+        "head": head,
+        "events": events,
+        "count": len(events),
+        "next_cursor": next_cursor,
+    }
+
+
+def op_campaign_list(args):
+    root = _campaign_root(args)
+    limit = args.get("limit", 100)
+    offset = args.get("offset", 0)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= CAMPAIGN_LIST_MAX:
+        raise StubError("invalid_arg", "limit must be from 1 to %d" % CAMPAIGN_LIST_MAX)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise StubError("invalid_arg", "offset must be a non-negative integer")
+    name = args.get("name")
+    records = []
+    if name is None:
+        try:
+            names = sorted(
+                item for item in os.listdir(root) if os.path.isdir(os.path.join(root, item))
+            )
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                names = []
+            else:
+                raise _os_error(e, root)
+        records = [
+            {"name": item} for item in names if re.match(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$", item)
+        ]
+    else:
+        base = os.path.join(root, _campaign_name(name, "name"), "runs")
+        try:
+            run_ids = sorted(
+                item for item in os.listdir(base) if os.path.isdir(os.path.join(base, item))
+            )
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                run_ids = []
+            else:
+                raise _os_error(e, base)
+        for run_id in run_ids:
+            run_dir = os.path.join(base, run_id)
+            run = _campaign_read_json(os.path.join(run_dir, "run.json"), required=False)
+            if isinstance(run, dict):
+                head = _campaign_head(run_dir)
+                summary = None
+                if head.get("view"):
+                    summary = _campaign_read_json(
+                        os.path.join(run_dir, head["view"], "summary.json"), required=False
+                    )
+                records.append({"run": run, "head": head, "summary": summary})
+    page = records[offset : offset + limit]
+    next_offset = offset + len(page) if offset + len(page) < len(records) else None
+    return {"items": page, "count": len(page), "next_offset": next_offset}
+
+
+def op_campaign_receipts(args):
+    base = _campaign_base(args)
+    kind = args.get("kind")
+    if kind == "preflight":
+        receipt_dir = os.path.join(base, "receipts", "preflight")
+    elif kind == "validation":
+        run_id = _campaign_id(args.get("run_id"), "run_id")
+        receipt_dir = os.path.join(base, "runs", run_id, "receipts", "validation")
+    else:
+        raise StubError("invalid_arg", "receipt kind must be preflight or validation")
+    receipt_id = args.get("receipt_id")
+    if receipt_id is not None:
+        receipt_id = _campaign_id(receipt_id, "receipt_id")
+        value = _campaign_read_json(os.path.join(receipt_dir, receipt_id + ".json"))
+        return {"receipt_id": receipt_id, "value": value}
+    limit = args.get("limit", 100)
+    offset = args.get("offset", 0)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+        raise StubError("invalid_arg", "limit must be from 1 to 500")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise StubError("invalid_arg", "offset must be a non-negative integer")
+    try:
+        names = sorted(
+            (name[:-5] for name in os.listdir(receipt_dir) if name.endswith(".json")),
+            reverse=True,
+        )
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            names = []
+        else:
+            raise _os_error(e, receipt_dir)
+    selected = names[offset : offset + limit]
+    items = []
+    for name in selected:
+        value = _campaign_read_json(os.path.join(receipt_dir, name + ".json"))
+        items.append({"receipt_id": name, "value": value})
+    next_offset = offset + len(items) if offset + len(items) < len(names) else None
+    return {"items": items, "count": len(items), "next_offset": next_offset}
+
+
+def op_campaign_check(args):
+    root = _campaign_root(args)
+    os.makedirs(root, exist_ok=True)
+    token = uuid.uuid4().hex
+    staged = os.path.join(root, ".doctor-" + token + ".staged")
+    published = os.path.join(root, ".doctor-" + token + ".published")
+    payload = {"schema": CAMPAIGN_SCHEMA, "token": token, "written_at": time.time()}
+    try:
+        _campaign_write_json(staged, payload)
+        os.rename(staged, published)
+        observed = _campaign_read_json(published)
+        if observed != payload:
+            raise StubError("error", "campaign store atomic-rename check read different bytes")
+        mode = statmod.S_IMODE(os.stat(root).st_mode)
+        return {
+            "path": root,
+            "writable": True,
+            "atomic_rename": True,
+            "mode": "%04o" % mode,
+            "compute_visibility": "not_tested",
+        }
+    finally:
+        for path in (staged, published):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def op_path_stats(args):
+    paths = args.get("paths")
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise StubError("invalid_arg", "paths must be an array of non-empty strings")
+    if len(paths) > 1024:
+        raise StubError("invalid_arg", "at most 1024 paths may be inspected per request")
+    records = []
+    for raw in paths:
+        path = _path(raw)
+        try:
+            info = os.lstat(path)
+            if statmod.S_ISREG(info.st_mode):
+                kind = "file"
+            elif statmod.S_ISDIR(info.st_mode):
+                kind = "directory"
+            elif statmod.S_ISLNK(info.st_mode):
+                kind = "symlink"
+            else:
+                kind = "other"
+            records.append(
+                {
+                    "path": path,
+                    "exists": True,
+                    "kind": kind,
+                    "size": info.st_size,
+                    "mtime": info.st_mtime,
+                    "readable": os.access(path, os.R_OK),
+                    "writable": os.access(path, os.W_OK),
+                    "executable": os.access(path, os.X_OK),
+                }
+            )
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                parent = os.path.dirname(path)
+                while parent and not os.path.exists(parent):
+                    next_parent = os.path.dirname(parent)
+                    if next_parent == parent:
+                        break
+                    parent = next_parent
+                records.append(
+                    {
+                        "path": path,
+                        "exists": False,
+                        "nearest_parent": parent,
+                        "parent_writable": bool(parent and os.access(parent, os.W_OK)),
+                    }
+                )
+            else:
+                records.append(
+                    {"path": path, "exists": None, "error": _os_error(e, path).to_dict()}
+                )
+    return {"paths": records, "count": len(records)}
+
+
+def _contract_match(path, want_hash, hash_budget):
+    try:
+        info = os.lstat(path)
+        if statmod.S_ISREG(info.st_mode):
+            kind = "file"
+        elif statmod.S_ISDIR(info.st_mode):
+            kind = "directory"
+        elif statmod.S_ISLNK(info.st_mode):
+            kind = "symlink"
+        else:
+            kind = "other"
+        result = {
+            "path": path,
+            "exists": True,
+            "kind": kind,
+            "size": info.st_size,
+            "mtime": info.st_mtime,
+        }
+        if want_hash and kind == "file":
+            if info.st_size > CONTRACT_MAX_HASH_BYTES or info.st_size > hash_budget[0]:
+                result["error"] = {
+                    "code": "too_large",
+                    "message": "file exceeds bounded contract hash limit",
+                    "size": info.st_size,
+                    "max_bytes": min(CONTRACT_MAX_HASH_BYTES, hash_budget[0]),
+                }
+            else:
+                digest = hashlib.sha256()
+                with io.open(path, "rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                hash_budget[0] -= info.st_size
+                result["sha256"] = digest.hexdigest()
+        elif want_hash and kind == "symlink":
+            result["sha256"] = hashlib.sha256(os.readlink(path).encode("utf-8")).hexdigest()
+        return result
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return {"path": path, "exists": False}
+        return {"path": path, "exists": None, "error": _os_error(e, path).to_dict()}
+
+
+def op_contract_observe(args):
+    items = args.get("items")
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise StubError("invalid_arg", "items must be an array of contract observation objects")
+    if len(items) > CONTRACT_MAX_ITEMS:
+        raise StubError(
+            "invalid_arg", "at most %d contract items may be observed" % CONTRACT_MAX_ITEMS
+        )
+    hash_budget = [CONTRACT_MAX_TOTAL_HASH_BYTES]
+    match_budget = [CONTRACT_MAX_TOTAL_MATCHES]
+    observations = []
+    for item in items:
+        raw = item.get("path")
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            raise StubError("invalid_arg", "contract path must be non-empty text without NUL")
+        path = _path(raw)
+        use_glob = bool(item.get("glob", False))
+        max_matches = item.get("max_matches", CONTRACT_MAX_MATCHES)
+        if (
+            isinstance(max_matches, bool)
+            or not isinstance(max_matches, int)
+            or not 1 <= max_matches <= CONTRACT_MAX_MATCHES
+        ):
+            raise StubError(
+                "invalid_arg", "max_matches must be from 1 to %d" % CONTRACT_MAX_MATCHES
+            )
+        want_hash = bool(item.get("sha256", False))
+        if use_glob:
+            found = []
+            truncated = False
+            item_limit = min(max_matches, match_budget[0])
+            try:
+                for candidate in glob.iglob(path, recursive=True):
+                    if len(found) >= item_limit:
+                        truncated = True
+                        break
+                    found.append(candidate)
+            except (OSError, re.error) as e:
+                observations.append(
+                    {
+                        "path": path,
+                        "matches": [],
+                        "truncated": False,
+                        "error": {"code": "error", "message": str(e)},
+                    }
+                )
+                continue
+            match_budget[0] -= len(found)
+            matches = [
+                _contract_match(candidate, want_hash, hash_budget) for candidate in sorted(found)
+            ]
+        else:
+            match = _contract_match(path, want_hash, hash_budget)
+            matches = [] if match.get("exists") is False else [match]
+            truncated = False
+        observations.append(
+            {
+                "path": path,
+                "matches": matches,
+                "truncated": truncated,
+                "observed_at": time.time(),
+            }
+        )
+    return {
+        "observed_at": time.time(),
+        "items": observations,
+        "count": len(observations),
+        "limits": {
+            "max_items": CONTRACT_MAX_ITEMS,
+            "max_matches": CONTRACT_MAX_MATCHES,
+            "max_total_matches": CONTRACT_MAX_TOTAL_MATCHES,
+            "max_hash_bytes": CONTRACT_MAX_HASH_BYTES,
+            "max_total_hash_bytes": CONTRACT_MAX_TOTAL_HASH_BYTES,
+        },
+    }
+
+
+def op_tool_check(args):
+    names = args.get("names")
+    if not isinstance(names, list) or not all(isinstance(name, str) and name for name in names):
+        raise StubError("invalid_arg", "names must be an array of non-empty tool names")
+    if len(names) > 64:
+        raise StubError("invalid_arg", "at most 64 tools may be checked")
+    tools = []
+    for name in names:
+        if "\x00" in name:
+            raise StubError("invalid_arg", "tool name contains NUL")
+        path = shutil.which(name)
+        tools.append({"name": name, "available": path is not None, "path": path})
+    return {"tools": tools, "count": len(tools)}
 
 
 def op_squeue(args):
@@ -2788,6 +4051,19 @@ OPS = {
     "task_fingerprint": op_task_fingerprint,
     "task_ensure": op_task_ensure,
     "task_update": op_task_update,
+    "campaign_attempt_ensure": op_campaign_attempt_ensure,
+    "campaign_attempt_update": op_campaign_attempt_update,
+    "campaign_markers": op_campaign_markers,
+    "campaign_put_immutable": op_campaign_put_immutable,
+    "campaign_commit": op_campaign_commit,
+    "campaign_read": op_campaign_read,
+    "campaign_events": op_campaign_events,
+    "campaign_list": op_campaign_list,
+    "campaign_receipts": op_campaign_receipts,
+    "campaign_check": op_campaign_check,
+    "path_stats": op_path_stats,
+    "contract_observe": op_contract_observe,
+    "tool_check": op_tool_check,
     "squeue": op_squeue,
     "sstat": op_sstat,
     "sacct": op_sacct,

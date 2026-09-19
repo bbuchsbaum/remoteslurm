@@ -350,13 +350,13 @@ def test_accounting_lag_falls_back_to_scontrol_then_registry(make_cluster, sandb
     assert st.source == "scontrol"
     assert st.state == "COMPLETED"
     assert st.terminal is True
-    # once scontrol forgets the job too, the registry's last state is reported as pending
+    # once scontrol forgets the job too, retained terminal evidence remains terminal
     burn_ticks(c, 5)
     st = c.job_status(job.job_id, refresh=True)
     assert st.source == "registry"
-    assert st.accounting_pending is True
+    assert st.accounting_pending is False
     assert st.state == "COMPLETED"
-    assert st.terminal is False
+    assert st.terminal is True
 
 
 # -- cancel ----------------------------------------------------------------------------------

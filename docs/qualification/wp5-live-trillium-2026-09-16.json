@@ -1,0 +1,95 @@
+{
+  "candidate": "working tree",
+  "candidate_source_sha256": "f5de3de8a9f2e81069016cb10f12a24f1aee26dd6e0b520e4fb8035decd4fc3f",
+  "client_stub_sha": "4d118ea530019b60",
+  "git_revision": "771dff69eb0b3337d8ddf2d54a70787e3dac5782",
+  "host": "tri-login04",
+  "qualification": "WP5 campaign execution",
+  "qualification_test_sha256": "b01ff6ce46871e38baa08d845bfcbb836fb799f2a9672f67a10d0910d5248415",
+  "recorded_at": "2026-09-16T20:27:09.672338+00:00",
+  "remote_stub_sha": "4d118ea530019b60",
+  "resources": {
+    "cpus_per_task": 1,
+    "nodes": 1,
+    "ntasks": 1,
+    "partition": "archiveshort",
+    "time": "00:15:00"
+  },
+  "result": "PASSED",
+  "scenarios": {
+    "array_lost_response": {
+      "definition_id": "7e86b7cb8b38df8c55092d920a50c2d76cebfc4339693cec46e9fdf5a18cc53d",
+      "job_ids": [
+        "2328272"
+      ],
+      "recovered": true,
+      "remote_attempts": 1,
+      "run_id": "qualification",
+      "states": [
+        "COMPLETED",
+        "FAILED"
+      ]
+    },
+    "cancellation": {
+      "campaign_state": "CANCELLED",
+      "definition_id": "0d7abad3adeaaca871ae64b76859b0b7181d8968d05a152bc18ece889e9037ed",
+      "job_ids": [
+        "2328313"
+      ],
+      "run_id": "qualification",
+      "scheduler_state": "CANCELLED"
+    },
+    "concurrent_retry": {
+      "attempt_count": 2,
+      "authorization_id": "dd4aa545269247d0846314d1c53f1146",
+      "consumed_authorizations": 1,
+      "definition_id": "0308ba9055b657c3c51e968700b6206c59b45fce71d0b51143116725281f6f86",
+      "job_ids": [
+        "2328279",
+        "2328280"
+      ],
+      "run_id": "qualification",
+      "state": "COMPLETED"
+    },
+    "packed_markers": {
+      "definition_id": "01643169e2e4d10d807ab405534413e63a372941e8f8c4e089a1e08a0aa9edc6",
+      "job_ids": [
+        "2328275"
+      ],
+      "marker_statuses": [
+        "finished",
+        "finished"
+      ],
+      "run_id": "qualification",
+      "states": [
+        "COMPLETED",
+        "COMPLETED"
+      ]
+    },
+    "verified_dependency": {
+      "definition_id": "db7000f5b2b332d3928d1b4ffe426ab5ece88de68fad5fe82df9e68830a3a02f",
+      "downstream": {
+        "blocked": {
+          "dependency_state": "BLOCKED",
+          "execution_state": "UNBOUND"
+        },
+        "ready": {
+          "dependency_state": "SATISFIED",
+          "execution_state": "COMPLETED"
+        }
+      },
+      "job_ids": [
+        "2328286",
+        "2328292",
+        "2328293"
+      ],
+      "run_id": "qualification",
+      "validation_counts": {
+        "FAILED": 1,
+        "PASSED": 1
+      }
+    }
+  },
+  "schema": 1,
+  "slurm_version": "slurm 25.11.8"
+}

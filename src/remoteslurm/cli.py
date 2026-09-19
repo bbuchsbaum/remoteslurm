@@ -290,6 +290,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         w = c.write("~/.cache/remoteslurm/.doctor", "ok\n", force=True)
         c.rm(w["path"], force=True)
         check("home writable", True, info["home"])
+        campaign_store = c.call("campaign_check", campaign_dir=host.campaign_dir)
+        check(
+            "campaign store",
+            bool(campaign_store.get("writable") and campaign_store.get("atomic_rename")),
+            f"{campaign_store['path']} (mode {campaign_store.get('mode', '?')}; "
+            f"compute visibility {campaign_store.get('compute_visibility', 'not tested')})",
+        )
         env = info.get("env", {})
         configured_env = {k: env.get(k) for k in host.env_vars}
         missing_env = [k for k, v in configured_env.items() if v is None]
@@ -1736,6 +1743,443 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ----------------------------------------------------------------------------- campaigns
+def _campaign_status_human(data: dict[str, Any]) -> None:
+    store = data.get("store", {})
+    print(
+        f"{data['campaign']}  run {data['run_id']}  {data['lifecycle']}  "
+        f"revision {store.get('revision', data.get('revision', 0))}"
+    )
+    print("STAGE  UNITS  READY  PEND  RUN  EXEC-FAIL  OUTPUTS  VERIFIED  INVALID")
+    for stage in data.get("stages", []):
+        execution = stage["execution"]
+        artifacts = stage["artifacts"]
+        validation = stage["validation"]
+        print(
+            f"{stage['name']:<12} {stage['units']:>5} {stage['ready']:>6} "
+            f"{execution['PENDING']:>5} {execution['RUNNING']:>4} {execution['FAILED']:>10} "
+            f"{artifacts['PRESENT']:>4}/{stage['units']:<4} "
+            f"{validation['PASSED']:>4}/{stage['units']:<4} "
+            f"{validation['FAILED'] + validation['ERROR']:>7}"
+        )
+    telemetry = data.get("telemetry", {})
+    cpu_coverage = telemetry.get("cpu_coverage", {})
+    rss_coverage = telemetry.get("rss_coverage", {})
+    print(
+        "CURRENT RESOURCES  "
+        f"{telemetry.get('active_allocations', 0)} allocations / "
+        f"{telemetry.get('allocated_cpus', 0)} CPUs allocated"
+    )
+    effective = telemetry.get("effective_cpus")
+    rss = telemetry.get("estimated_rss_bytes")
+    print(
+        "OBSERVED           "
+        f"{effective if effective is not None else '-'} effective CPUs; "
+        f"{fmt_size(rss)} RSS; "
+        f"CPU {cpu_coverage.get('sampled', 0)}/{cpu_coverage.get('eligible', 0)}, "
+        f"RSS {rss_coverage.get('sampled', 0)}/{rss_coverage.get('eligible', 0)} covered"
+    )
+    action = data.get("next_action") or {}
+    if action:
+        print(f"NEXT                {action.get('kind')}: {action.get('reason')}")
+
+
+def _load_campaign_for_cli(args: argparse.Namespace) -> Any:
+    from .campaigns.spec import load_campaign
+
+    preliminary = load_campaign(args.file, max_units=args.max_units)
+    config = Config.load(Path(args.config) if getattr(args, "config", None) else None)
+    return load_campaign(
+        args.file,
+        max_units=args.max_units,
+        host_config=config.host(preliminary.host),
+    )
+
+
+def cmd_campaign_plan(args: argparse.Namespace) -> int:
+    from .campaigns.contracts import stage_contract
+
+    definition = _load_campaign_for_cli(args)
+    stage_counts: dict[str, int] = {}
+    for unit in definition.units:
+        stage_counts[unit.stage] = stage_counts.get(unit.stage, 0) + 1
+    data: dict[str, Any] = {
+        "schema": definition.schema,
+        "campaign": definition.name,
+        "host": definition.host,
+        "definition_id": definition.definition_id,
+        "unit_count": len(definition.units),
+        "stages": [
+            {
+                "name": stage.name,
+                "units": stage_counts.get(stage.name, 0),
+                "needs": [need.stage for need in stage.needs],
+                "script_sha256": stage.script_sha256,
+                "execution": stage.execution,
+                "resources": stage.resources,
+                "contract_id": stage_contract(stage)["contract_id"],
+            }
+            for stage in definition.stages
+        ],
+    }
+    if args.units:
+        data["units"] = [unit.__dict__ for unit in definition.units[: args.limit]]
+        data["truncated"] = len(definition.units) > args.limit
+
+    def human(result: dict[str, Any]) -> None:
+        print(f"{result['campaign']}  {result['definition_id']}")
+        print(f"host {result['host']}  {result['unit_count']} units")
+        for stage in result["stages"]:
+            dependencies = ",".join(stage["needs"]) or "-"
+            print(f"  {stage['name']}: {stage['units']} units  needs {dependencies}")
+
+    emit(args, data, human)
+    return EXIT_OK
+
+
+def cmd_campaign_start(args: argparse.Namespace) -> int:
+    definition = _load_campaign_for_cli(args)
+    cluster = get_cluster(args, definition.host)
+    result = cluster.campaigns.start(definition, run_id=args.run_id, parent_run=args.parent_run)
+    emit(args, result, _campaign_status_human)
+    return EXIT_OK
+
+
+def cmd_campaign_list(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.list(limit=args.limit, offset=args.offset)
+
+    def human(data: dict[str, Any]) -> None:
+        for item in data["items"]:
+            print(item["name"])
+        if data.get("next_offset") is not None:
+            print(f"next offset: {data['next_offset']}", file=sys.stderr)
+
+    emit(args, result, human)
+    return EXIT_OK
+
+
+def cmd_campaign_runs(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.runs(
+        args.name,
+        include_archived=args.include_archived,
+        limit=args.limit,
+        offset=args.offset,
+    )
+
+    def human(data: dict[str, Any]) -> None:
+        print("RUN  LIFECYCLE  REVISION  CREATED")
+        for item in data["items"]:
+            print(
+                f"{item['run_id']}  {item['lifecycle']:<11} "
+                f"{item.get('revision', 0):>8}  {item.get('created_at', '-')}"
+            )
+
+    emit(args, result, human)
+    return EXIT_OK
+
+
+def cmd_campaign_status(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.status(
+        args.name,
+        run_id=args.run,
+        refresh=args.refresh,
+        include_units=args.units,
+        offset=args.offset,
+        limit=args.limit,
+        stage=args.stage,
+    )
+    emit(args, result, _campaign_status_human)
+    return EXIT_OK
+
+
+def cmd_campaign_adopt(args: argparse.Namespace) -> int:
+    unit_jobs = None
+    if args.job_map:
+        try:
+            unit_jobs = json.loads(Path(args.job_map).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise InvalidArgument(f"cannot read job map {args.job_map}: {exc}") from exc
+        if not isinstance(unit_jobs, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in unit_jobs.items()
+        ):
+            raise InvalidArgument("job map must be a JSON object of unit_id to Slurm job id")
+    manager = get_cluster(args).campaigns
+    result = manager.adopt(
+        args.name,
+        args.stage,
+        run_id=args.run,
+        job_id=args.job,
+        array_job_id=args.array_job,
+        unit_jobs=unit_jobs,
+        output_only=args.output_only,
+    )
+    if args.refresh:
+        result = manager.status(args.name, run_id=result["run_id"], refresh=True)
+    emit(args, result, _campaign_status_human)
+    return EXIT_OK
+
+
+def cmd_campaign_close(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.close(
+        args.name,
+        run_id=args.run,
+        allow_active=args.allow_active,
+        reason=args.reason,
+    )
+    emit(args, result, _campaign_status_human)
+    return EXIT_OK
+
+
+def cmd_campaign_archive(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.archive(
+        args.name,
+        run_id=args.run,
+        accept_unresolved=args.accept_unresolved,
+    )
+    emit(args, result, _campaign_status_human)
+    return EXIT_OK
+
+
+def cmd_campaign_restore(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.restore(args.name, run_id=args.run)
+    emit(args, result, _campaign_status_human)
+    return EXIT_OK
+
+
+def cmd_campaign_failures(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.failures(args.name, run_id=args.run, limit=args.limit)
+
+    def human(data: dict[str, Any]) -> None:
+        if not data["failures"]:
+            print("no campaign failures")
+            return
+        for unit in data["failures"]:
+            print(
+                f"{unit['unit_id']}  execution={unit['execution']['state']} "
+                f"artifacts={unit['artifacts']['state']} "
+                f"validation={unit['validation']['state']}"
+            )
+        if data.get("truncated"):
+            print(f"showing {len(data['failures'])} of {data['count']}", file=sys.stderr)
+
+    emit(args, result, human)
+    return EXIT_OK
+
+
+def cmd_campaign_events(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.events(
+        args.name,
+        run_id=args.run,
+        cursor=args.cursor,
+        limit=args.limit,
+    )
+
+    def human(data: dict[str, Any]) -> None:
+        for event in data["events"]:
+            context = ""
+            if event.get("stage"):
+                context += f" stage={event['stage']}"
+            if event.get("unit_id"):
+                context += f" unit={event['unit_id']}"
+            print(f"{event.get('recorded_at', '-')}  {event.get('type', 'unknown')}{context}")
+        if data.get("next_cursor"):
+            print(f"next cursor: {data['next_cursor']}", file=sys.stderr)
+
+    emit(args, result, human)
+    return EXIT_OK
+
+
+def cmd_campaign_verify(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.verify(
+        args.name,
+        run_id=args.run,
+        stage=args.stage,
+        unit_id=args.unit,
+        settle=not args.no_settle,
+        offset=args.offset,
+        limit=args.limit,
+    )
+
+    def human(data: dict[str, Any]) -> None:
+        counts = "  ".join(f"{key}={value}" for key, value in sorted(data["counts"].items()))
+        print(f"{data['campaign']}  run {data['run_id']}  selected {data['selected']}")
+        print(counts or "no validation results")
+        for item in data["results"]:
+            print(f"  {item['unit_id']}  {item['state']}  receipt {item['receipt_id']}")
+        if data.get("next_offset") is not None:
+            print(f"next offset: {data['next_offset']}", file=sys.stderr)
+
+    emit(args, result, human)
+    return (
+        EXIT_OK
+        if result.get("counts", {}).get("FAILED", 0) == 0
+        and result.get("counts", {}).get("ERROR", 0) == 0
+        else EXIT_ERROR
+    )
+
+
+def cmd_campaign_preflight(args: argparse.Namespace) -> int:
+    definition = _load_campaign_for_cli(args)
+    cluster = get_cluster(args, definition.host)
+    result = cluster.campaigns.preflight(definition, against=args.against)
+
+    def human(data: dict[str, Any]) -> None:
+        print(f"{data['campaign']}  {data['result']}  receipt {data['receipt_id']}")
+        for name, section in data["sections"].items():
+            print(f"  {name}: {section['status']}")
+
+    emit(args, result, human)
+    return EXIT_OK if result["result"] == "PASSED" else EXIT_ERROR
+
+
+def cmd_campaign_receipts(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.receipts(
+        args.name,
+        args.kind,
+        run_id=args.run,
+        receipt_id=args.receipt,
+        limit=args.limit,
+        offset=args.offset,
+    )
+
+    def human(data: dict[str, Any]) -> None:
+        if "receipt_id" in data:
+            print(f"{data['receipt_id']}  {data.get('value', {}).get('result', '-')}")
+            return
+        for item in data.get("items", []):
+            value = item.get("value", {})
+            recorded_at = value.get("checked_at", value.get("verified_at", "-"))
+            print(
+                f"{item['receipt_id']}  {value.get('kind', '-')}  "
+                f"{value.get('result', '-')}  {recorded_at}"
+            )
+
+    emit(args, result, human)
+    return EXIT_OK
+
+
+def _campaign_pairs(values: list[str], label: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise InvalidArgument(f"{label} values must use NAME=VALUE")
+        key, item = value.split("=", 1)
+        if not key or not item or key in result:
+            raise InvalidArgument(f"{label} values need unique, non-empty NAME=VALUE pairs")
+        result[key] = item
+    return result
+
+
+def cmd_campaign_apply(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.apply(
+        args.name,
+        run_id=args.run,
+        stage=args.stage,
+        unit_id=args.unit,
+        max_groups=args.max_groups,
+        require_preflight=args.require_preflight,
+    )
+
+    def human(data: dict[str, Any]) -> None:
+        print(
+            f"{data['campaign']}  run {data['run_id']}  "
+            f"applied {data['applied_groups']}/{data['planned_groups']} groups"
+        )
+        for group in data["groups"]:
+            attempt = group.get("attempt") or {}
+            print(
+                f"  {group['stage']}  {group['mode']}  units={group['units']}  "
+                f"state={group['state']}  job={attempt.get('job_id', '-')}"
+            )
+
+    emit(args, result, human)
+    return EXIT_OK
+
+
+def cmd_campaign_retry(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.retry(
+        args.name,
+        run_id=args.run,
+        stage=args.stage,
+        unit_id=args.unit,
+        where=_campaign_pairs(args.where, "where"),
+        states=_campaign_pairs(args.state, "state"),
+        reason=args.reason,
+        accept_duplicate_risk=args.accept_duplicate_risk,
+        dry_run=args.dry_run,
+        apply=args.apply,
+        require_preflight=args.require_preflight,
+        max_groups=args.max_groups,
+    )
+    emit(
+        args,
+        result,
+        lambda data: print(
+            f"would authorize {data['selected']} unit(s)"
+            if data.get("dry_run")
+            else f"authorized {data['authorized']} unit(s) for retry "
+            f"({data['authorization_id']})" + (" and applied" if data["applied"] else "")
+        ),
+    )
+    return EXIT_OK
+
+
+def cmd_campaign_cancel(args: argparse.Namespace) -> int:
+    cluster = get_cluster(args)
+    plan = cluster.campaigns.cancel(
+        args.name,
+        run_id=args.run,
+        stage=args.stage,
+        unit_id=args.unit,
+        all_active=args.all_active,
+    )
+    result = plan
+    if args.apply and plan["job_ids"]:
+        what = f"cancel campaign jobs {', '.join(plan['job_ids'])}"
+        if not _confirm_gate(args, cluster, "cancel", what):
+            print("aborted", file=sys.stderr)
+            return EXIT_ERROR
+        result = cluster.campaigns.cancel(
+            args.name,
+            run_id=args.run,
+            stage=args.stage,
+            unit_id=args.unit,
+            all_active=args.all_active,
+            apply=True,
+            confirm=True,
+        )
+
+    def human(data: dict[str, Any]) -> None:
+        verb = "cancelled" if data["applied"] else "would cancel"
+        print(
+            f"{verb} {len(data['job_ids'])} job(s), affecting {len(data['affected_units'])} unit(s)"
+        )
+        if data["job_ids"]:
+            print("  " + " ".join(data["job_ids"]))
+
+    emit(args, result, human)
+    return EXIT_OK
+
+
+def cmd_campaign_drive(args: argparse.Namespace) -> int:
+    result = get_cluster(args).campaigns.drive(
+        args.name,
+        run_id=args.run,
+        max_passes=args.max_passes,
+        interval=args.interval,
+        max_groups=args.max_groups,
+        require_preflight=args.require_preflight,
+    )
+    emit(
+        args,
+        result,
+        lambda data: print(
+            f"{data['campaign']}  run {data['run_id']}  completed {data['passes']} drive pass(es)"
+        ),
+    )
+    return EXIT_OK
+
+
 def cmd_mcp_config(args: argparse.Namespace) -> int:
     from .server import mcp_config_snippet
 
@@ -2220,6 +2664,157 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--older-than-days", type=int, default=30, help="age cutoff in days (default 30)"
     )
+
+    campaign = sub.add_parser(
+        "campaign",
+        help="define, adopt, reconcile, and inspect durable campaigns",
+        description="Observation-first durable campaign workspaces",
+        parents=[common],
+    )
+    campaign_sub = campaign.add_subparsers(dest="campaign_command", metavar="COMMAND")
+    campaign_sub.required = True
+
+    def add_campaign(
+        name: str, fn: Callable[[argparse.Namespace], int], help: str
+    ) -> argparse.ArgumentParser:
+        child = campaign_sub.add_parser(name, help=help, description=help, parents=[common])
+        child.set_defaults(func=fn)
+        return child
+
+    sp = add_campaign("plan", cmd_campaign_plan, "compile and inspect a campaign definition")
+    sp.add_argument("file")
+    sp.add_argument("--max-units", type=int, default=50_000)
+    sp.add_argument("--units", action="store_true", help="include bounded unit details")
+    sp.add_argument("--limit", type=int, default=200)
+
+    sp = add_campaign("start", cmd_campaign_start, "create a durable observation-only run")
+    sp.add_argument("file")
+    sp.add_argument("--run-id")
+    sp.add_argument("--parent-run")
+    sp.add_argument("--max-units", type=int, default=50_000)
+
+    sp = add_campaign("list", cmd_campaign_list, "list campaigns in the remote store")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--offset", type=int, default=0)
+
+    sp = add_campaign("runs", cmd_campaign_runs, "list a campaign's run history")
+    sp.add_argument("name")
+    sp.add_argument("--include-archived", action="store_true")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--offset", type=int, default=0)
+
+    sp = add_campaign("status", cmd_campaign_status, "show a reconciled campaign snapshot")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--refresh", action="store_true", help="append one bounded observation pass")
+    sp.add_argument("--stage")
+    sp.add_argument("--units", action="store_true", help="include bounded unit details")
+    sp.add_argument("--limit", type=int, default=200)
+    sp.add_argument("--offset", type=int, default=0)
+
+    sp = add_campaign("adopt", cmd_campaign_adopt, "bind already-running work or existing outputs")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--stage", required=True)
+    adoption = sp.add_mutually_exclusive_group(required=True)
+    adoption.add_argument("--job", help="job id for a one-unit stage")
+    adoption.add_argument("--array-job", help="bare array id, mapped by stable unit ordinal")
+    adoption.add_argument("--job-map", help="JSON object mapping every stage unit id to job id")
+    adoption.add_argument("--output-only", action="store_true", help="adopt existing artifacts")
+    sp.add_argument("--refresh", action="store_true", help="observe immediately after adoption")
+
+    sp = add_campaign("close", cmd_campaign_close, "close execution intent for a run")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--allow-active", action="store_true")
+    sp.add_argument("--reason")
+
+    sp = add_campaign("archive", cmd_campaign_archive, "archive a closed run")
+    sp.add_argument("name")
+    sp.add_argument("--run", required=True)
+    sp.add_argument("--accept-unresolved", action="store_true")
+
+    sp = add_campaign("restore", cmd_campaign_restore, "restore an archived run as closed")
+    sp.add_argument("name")
+    sp.add_argument("--run", required=True)
+
+    sp = add_campaign("failures", cmd_campaign_failures, "list failed or unresolved units")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--limit", type=int, default=200)
+
+    sp = add_campaign("events", cmd_campaign_events, "read committed campaign history")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--cursor")
+    sp.add_argument("--limit", type=int, default=200)
+
+    sp = add_campaign("verify", cmd_campaign_verify, "validate outputs and store receipts")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--stage")
+    sp.add_argument("--unit")
+    sp.add_argument("--no-settle", action="store_true", help="observe once without waiting")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--offset", type=int, default=0)
+
+    sp = add_campaign("preflight", cmd_campaign_preflight, "qualify a campaign definition")
+    sp.add_argument("file")
+    sp.add_argument("--against", help="named pilot selection to validate")
+    sp.add_argument("--max-units", type=int, default=50_000)
+
+    sp = add_campaign("receipts", cmd_campaign_receipts, "read immutable campaign receipts")
+    sp.add_argument("name")
+    sp.add_argument("--kind", choices=("preflight", "validation"), required=True)
+    sp.add_argument("--run", help="required for validation receipts")
+    sp.add_argument("--receipt")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--offset", type=int, default=0)
+
+    sp = add_campaign("apply", cmd_campaign_apply, "submit one bounded eligible campaign pass")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--stage")
+    sp.add_argument("--unit")
+    sp.add_argument("--max-groups", type=int, default=100)
+    sp.add_argument(
+        "--require-preflight",
+        nargs="?",
+        const="",
+        metavar="PILOT",
+        help="require a current passing receipt, optionally for PILOT",
+    )
+
+    sp = add_campaign("retry", cmd_campaign_retry, "authorize explicit campaign retries")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--stage")
+    sp.add_argument("--unit")
+    sp.add_argument("--where", action="append", default=[], metavar="FIELD=VALUE")
+    sp.add_argument("--state", action="append", default=[], metavar="AXIS=STATE")
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--accept-duplicate-risk", action="store_true")
+    sp.add_argument("--dry-run", action="store_true", help="preview selection without authorizing")
+    sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--max-groups", type=int, default=100)
+    sp.add_argument("--require-preflight", nargs="?", const="", metavar="PILOT")
+
+    sp = add_campaign("cancel", cmd_campaign_cancel, "plan or cancel active campaign jobs")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--stage")
+    sp.add_argument("--unit")
+    sp.add_argument("--all-active", action="store_true")
+    sp.add_argument("--apply", action="store_true", help="perform the planned cancellation")
+    sp.add_argument("--yes", action="store_true", help="skip configured confirmation prompt")
+
+    sp = add_campaign("drive", cmd_campaign_drive, "run bounded attached apply/refresh passes")
+    sp.add_argument("name")
+    sp.add_argument("--run")
+    sp.add_argument("--max-passes", type=int, default=20)
+    sp.add_argument("--interval", type=float, default=10.0)
+    sp.add_argument("--max-groups", type=int, default=100)
+    sp.add_argument("--require-preflight", nargs="?", const="", metavar="PILOT")
 
     sp = add("config", cmd_config, "show config, or --init to write an example")
     sp.add_argument("--init", action="store_true")

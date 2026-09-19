@@ -93,6 +93,12 @@ class RegistryUnavailable(RemoteSlurmError):
     code = "registry_unavailable"
 
 
+class StoreConflict(RemoteSlurmError):
+    """A durable campaign compare-and-swap or idempotency check failed."""
+
+    code = "store_conflict"
+
+
 class Cancelled(RemoteSlurmError):
     """The caller abandoned the call (e.g. an MCP client cancelled or timed out the tool call)."""
 
@@ -130,6 +136,7 @@ _BY_CODE: dict[str, type[RemoteSlurmError]] = {
         ExecutionMismatch,
         TaskBusy,
         RegistryUnavailable,
+        StoreConflict,
         Cancelled,
         ConfirmationRequired,
     )

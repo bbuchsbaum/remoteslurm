@@ -1,5 +1,13 @@
 """remoteslurm — fast, agent-friendly control of a remote Slurm login node."""
 
+from .campaigns import (
+    CampaignDefinition,
+    CampaignManager,
+    compile_campaign,
+    evaluate_output,
+    load_campaign,
+    stage_contract,
+)
 from .cluster import Cluster
 from .config import Config, HostConfig
 from .errors import (
@@ -15,6 +23,7 @@ from .errors import (
     RemoteTimeout,
     SessionDied,
     SlurmError,
+    StoreConflict,
     TaskBusy,
     TooLarge,
 )
@@ -24,6 +33,12 @@ __version__ = "0.2.0"
 
 __all__ = [
     "Cluster",
+    "CampaignDefinition",
+    "CampaignManager",
+    "compile_campaign",
+    "evaluate_output",
+    "load_campaign",
+    "stage_contract",
     "Config",
     "HostConfig",
     "TaskSpec",
@@ -39,6 +54,7 @@ __all__ = [
     "RemoteTimeout",
     "SessionDied",
     "SlurmError",
+    "StoreConflict",
     "TaskBusy",
     "TooLarge",
     "__version__",

@@ -2,7 +2,8 @@
 
 [Codex skill](skills/remoteslurm/SKILL.md) · [Agent guide](docs/agent-guide.md) ·
 [Changelog](CHANGELOG.md) ·
-[Design notes](docs/plans/v2-plan.md) ·
+[v2 design notes](docs/plans/v2-plan.md) ·
+[Campaign workspace plan](docs/plans/v3-campaign-workspaces.md) ·
 [Issues](https://github.com/bbuchsbaum/remoteslurm/issues)
 
 **remoteslurm is a Python toolkit for operating a Slurm cluster through an SSH alias.** It gives
@@ -188,6 +189,64 @@ reported as `UNKNOWN` without an automatic retry. `VERIFIED` means the validatio
 and declared output fingerprints still match the receipt. See [durable tasks](docs/durable-tasks.md)
 for the manifest, retry semantics, Python API, and MCP tool.
 
+## Campaign workspaces
+
+A campaign definition groups finite inventories and stage dependencies into stable work-unit
+identities. Campaigns can create a durable run, adopt already-running arrays or output-only
+products, reconcile scheduler and filesystem evidence, qualify named pilots, validate output
+contracts, and close or archive the run. `status --refresh` observes once and never submits work or
+runs validators.
+
+```bash
+# Compile locally. Inventory rows and exact script bytes contribute to the definition id.
+rslurm campaign plan campaign.toml
+
+# Create durable remote intent, then adopt work that already exists.
+rslurm campaign start campaign.toml --run-id first-pass
+rslurm campaign apply analysis --run first-pass --require-preflight small
+rslurm campaign adopt analysis --run first-pass --stage preprocess --array-job 12345
+rslurm campaign adopt analysis --run first-pass --stage group --output-only
+
+# One bounded refresh combines squeue, sacct, retained evidence, output metadata, and sstat.
+rslurm campaign status analysis --run first-pass --refresh
+rslurm campaign failures analysis --run first-pass
+
+# Qualify the definition and an exact pilot layout, then validate production outputs separately.
+rslurm campaign preflight campaign.toml --against small
+rslurm campaign verify analysis --run first-pass --stage preprocess
+rslurm campaign receipts analysis --kind validation --run first-pass
+
+# Retry authorization is explicit; UNKNOWN also requires --accept-duplicate-risk.
+rslurm campaign retry analysis --run first-pass --stage preprocess \
+  --state validation=failed --reason 'fixed validator' --dry-run
+rslurm campaign drive analysis --run first-pass --max-passes 20 --interval 30
+
+# Closing blocks new adoption while preserving refresh and revalidation. Archival is read-only.
+rslurm campaign close analysis --run first-pass
+rslurm campaign archive analysis --run first-pass
+```
+
+Each unit reports dependency, execution, artifact, validation, and freshness states separately.
+Scheduler `COMPLETED`, present outputs, and passed validation therefore remain distinct claims.
+Current telemetry summarizes active allocations, allocated CPUs, observed effective CPUs/RSS, and
+sample coverage; it does not yet make packing recommendations. Configure `campaign_dir` on the
+host when `~/.remoteslurm/campaigns` is not visible from every login node.
+
+Managed stages choose `single`, `array`, or `pack` execution. One `apply` pass refreshes evidence,
+plans stable bounded groups, persists exact submission intent remotely, and then calls `sbatch`.
+Lost replies recover by attempt marker; an ambiguous attempt remains `UNKNOWN`. Arrays retain exact
+unit/index maps, and packed wrappers record per-unit start, finish, exit, and diagnostic evidence.
+Retries append authorization and immutable attempts instead of replacing failures. `campaign
+cancel` previews resolved jobs unless `--apply` is given, and cancellation remains available for
+active work in a run closed with `--allow-active`.
+
+Output contracts support required or optional file, directory, and symlink outputs; exact/minimum/
+maximum glob cardinality and byte size; optional SHA-256 evidence; and explicit settling intervals.
+Light validators are argv arrays with bounded time and output and pass through the host's
+`allow_run` policy. Verification writes content-addressed immutable receipts. A later artifact
+change marks current validation `STALE` while retaining the old receipt. Named-pilot receipts never
+count as production validation. See the [campaign guide](docs/campaigns.md) for the schema and APIs.
+
 ## What you can do
 
 | Goal | Commands |
@@ -197,6 +256,7 @@ for the manifest, retry semantics, Python API, and MCP tool.
 | Run work through Slurm | `submit`, `ensure`, `pack`, `sweep`, `run --compute` |
 | Keep login-node work running | `run --detach`, `proc`, `wait --pid`/`--path` |
 | Observe or recover jobs | `jobs`, `status`, `adopt`, `wait`, `watch`, `events` |
+| Run or validate a campaign | `campaign apply`, `campaign drive`, `campaign retry`, `campaign status`, `campaign preflight`, `campaign verify` |
 | Understand or stop a job | `output`, `diagnose`, `cancel` |
 | Inspect capacity and storage | `sinfo`, `queue`, `quota` |
 
@@ -219,8 +279,9 @@ remoteslurm mcp-config --host mycluster
 ```
 
 The default `core` tool set covers cluster information, bounded file operations, execution
-(including detached login-node processes), submission and durable `ensure`, job monitoring, diagnosis,
-synchronization, cancellation, waiting, and connection state. Set `REMOTESLURM_MCP_TOOLS=all` to
+(including detached login-node processes), submission, durable `ensure`, campaign observation,
+job monitoring, diagnosis, synchronization, cancellation, waiting, and connection state. Set
+`REMOTESLURM_MCP_TOOLS=all` to
 add project and queue inspection, quota, sweeps, output, events, globbing, and diffs. `run` and
 `sync` stay under 25 minutes (`REMOTESLURM_MCP_MAX_CALL`, default 1500 s) because clients such as
 Claude Code abort silent calls after 30 minutes. Cancelling a `run` or `wait` call stops its
@@ -349,12 +410,18 @@ REMOTESLURM_LIVE_TEMPLATE=short \
 uv run --no-sync pytest -q tests/live
 ```
 
-You may instead provide `REMOTESLURM_LIVE_PARTITION`, `REMOTESLURM_LIVE_TIME`, or
-`REMOTESLURM_LIVE_CWD`. Omitted values fall back to configured or scheduler defaults.
+You may instead provide `REMOTESLURM_LIVE_PARTITION`, `REMOTESLURM_LIVE_QOS`,
+`REMOTESLURM_LIVE_TIME`, or `REMOTESLURM_LIVE_CWD`. Omitted values fall back to configured or
+scheduler defaults.
 The durable-task live test runs when `REMOTESLURM_LIVE_CWD` is set, creates an isolated
 subdirectory there, and removes both its outputs and remote task record after validation.
 Set `REMOTESLURM_LIVE_FAULTS=1` to also exercise recovery after the submitting stub exits
 immediately following scheduler acceptance.
+
+The campaign live test also requires `REMOTESLURM_LIVE_CWD`. It exercises lost-response array
+recovery, mixed array outcomes, packed markers, concurrent retry authorization, verified per-unit
+dependency release, and cancellation with isolated campaigns and work directories. Set
+`REMOTESLURM_LIVE_EVIDENCE` to write its machine-readable qualification receipt.
 
 ## License
 

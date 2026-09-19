@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Added observation-first campaign workspaces across Python, CLI, and MCP. Strict TOML definitions
+  compile inventories and dependency joins into stable work units whose identity covers exact
+  script, lockfile, validator, environment, template, and resource inputs. Durable remote runs can
+  adopt arrays, individual jobs, or output-only products; bounded refreshes reconcile `squeue`,
+  `sacct`, retained terminal evidence, output metadata, and current `sstat` coverage while keeping
+  dependency, execution, artifact, validation, and freshness states separate. The remote store uses
+  compare-and-swap revisions, idempotent transactions, `HEAD`-reachable history, orphan quarantine,
+  paged unit views, and explicit open/closed/archived lifecycle transitions.
+- Added campaign output contracts, settling, verification, and preflight across Python, CLI, and
+  MCP. Contracts cover bounded cardinality/glob scans, file types, byte sizes, optional SHA-256,
+  guarded layout alternatives, and argv validators with bounded time/output. Status remains
+  observation-only and reports `SETTLING`; explicit verification stores content-addressed immutable
+  receipts and marks validation `STALE` after artifact mutation. Preflight records separate static,
+  remote, fixture, and named-pilot sections, requires every pilot layout alternative, and exposes a
+  fail-closed current-receipt gate for the later campaign executor.
+- Added idempotent campaign execution across Python, CLI, and core MCP tools. Deterministic single,
+  split-array, and packed job groups persist their exact intent and wrapper bytes remotely before
+  `sbatch`, recover lost replies by unique scheduler marker, and leave ambiguous attempts UNKNOWN.
+  A run-scoped execution ledger reserves units before submission, recovers the original group even
+  if a later request narrows the selection, normalizes array-task evidence to its parent job, and
+  atomically binds each retry authorization to its expected attempt and one replacement. Scheduler
+  evidence remains attempt-scoped, and a started packed unit becomes unresolved when its allocation
+  terminates without a finish marker.
+  Arrays retain exact per-unit indexes; packed allocations emit atomic per-unit start/finish/exit
+  markers and never promote allocation-only completion to unit success. Per-unit dependencies gate
+  eligibility, retries require journaled selectors and reasons (plus duplicate-risk acceptance for
+  UNKNOWN), cancellation previews bounded affected allocations, and attached `drive` repeats the
+  same observation/apply pass without implicit retry or validation. Successful cancellation also
+  retains attempt-scoped `scancel` evidence while scheduler accounting catches up.
 - `status --usage`, rate-limited `watch --usage`, Python job status, and MCP `jobs` can now
   normalize running `sstat` and terminal `sacct` telemetry: allocated CPUs, live PIDs, CPU time,
   effective CPU use, utilization, and RSS. Submissions and durable task manifests can declare a
@@ -47,6 +76,8 @@
   output for at most 2 s; previously a `setsid` child holding the pipes blocked one of the stub's four
   slow-pool workers until that child exited. Non-streaming runs now use the streaming path's
   bounded-memory reader, so a timeout error carries the first `max_output` bytes, not the last.
+  Child pipes are nonblocking, preventing simultaneous large stdin and capped output from stalling
+  the selector loop past its timeout.
 - Detached runs: `run(detach=True)` / `rslurm run --detach` / MCP `run(detach=true)` start a
   command in its own session, with output appended to a log, and return `{pid, pgid, log}` at
   once. The exit status is recorded remotely, so it survives the connection. New

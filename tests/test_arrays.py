@@ -70,6 +70,25 @@ def test_array_job_status_aggregate_is_running(cluster, monkeypatch: pytest.Monk
     assert st.extra["task_states"][7] == "PENDING"
 
 
+def test_aged_out_array_preserves_retained_terminal_evidence(
+    cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cluster.registry.put(
+        jobs_mod.JobRecord(
+            job_id="2200000",
+            last_state="COMPLETED",
+            last_seen=1.0,
+            meta={"array": "0-9"},
+        )
+    )
+    monkeypatch.setattr(cluster, "squeue", lambda **kw: [])
+    monkeypatch.setattr(cluster, "sacct", lambda ids=None, **kw: {})
+    status = cluster.job_status("2200000")
+    assert status.state == "COMPLETED"
+    assert status.source == "registry"
+    assert status.terminal is True
+
+
 # --------------------------------------------------------------------------- parser helpers
 def test_expand_array_tasks() -> None:
     assert slurm.expand_array_tasks("[5-9%4]") == [5, 6, 7, 8, 9]

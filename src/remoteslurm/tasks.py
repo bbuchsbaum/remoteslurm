@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import slurm
-from .errors import ExecutionMismatch, InvalidArgument, RemoteSlurmError
-from .identity import control_identity
+from .attempts import submission_control
+from .errors import InvalidArgument, RemoteSlurmError
 from .jobs import (
     JobRecord,
     append_learned_notes,
@@ -232,26 +232,6 @@ def _submission(cluster: Cluster, spec: TaskSpec) -> tuple[str, dict[str, Any], 
     return script, opts, flags
 
 
-def _control(cluster: Cluster) -> dict[str, Any]:
-    expected = control_identity()
-    info = cluster.info(refresh=True)
-    actual_sha = info.get("stub_sha")
-    if actual_sha != expected["stub_sha"]:
-        raise ExecutionMismatch(
-            "the loaded remote stub does not match the requesting client",
-            action="close the host session and repeat ensure so the current stub is installed",
-            client_stub_sha=expected["stub_sha"],
-            remote_stub_sha=actual_sha,
-            remote_stub=info.get("stub"),
-        )
-    return {
-        **expected,
-        "remote_protocol": info.get("protocol"),
-        "remote_python": info.get("python"),
-        "remote_stub": info.get("stub"),
-    }
-
-
 def _resolve(cluster: Cluster, spec: TaskSpec) -> dict[str, Any]:
     script, resources, flags = _submission(cluster, spec)
     info = cluster.info()
@@ -421,7 +401,7 @@ def ensure_task(
             f"task manifest selects host {parsed.host!r}, but cluster "
             f"{cluster.host.name!r} is connected"
         )
-    control = _control(cluster)
+    control = submission_control(cluster)
     resolved = _resolve(cluster, parsed)
     remote = cluster.call(
         "task_ensure",

@@ -131,6 +131,14 @@ class Cluster(SlurmOps):
 
         return ensure_task(self, spec, retry=retry, retry_unknown=retry_unknown)
 
+    @property
+    def campaigns(self) -> Any:
+        """Observation-first durable campaign workspace on this cluster."""
+
+        from .campaigns.manager import CampaignManager
+
+        return CampaignManager(self)
+
     def __enter__(self) -> Cluster:
         return self
 

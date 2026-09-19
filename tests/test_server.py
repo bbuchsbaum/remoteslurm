@@ -30,6 +30,19 @@ CORE_EXPECTED = {
     "ensure",
     "pack",
     "jobs",
+    "campaigns",
+    "campaign_start",
+    "campaign_adopt",
+    "campaign_lifecycle",
+    "campaign_failures",
+    "campaign_events",
+    "campaign_verify",
+    "campaign_preflight",
+    "campaign_receipts",
+    "campaign_apply",
+    "campaign_retry",
+    "campaign_cancel",
+    "campaign_drive",
     "diagnose",
     "sync",
     "cancel",
@@ -100,6 +113,51 @@ def test_list_tools_core_default() -> None:
 
 def test_list_tools_all_set() -> None:
     assert _tool_names(server.make_mcp("all")) == ALL_EXPECTED
+
+
+def test_campaigns_tool_lists_empty_store(mcp_cluster: Cluster) -> None:
+    result = call("campaigns")
+    assert result == {"items": [], "count": 0, "next_offset": None}
+
+
+def test_campaign_verify_and_receipt_tools(mcp_cluster: Cluster, sandbox) -> None:
+    from remoteslurm.campaigns.spec import compile_campaign
+
+    (sandbox / "run.sh").write_text("#!/bin/sh\ntrue\n")
+    definition = compile_campaign(
+        {
+            "schema": 1,
+            "name": "mcpreceipt",
+            "host": "local",
+            "workspace": {
+                "remote_root": str(sandbox),
+                "output_root": str(sandbox / "mcp-out"),
+            },
+            "inventories": {"one": {"key": ["id"], "rows": [{"id": "one"}]}},
+            "stages": {
+                "only": {
+                    "foreach": "one",
+                    "script": "run.sh",
+                    "outputs": [{"name": "result", "path": "result.txt", "min_bytes": 1}],
+                }
+            },
+        },
+        base_dir=sandbox,
+    )
+    mcp_cluster.campaigns.start(definition, run_id="mcp-run")
+    product = sandbox / "mcp-out" / "result.txt"
+    product.parent.mkdir()
+    product.write_text("ok\n")
+
+    verified = call("campaign_verify", name="mcpreceipt", run_id="mcp-run")
+    assert verified["counts"] == {"PASSED": 1}
+    receipts = call("campaign_receipts", name="mcpreceipt", kind="validation", run_id="mcp-run")
+    assert receipts["count"] == 1
+    applied = call("campaign_apply", name="mcpreceipt", run_id="mcp-run")
+    assert applied["applied_groups"] == 1
+    cancellation = call("campaign_cancel", name="mcpreceipt", run_id="mcp-run", all_active=True)
+    assert cancellation["applied"] is False
+    assert len(cancellation["job_ids"]) == 1
 
 
 def test_guide_resource_present() -> None:

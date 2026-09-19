@@ -28,6 +28,8 @@ from .errors import (
     RemoteTimeout,
     SlurmError,
 )
+from .evidence import Observation, ObservationIdentity, observed, unavailable
+from .reconcile import reconcile_job
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -1056,6 +1058,10 @@ class SlurmOps:
         base, task = slurm.parse_job_id(job_id)
         rec = self._registry_get(job_id)
         st: slurm.JobStatus | None = None
+        observed_at = time.time()
+        identity = ObservationIdentity(cluster=self.host.name, job_id=job_id)
+        evidence: list[Observation] = []
+        source_status: dict[str, slurm.JobStatus] = {}
 
         all_rows = self.squeue(refresh=refresh)
         if task is None and self._is_array(base, all_rows, rec):
@@ -1093,6 +1099,17 @@ class SlurmOps:
                 start_time=(r["start_time"] if r["start_time"] not in ("N/A", "") else None),
                 workdir=r["workdir"] or None,
             )
+            source_status["squeue"] = st
+            evidence.append(
+                observed(
+                    "squeue",
+                    observed_at,
+                    {"state": st.state},
+                    identity=identity,
+                )
+            )
+        else:
+            evidence.append(observed("squeue", observed_at, None, identity=identity))
         if st is None:
             found = self.sacct([job_id], all_steps=True)
             acct = found.get(job_id.split("_")[0]) or found.get(job_id)
@@ -1115,6 +1132,20 @@ class SlurmOps:
                     max_rss=acct.get("max_rss"),
                     workdir=acct.get("workdir") or None,
                     extra={"steps": acct.get("steps", [])},
+                )
+                source_status["sacct"] = st
+                evidence.append(
+                    observed(
+                        "sacct",
+                        observed_at,
+                        {"state": st.state},
+                        identity=identity,
+                        durable=True,
+                    )
+                )
+            else:
+                evidence.append(
+                    observed("sacct", observed_at, None, identity=identity, durable=True)
                 )
         if st is None:
             try:
@@ -1141,18 +1172,49 @@ class SlurmOps:
                     stdout_path=sc.get("StdOut") or None,
                     stderr_path=sc.get("StdErr") or None,
                 )
-            except SlurmError:
-                pass
-        if st is None:
-            # Not visible anywhere. Within the grace window after last sighting, report pending
-            # accounting rather than "unknown".
-            pending = bool(rec) and (time.time() - rec.last_seen) < ACCOUNTING_GRACE_SECONDS  # type: ignore[union-attr]
+                source_status["scontrol"] = st
+                evidence.append(
+                    observed(
+                        "scontrol",
+                        observed_at,
+                        {"state": st.state},
+                        identity=identity,
+                    )
+                )
+            except SlurmError as exc:
+                evidence.append(unavailable("scontrol", observed_at, exc.message))
+
+        if rec is not None:
+            evidence.append(
+                observed(
+                    "registry",
+                    rec.last_seen,
+                    {"state": rec.last_state or "UNKNOWN", "last_seen": rec.last_seen},
+                    identity=identity,
+                    durable=True,
+                )
+            )
+        reconciled = reconcile_job(
+            job_id,
+            evidence,
+            now=time.time(),
+            grace_seconds=ACCOUNTING_GRACE_SECONDS,
+        )
+        selected = source_status.get(reconciled.source)
+        if selected is not None:
+            st = selected
+        else:
             st = slurm.JobStatus(
                 job_id=job_id,
-                state=(rec.last_state if rec and pending else "UNKNOWN") or "UNKNOWN",
-                source="registry" if rec else "unknown",
-                accounting_pending=pending,
+                state=reconciled.state,
+                source=reconciled.source,
+                accounting_pending=reconciled.accounting_pending,
             )
+        st.extra["reconciliation"] = {
+            "freshness": reconciled.freshness,
+            "observed_at": reconciled.observed_at,
+            "sources": list(reconciled.sources),
+        }
         if rec:
             st.stdout_path = st.stdout_path or rec.stdout_path
             st.stderr_path = st.stderr_path or rec.stderr_path
@@ -1211,11 +1273,34 @@ class SlurmOps:
         # unknown (not a perpetual non-terminal "array") so wait() stops instead of looping.
         source = "array" if agg["task_states"] else "unknown"
         terminal = agg["terminal"] or source == "unknown"
+        accounting_pending = False
+        rec = self._registry_get(base)
+        if not agg["task_states"] and rec is not None:
+            reconciled = reconcile_job(
+                base,
+                [
+                    observed("squeue", time.time(), None),
+                    observed("sacct", time.time(), None, durable=True),
+                    observed(
+                        "registry",
+                        rec.last_seen,
+                        {"state": rec.last_state or "UNKNOWN", "last_seen": rec.last_seen},
+                        durable=True,
+                    ),
+                ],
+                now=time.time(),
+                grace_seconds=ACCOUNTING_GRACE_SECONDS,
+            )
+            agg["state"] = reconciled.state
+            source = reconciled.source
+            accounting_pending = reconciled.accounting_pending
+            terminal = reconciled.terminal or reconciled.state == "UNKNOWN"
         st = slurm.JobStatus(
             job_id=base,
             state=agg["state"],
             source=source,
             terminal=terminal,
+            accounting_pending=accounting_pending,
             extra={
                 "array": True,
                 "n_tasks": len(agg["task_states"]),
@@ -1224,7 +1309,6 @@ class SlurmOps:
                 "task_states": agg["task_states"],
             },
         )
-        rec = self._registry_get(base)
         if rec:
             st.name = rec.name
             st.stdout_path = rec.stdout_path
@@ -1240,7 +1324,8 @@ class SlurmOps:
                         failed_params[t] = p
                 if failed_params:
                     st.extra["failed_task_params"] = failed_params
-            self._registry_update(base, last_state=agg["state"], last_seen=time.time())
+            if source != "registry":
+                self._registry_update(base, last_state=agg["state"], last_seen=time.time())
         return st
 
     def _sweep_params_for(self, base: str, task: int) -> dict[str, Any] | None:
