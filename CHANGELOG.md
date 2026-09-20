@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `connect` checks the effective SSH ControlPath before authentication and verifies the master
+  before reporting success. Missing sockets now produce configuration-specific diagnostics.
+  Master checks, PID queries, shutdown, and `doctor` honor the same host SSH options used to
+  connect, including alternate SSH config files. `connect` and `doctor` also honor `--config`.
 - Added observation-first campaign workspaces across Python, CLI, and MCP. Strict TOML definitions
   compile inventories and dependency joins into stable work units whose identity covers exact
   script, lockfile, validator, environment, template, and resource inputs. Durable remote runs can

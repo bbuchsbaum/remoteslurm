@@ -8,7 +8,11 @@ remoteslurm and its rsync both traverse the same bastion. All unit-tested on arg
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from types import SimpleNamespace
+
+import pytest
 
 from remoteslurm import sync as sync_mod
 from remoteslurm.cluster import Cluster
@@ -30,6 +34,8 @@ def test_config_ssh_opts_reach_transport() -> None:
     # Every ssh command the transport builds carries the opts.
     assert _sublist(t._ssh_base(), PROXY)
     assert _sublist(t.connect_cmd(), PROXY)
+    assert _sublist(t.control_cmd("check"), PROXY)
+    assert _sublist(t.control_cmd("exit"), PROXY)
 
 
 def test_transport_ssh_opts_includes_proxyjump_for_rsync() -> None:
@@ -50,3 +56,31 @@ def test_transport_ssh_opts_appear_in_rsync_e_string() -> None:
     e_idx = cmd.index("-e")
     rsh = cmd[e_idx + 1]
     assert "ProxyJump=bastion" in rsh
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="OpenSSH config inspection requires ssh")
+@pytest.mark.parametrize("source", ["ssh_config", "ssh_opts", "control_path", "both"])
+def test_openssh_resolves_same_socket_for_all_commands(tmp_path, source) -> None:
+    cfg = tmp_path / "ssh config"
+    cfg.write_text("Host review\n  HostName example.invalid\n  ControlPath /tmp/from-file\n")
+    extra = ["-F", str(cfg)]
+    if source in {"ssh_opts", "both"}:
+        extra += ["-o", "ControlPath=/tmp/from-options"]
+    explicit = "/tmp/from-profile" if source in {"control_path", "both"} else None
+    transport = SSHTransport(alias="review", control_path=explicit, extra_ssh_opts=extra)
+    expected = explicit or ("/tmp/from-options" if source == "ssh_opts" else "/tmp/from-file")
+    assert transport.effective_config()["controlpath"] == expected
+    commands = [
+        [*transport._ssh_base(), "review"],
+        transport.control_cmd("check"),
+        transport.control_cmd("exit"),
+        [*sync_mod.transport_ssh_opts(SimpleNamespace(transport=transport)), "review"],
+    ]
+    for command in commands:
+        # -G exits after local config evaluation, even for -O exit: no connection or mutation.
+        result = subprocess.run(
+            [command[0], "-G", *command[1:]], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0, result.stderr
+        options = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+        assert options["controlpath"] == expected

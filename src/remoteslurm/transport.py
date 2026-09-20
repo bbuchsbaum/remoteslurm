@@ -22,7 +22,7 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any
 
-from .errors import AuthRequired, NotConnected, RemoteTimeout
+from .errors import AuthRequired, ConfigError, NotConnected, RemoteTimeout
 
 # `connection` warns when a master with a known session_lifetime has less than this left.
 EXPIRY_WARN_SECONDS = 3600
@@ -88,23 +88,25 @@ class SSHTransport(Transport):
     mfa: bool = True
     python: str = "python3"
     install_dir: str | None = None  # remote dir; default ~/.cache/remoteslurm with fallbacks
-    control_path: str | None = None  # only used when the ssh config lacks one
+    control_path: str | None = None  # explicit socket override; otherwise use the ssh config
     control_persist: str = "12h"
     extra_ssh_opts: list[str] = field(default_factory=list)
     name: str = "ssh"
 
     # -- ssh helpers -----------------------------------------------------------------
-    def _ssh_base(self) -> list[str]:
-        cmd = ["ssh", *SSH_BATCH_OPTS, *self.extra_ssh_opts]
+    def _host_ssh_opts(self) -> list[str]:
+        # OpenSSH takes the first value for each option. Keep socket identity and
+        # precedence identical for establishment, reuse, and control operations.
+        opts = []
         if self.control_path:
-            cmd += ["-o", f"ControlPath={self.control_path}"]
-        return cmd
+            opts += ["-o", f"ControlPath={self.control_path}"]
+        return [*opts, *self.extra_ssh_opts]
+
+    def _ssh_base(self) -> list[str]:
+        return ["ssh", *SSH_BATCH_OPTS, *self._host_ssh_opts()]
 
     def control_cmd(self, op: str) -> list[str]:
-        cmd = ["ssh", "-o", "LogLevel=ERROR"]
-        if self.control_path:
-            cmd += ["-o", f"ControlPath={self.control_path}"]
-        return [*cmd, "-O", op, self.alias]
+        return ["ssh", "-o", "LogLevel=ERROR", *self._host_ssh_opts(), "-O", op, self.alias]
 
     def master_alive(self) -> bool:
         try:
@@ -182,13 +184,46 @@ class SSHTransport(Transport):
             "-o",
             f"ControlPersist={self.control_persist}",
         ]
-        if self.control_path:
-            cmd += ["-o", f"ControlPath={self.control_path}"]
-        cmd += [*self.extra_ssh_opts, self.alias]
+        cmd += [*self._host_ssh_opts(), self.alias]
         return cmd
 
+    def effective_config(self) -> dict[str, str]:
+        """Inspect the establishment command's configuration without connecting."""
+        cmd = self.connect_cmd()
+        try:
+            result = subprocess.run(
+                [cmd[0], "-G", *cmd[1:]], capture_output=True, text=True, timeout=10
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ConfigError(
+                f"could not inspect SSH configuration for {self.alias}: {exc}",
+                action="check that OpenSSH is installed and the host's SSH configuration is valid",
+                alias=self.alias,
+            ) from exc
+        if result.returncode != 0:
+            raise ConfigError(
+                f"could not inspect SSH configuration for {self.alias}: "
+                f"{result.stderr.strip()[-4000:]}",
+                action="correct the host's SSH configuration and ssh_opts before connecting",
+                alias=self.alias,
+            )
+        return dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+
     def establish_master(self, interactive: bool) -> None:
-        """Establish the ControlMaster. Non-interactive only for hosts without MFA."""
+        """Establish and verify reuse. Non-interactive only for hosts without MFA."""
+        control_path = self.effective_config().get("controlpath")
+        if not control_path or control_path.lower() == "none":
+            raise ConfigError(
+                f"cannot establish a reusable SSH master for {self.alias}: "
+                "no effective ControlPath is configured",
+                action=(
+                    "set ControlPath in the host's SSH configuration (for example, "
+                    "~/.ssh/sockets/%C), or control_path in its remoteslurm host profile; "
+                    "create the socket directory before reconnecting"
+                ),
+                alias=self.alias,
+                control_path=control_path,
+            )
         cmd = self.connect_cmd()
         if not interactive:
             cmd = [cmd[0], "-o", "BatchMode=yes", *cmd[1:]]
@@ -199,12 +234,24 @@ class SSHTransport(Transport):
                     f"{r.stderr.decode(errors='replace').strip()}",
                     action=f"run: remoteslurm connect {self.alias}",
                 )
-            return
-        r = subprocess.run(cmd)
-        if r.returncode != 0:
-            raise AuthRequired(
-                f"ssh to {self.alias} failed (exit {r.returncode})",
-                action="check `ssh " + self.alias + "` works interactively, then retry",
+        else:
+            r = subprocess.run(cmd)
+            if r.returncode != 0:
+                raise AuthRequired(
+                    f"ssh to {self.alias} failed (exit {r.returncode})",
+                    action="check `ssh " + self.alias + "` works interactively, then retry",
+                )
+        if not self.master_alive():
+            raise NotConnected(
+                f"ssh exited successfully for {self.alias}, but no reusable master is listening "
+                f"at ControlPath {control_path}",
+                action=(
+                    "check that the ControlPath directory exists and is writable, and that SSH "
+                    "can create its control socket; verify the host's SSH configuration and "
+                    "ssh_opts before reconnecting"
+                ),
+                alias=self.alias,
+                control_path=control_path,
             )
 
     def ensure_master(self) -> None:

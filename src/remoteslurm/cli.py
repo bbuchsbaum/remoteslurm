@@ -144,7 +144,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
 # ----------------------------------------------------------------------------- commands
 def cmd_connect(args: argparse.Namespace) -> int:
-    cfg = Config.load()
+    cfg = Config.load(Path(args.config) if args.config else None)
     host = cfg.host(args.host_name or args.host)
     if host.ssh == "local":
         print("local host needs no connection")
@@ -200,8 +200,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if fix and not ok:
                 print(f"    -> {fix}")
 
-    cfgp = config_path()
-    cfg = Config.load()
+    cfgp = Path(args.config).expanduser() if args.config else config_path()
+    cfg = Config.load(cfgp)
     check(
         "config file",
         cfgp.exists() or None,
@@ -244,23 +244,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
     if host.ssh != "local":
         check("ssh binary", ssh_available(), shutil.which("ssh") or "not found")
+        t = SSHTransport(
+            alias=host.ssh,
+            mfa=host.mfa,
+            control_path=host.control_path,
+            control_persist=host.control_persist,
+            extra_ssh_opts=list(host.ssh_opts),
+        )
         try:
-            g = subprocess.run(["ssh", "-G", host.ssh], capture_output=True, text=True, timeout=10)
-            opts = dict(line.split(" ", 1) for line in g.stdout.splitlines() if " " in line)
-        except Exception:
-            opts = {}
+            opts = t.effective_config()
+        except RemoteSlurmError as e:
+            check("ssh configuration", False, e.message, e.action or "")
+            emit(args, {"ok": False, "checks": results}, lambda d: None)
+            return EXIT_ERROR
         cm = opts.get("controlmaster", "false")
         cp = opts.get("controlpath", "none")
         cpers = opts.get("controlpersist", "no")
         good_cm = cm in ("auto", "yes", "autoask") and cp != "none"
         check(
             "ssh ControlMaster",
-            good_cm or (host.control_path is not None),
+            good_cm,
             f"ControlMaster={cm} ControlPath={cp} ControlPersist={cpers}",
             "add to ~/.ssh/config:  ControlMaster auto / "
             "ControlPath ~/.ssh/sockets/%r@%h-%p / ControlPersist 12h",
         )
-        t = SSHTransport(alias=host.ssh, mfa=host.mfa, control_path=host.control_path)
         alive = t.master_alive()
         detail = ""
         if alive:
