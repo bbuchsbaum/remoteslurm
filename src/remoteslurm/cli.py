@@ -1113,6 +1113,12 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
         if st.get("reason"):
             meta += f" reason={st.get('reason')}"
         print(f"\n[{meta}]")
+        for log in d.get("log_errors", []):
+            for excerpt in log.get("excerpts", []):
+                print(f"\n--- {log['path']}:{excerpt['line']} (error context) ---")
+                print(excerpt["content"])
+            if log.get("scan_truncated") or log.get("match_limit_reached"):
+                print(f"[error scan limited: {log['path']}]", file=sys.stderr)
         if d.get("stderr_tail"):
             print("\n--- stderr (tail) ---")
             print(d["stderr_tail"].rstrip("\n"))
@@ -1179,21 +1185,31 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         pruned = c.registry.prune(force=True)
         if not args.json:
             print(f"pruned {pruned['pruned']} stale record(s)", file=sys.stderr)
-    sts = c.jobs(include_finished=not args.live, refresh=args.refresh)
-    rows = [s.to_dict() for s in sts]
-    for r in rows:
-        cell = array_tasks_cell(r)
-        if cell:
-            r["tasks"] = cell
-    out: dict[str, Any] = {"jobs": rows, "count": len(rows)}
-    out["registry_available"] = c.registry_error is None
-    if c.registry_error:
-        out["registry_error"] = c.registry_error
+    out = c.jobs_page(
+        include_finished=not args.live,
+        refresh=args.refresh,
+        compact=not getattr(args, "detail", False),
+        name=getattr(args, "name", None),
+        since=getattr(args, "since", None),
+        states=getattr(args, "state", None),
+        job_ids=getattr(args, "id", None),
+        fields=args.fields.split(",") if getattr(args, "fields", None) else None,
+        limit=getattr(args, "limit", 50),
+        offset=getattr(args, "offset", 0),
+        max_bytes=getattr(args, "max_bytes", 32768),
+    )
     if pruned is not None:
         out["pruned"] = pruned
 
     def human(data: dict[str, Any]) -> None:
-        _print_jobs(data["jobs"])
+        rows = [dict(row) for row in data["jobs"]]
+        for row in rows:
+            cell = array_tasks_cell(row)
+            if cell:
+                row["tasks"] = cell
+        _print_jobs(rows)
+        if data["has_more"]:
+            print(f"More jobs: use --offset {data['next_offset']}", file=sys.stderr)
         if data.get("registry_error"):
             print(
                 "WARNING: local job history is unavailable; showing scheduler-visible jobs only: "
@@ -1616,6 +1632,29 @@ def _completed_ok(st: Any) -> bool:
 def cmd_watch(args: argparse.Namespace) -> int:
     from . import slurm, watch
 
+    if getattr(args, "background", False) or getattr(args, "watch_id", None):
+        from .job_monitor import watch_jobs
+
+        if args.all or getattr(args, "usage", False) or args.timeout is not None:
+            raise InvalidArgument(
+                "background watches need explicit IDs; "
+                "--all, --usage, and --timeout are unsupported"
+            )
+        watch_id = getattr(args, "watch_id", None)
+        action = "stop" if getattr(args, "stop", False) else ("status" if watch_id else "start")
+        result = watch_jobs(
+            host=args.host,
+            job_ids=args.job_id or None,
+            watch_id=watch_id,
+            action=action,
+            condition=args.condition,
+            poll=args.poll,
+            notify=args.notify,
+        )
+        emit(args, result, lambda data: print(json.dumps(data, indent=2)))
+        return EXIT_OK
+    if getattr(args, "stop", False):
+        raise InvalidArgument("--stop needs --watch-id")
     c = get_cluster(args)
     host = c.host.name
     if args.all:
@@ -2546,6 +2585,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-n", "--lines", type=int, default=60, help="log tail lines to include")
 
     sp = add("jobs", cmd_jobs, "list my jobs (queue + recently submitted)", aliases=["squeue"])
+    sp.add_argument("--name", help="job name glob")
+    sp.add_argument("--since", help="submitted at/after this ISO timestamp or epoch")
+    sp.add_argument("--state", action="append", help="state filter (repeatable)")
+    sp.add_argument("--id", action="append", help="job ID filter (repeatable)")
+    sp.add_argument("--fields", help="comma-separated status fields")
+    sp.add_argument("--detail", action="store_true", help="include detail within the byte limit")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+    sp.add_argument("--max-bytes", type=int, default=32768)
     sp.add_argument("--live", action="store_true", help="only jobs currently in the queue")
     sp.add_argument("--refresh", action="store_true", help="bypass the squeue cache")
     sp.add_argument(
@@ -2640,6 +2688,16 @@ def build_parser() -> argparse.ArgumentParser:
         "watch job(s) until they finish (exit 0 only if all COMPLETED); foreground",
     )
     sp.add_argument("job_id", nargs="*", help="job id(s) to watch (or use --all)")
+    sp.add_argument(
+        "--background", action="store_true", help="persist an explicit job-ID watch in the daemon"
+    )
+    sp.add_argument("--watch-id", help="read a background watch locally")
+    sp.add_argument("--stop", action="store_true", help="stop --watch-id; never cancels jobs")
+    sp.add_argument(
+        "--condition",
+        default="all_terminal_or_any_failed",
+        choices=["all_terminal", "any_failed", "all_terminal_or_any_failed"],
+    )
     sp.add_argument("--all", action="store_true", help="watch everything currently in the queue")
     sp.add_argument("--notify", action="store_true", help="desktop notification on each finish")
     sp.add_argument("--poll", type=float, default=30.0, help="seconds between polls (default 30)")

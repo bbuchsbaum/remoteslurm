@@ -10,6 +10,9 @@ Use MCP tool names below when connected through remoteslurm MCP. With the CLI, u
 - Use configured `sync` projects for source trees. Dry-run when the change set or destination is
   uncertain. Treat `delete` and `force` as explicit escalations.
 - `~` and variables such as `$WORK` are evaluated in the remote login environment.
+- Use CLI `put LOCAL HOST:REMOTE` / `get HOST:REMOTE LOCAL` for files, directories, and existing
+  archives; directories and large files use rsync. `sync(direction="pull")` downloads a configured
+  project. `pack` schedules compute commands, not archive transfers.
 
 ## Choose an execution mode
 
@@ -38,12 +41,25 @@ use `proc_kill` only when stopping it is in scope.
 
 If a compute call cannot fit its queue wait plus walltime inside the reported limit, use `submit`.
 Use detached runs for appropriate login-node work, not as a substitute for scheduled compute.
+The queue deadline is enforced by Slurm. Timeout/cancellation results include allocation identity
+and cleanup evidence: reconcile `job_ids`/`allocation_name` before resubmitting when cleanup is
+unconfirmed. Submit creates fixed log parents before sbatch and refuses unresolved Slurm directory
+tokens; use `logs/%j.out`, not `%j/log.out`.
 
 ## Observe and diagnose
 
-- Use `jobs(job_id=...)` and its `terminal` field for state. Use bounded `wait`; do not tight-poll.
+- Use `jobs(job_id=...)` for full status. Listings default to compact, byte-bounded pages; filter
+  by `name`, `since` (submission time), `states`, or `job_ids`, and follow `next_offset`.
+- For long cohorts use `watch(job_ids=[...], notify=True)`. It returns a persistent watch_id;
+  the daemon observes all-terminal or any-failed conditions. `watch(action="status", watch_id=...)`
+  reads results/health locally; `action="stop"` stops observation without cancelling jobs.
+  Desktop notification is available; waking the agent requires client integration. Agent exit
+  does not stop the watcher. Daemon restart resumes subscriptions; sleep/MFA loss cause visible
+  observation gaps. An absent/stale observer heartbeat is not active monitoring.
+- Use bounded `wait` for short waits; a timeout does not establish a background watcher.
 - Use `diagnose(job_id)` when work fails or remains pending unexpectedly. Follow its scheduler,
   resource, log, and submission hints before reading logs manually.
+  `log_errors` provides bounded error excerpts above epilogues; inspect `scan_truncated`.
 - Use `job_output` or CLI `output` when raw output is needed. For arrays, inspect the base summary,
   then diagnose a failing task ID when task-level evidence is needed.
 

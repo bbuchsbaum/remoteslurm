@@ -732,6 +732,7 @@ class SlurmOps:
             cwd=cwd,
             name=name or opts.get("job_name"),
             script_dir=self.host.script_dir,
+            protected_paths=self.host.protected_paths,
         )
         try:
             job_id = slurm.parse_sbatch_output(res["stdout"], res["stderr"], res["rc"])
@@ -1356,12 +1357,42 @@ class SlurmOps:
         return None
 
     def jobs(
-        self, *, include_finished: bool = True, refresh: bool = False
+        self,
+        *,
+        include_finished: bool = True,
+        refresh: bool = False,
+        job_ids: list[str] | None = None,
+        name: str | None = None,
+        since: str | None = None,
+        states: list[str] | None = None,
     ) -> list[slurm.JobStatus]:
         """All jobs: my live queue plus registry-known jobs (with their last/terminal state).
 
         A job array shows up as one row keyed by its base id (rolled up across tasks).
         """
+        import fnmatch
+
+        from .job_listing import since_epoch
+
+        cut = since_epoch(since)
+        wanted = set(job_ids) if job_ids is not None else None
+        for jid in wanted or ():
+            slurm.parse_job_id(jid)
+
+        def selected(jid: str, label: str | None, submitted: str | float | None) -> bool:
+            if wanted is not None and jid not in wanted:
+                return False
+            if name is not None and not fnmatch.fnmatchcase(label or "", name):
+                return False
+            if cut is not None:
+                try:
+                    stamp = since_epoch(str(submitted)) if submitted is not None else None
+                except InvalidArgument:
+                    stamp = None
+                if stamp is None or stamp < cut:
+                    return False
+            return True
+
         # Opportunistic housekeeping: drop long-finished records (throttled to once/hour via a
         # timestamp in the registry file). Never let it break a listing.
         self._registry_error = None
@@ -1372,10 +1403,14 @@ class SlurmOps:
         out: dict[str, slurm.JobStatus] = {}
         for r in self.squeue(refresh=refresh):
             jid = r["array_base"] or r["job_id"]  # arrays roll up under the base id
-            if jid not in out:
+            if jid not in out and selected(jid, r.get("name"), r.get("submit_time")):
                 out[jid] = self.job_status(jid, _reset_registry_error=False)
         if include_finished:
-            known = [r.job_id for r in self._registry_all() if r.job_id not in out]
+            known = [
+                r.job_id
+                for r in self._registry_all()
+                if r.job_id not in out and selected(r.job_id, r.name, r.submit_time)
+            ]
             if known:
                 acct = self.sacct(known) if known else {}
                 for jid in known:
@@ -1394,6 +1429,7 @@ class SlurmOps:
                             partition=a.get("partition") or None,
                             start_time=a.get("start_time") or None,
                             end_time=a.get("end_time") or None,
+                            submit_time=a.get("submit_time") or None,
                             max_rss=a.get("max_rss"),
                             workdir=a.get("workdir") or None,
                             stdout_path=rec.stdout_path if rec else None,
@@ -1405,11 +1441,48 @@ class SlurmOps:
                     else:
                         st = self.job_status(jid, _reset_registry_error=False)
                     out[jid] = st
-        rows = sorted(out.values(), key=lambda s: int(s.job_id.split("_")[0]))
+        # Explicit IDs also cover unregistered historical jobs and individual array tasks.
+        for jid in wanted or ():
+            if jid not in out:
+                st = self.job_status(jid, _reset_registry_error=False)
+                if selected(jid, st.name, st.submit_time) and (include_finished or not st.terminal):
+                    out[jid] = st
+        rows = sorted(
+            out.values(),
+            key=lambda s: (int(s.job_id.split("_")[0]), s.job_id),
+        )
+        if states is not None:
+            wanted_states = {slurm.normalize_state(s.upper()) for s in states}
+            rows = [s for s in rows if s.state in wanted_states]
         if self._registry_error:
             for status in rows:
                 self._mark_registry_status(status)
         return rows
+
+    def jobs_page(
+        self,
+        *,
+        compact: bool = True,
+        fields: list[str] | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        max_bytes: int = 32768,
+        **filters: Any,
+    ) -> dict[str, Any]:
+        from .job_listing import page
+
+        # Validate presentation arguments before scheduler work.
+        page([], compact=compact, fields=fields, limit=limit, offset=offset, max_bytes=max_bytes)
+        rows = self.jobs(**filters)
+        return page(
+            rows,
+            compact=compact,
+            fields=fields,
+            limit=limit,
+            offset=offset,
+            max_bytes=max_bytes,
+            registry_error=self.registry_error,
+        )
 
     def wait(
         self,

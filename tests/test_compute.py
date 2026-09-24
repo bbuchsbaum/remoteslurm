@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -91,6 +92,85 @@ def test_compute_queue_never_reports_not_started(make_cluster: Callable[..., Clu
     assert r["started"] is False
     assert "still queued after 3s" in r["reason"]
     assert r.get("node") is None
+
+
+def test_queue_deadline_cancels_scheduler_owned_allocation(make_cluster, sandbox):
+    c = make_cluster(
+        {"FAKESLURM_SRUN_QUEUE": "5", "FAKESLURM_SRUN_PERSIST": "1", "FAKESLURM_FREEZE": "1"}
+    )
+    other = c.submit(script="#!/bin/sh\ntrue\n", name="unrelated")
+    start = time.monotonic()
+    r = c.run("touch should-not-run", compute=True, time="00:01:00", queue_timeout=1)
+    assert time.monotonic() - start < 5
+    assert r["started"] is False
+    assert r["cleanup"]["confirmed"] is True
+    state = json.loads((sandbox / ".fakeslurm.json").read_text())["jobs"]
+    assert state[r["job_ids"][0]]["state"] == "CANCELLED"
+    assert state[other.job_id]["state"] == "PENDING"
+    assert not (sandbox / "should-not-run").exists()
+
+
+def test_total_timeout_cleans_running_scheduler_allocation(make_cluster, sandbox):
+    c = make_cluster({"FAKESLURM_SRUN_PERSIST": "1", "FAKESLURM_FREEZE": "1"})
+    r = c.session.call("srun", {"cmd": "sleep 30", "queue_timeout": 1, "timeout": 1})
+    assert r["started"] and r["timed_out"]
+    assert r["cleanup"]["confirmed"]
+    state = json.loads((sandbox / ".fakeslurm.json").read_text())["jobs"]
+    assert state[r["job_ids"][0]]["state"] == "CANCELLED"
+
+
+def test_cleanup_refuses_unowned_allocation(monkeypatch):
+    from remoteslurm import stub
+
+    calls = []
+
+    def slurm(argv, **kwargs):
+        calls.append(argv)
+        return {"rc": 0, "stdout": "JobName=unrelated UserId=someone(1)", "stderr": ""}
+
+    monkeypatch.setattr(stub, "_slurm", slurm)
+    assert not stub._cleanup_compute("rs-run-owned", {"123"})["confirmed"]
+    assert not any(a[0] == "scancel" for a in calls)
+
+
+def test_cancel_before_allocation_never_launches(monkeypatch):
+    from remoteslurm import stub
+
+    event = threading.Event()
+    event.set()
+    monkeypatch.setattr(stub, "_which", lambda name: "/fake/srun")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("cancelled request launched a process")
+
+    monkeypatch.setattr(stub, "_run", unexpected)
+    result = stub.op_srun({"cmd": "true", "_cancel_event": event})
+    assert result["cancelled"] and result["cleanup"]["confirmed"]
+
+
+def test_pending_cancel_removes_scheduler_allocation(make_cluster, sandbox):
+    c = make_cluster(
+        {"FAKESLURM_SRUN_PERSIST": "1", "FAKESLURM_SRUN_QUEUE": "60", "FAKESLURM_FREEZE": "1"}
+    )
+    rid = Session.new_request_id()
+    future = c.session.submit(
+        "srun", {"cmd": "touch must-not-run", "queue_timeout": 60, "timeout": 120}, request_id=rid
+    )
+    path = sandbox / ".fakeslurm.json"
+    try:
+        deadline = time.monotonic() + 5
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert path.exists()
+        assert c.session.cancel(rid)["cancelled"]
+        result = future.result(timeout=10)
+        assert result["cancelled"] and result["cleanup"]["confirmed"]
+        assert not result["started"]
+        jobs = json.loads(path.read_text())["jobs"]
+        assert all(job["state"] == "CANCELLED" for job in jobs.values())
+        assert not (sandbox / "must-not-run").exists()
+    finally:
+        c.session.cancel(rid)
 
 
 # --------------------------------------------------------------------------- resource resolution

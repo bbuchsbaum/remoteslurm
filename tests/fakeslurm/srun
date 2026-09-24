@@ -13,6 +13,7 @@ Knobs (env):
 """
 
 import os
+import subprocess
 import sys
 import time
 
@@ -53,23 +54,41 @@ def main():
     cmd = command_after_separator(sys.argv[1:])
     if not cmd:
         fs.die("srun: error: no command given")
+    jid = FAKE_JOB_ID
+    immediate = None
+    name = "srun"
+    for arg in sys.argv[1 : sys.argv.index("--")]:
+        if arg.startswith("--immediate="):
+            immediate = int(arg.split("=", 1)[1])
+        if arg.startswith("--job-name="):
+            name = arg.split("=", 1)[1]
+    persistent = os.environ.get("FAKESLURM_SRUN_PERSIST") == "1"
+    if persistent:
+        # Deliberately survives this launcher being killed: models scheduler ownership.
+        submitted = subprocess.check_output(
+            [os.path.join(os.path.dirname(__file__), "sbatch"), "--job-name=" + name, "/dev/null"],
+            text=True,
+        )
+        jid = int(submitted.strip())
     queue = os.environ.get("FAKESLURM_SRUN_QUEUE", "0")
-    if queue == "never":
-        sys.stderr.write("srun: job %d queued and waiting for resources\n" % FAKE_JOB_ID)
-        sys.stderr.flush()
-        sys.exit(1)
     try:
-        wait = float(queue)
+        wait = float("inf") if queue == "never" else float(queue)
     except ValueError:
         wait = 0.0
     if wait > 0:
-        sys.stderr.write("srun: job %d queued and waiting for resources\n" % FAKE_JOB_ID)
+        sys.stderr.write("srun: job %d queued and waiting for resources\n" % jid)
         sys.stderr.flush()
+        if immediate is not None and wait > immediate:
+            time.sleep(immediate)
+            sys.exit(1)
         time.sleep(wait)
-    sys.stderr.write("srun: job %d has been allocated resources\n" % FAKE_JOB_ID)
+    if persistent:
+        with fs.locked_state() as state:
+            state["jobs"][str(jid)]["state"] = "RUNNING"
+    sys.stderr.write("srun: job %d has been allocated resources\n" % jid)
     sys.stderr.flush()
     node = os.environ.get("FAKESLURM_SRUN_NODE", "fakenode1")
-    env = dict(os.environ, SLURMD_NODENAME=node)
+    env = dict(os.environ, SLURMD_NODENAME=node, SLURM_JOB_ID=str(jid))
     os.execvpe(cmd[0], cmd, env)  # replace this process so a cancel reaches the real command
 
 

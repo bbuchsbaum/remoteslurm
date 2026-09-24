@@ -477,8 +477,9 @@ class Cluster(SlurmOps):
         ``compute=True`` (via ``srun``), or in the background with ``detach=True``.
 
         ``cmd`` may be an argv list or a shell string. When ``cancel_on_timeout`` (the default)
-        the remote process group is killed if the client-side call times out (or is
-        interrupted), so nothing lingers.
+        the remote process group is terminated if the client-side call times out (or is
+        interrupted). Compute runs also cancel their owned scheduler allocation; check
+        ``cleanup.confirmed`` and reconcile the reported identity if cleanup is unconfirmed.
 
         With ``stream=True`` (or an ``on_chunk`` callback) the login-node run streams output as
         it arrives: ``on_chunk(stream, text)`` is invoked for each ``stdout``/``stderr`` piece
@@ -771,6 +772,8 @@ class Cluster(SlurmOps):
         cancel_on_timeout: bool,
         max_seconds: int | None = None,
     ) -> dict[str, Any]:
+        if queue_timeout < 1:
+            raise InvalidArgument("queue_timeout must be at least 1 second")
         res = self._resolve_compute_resources(
             template=template,
             partition=partition,
@@ -804,7 +807,7 @@ class Cluster(SlurmOps):
                 "env": env,
                 "stdin": stdin,
                 "queue_timeout": queue_timeout,
-                "timeout": total,
+                "timeout": int(queue_timeout) + int(walltime),
                 "max_output": max_output,
                 "login": login,  # honoured for both cmd and argv forms (module loads)
             }
@@ -820,6 +823,9 @@ class Cluster(SlurmOps):
             node=r.get("node"),
             rc=r.get("rc"),
             partition=res.get("partition"),
+            job_ids=r.get("job_ids"),
+            allocation_name=r.get("allocation_name"),
+            cleanup=r.get("cleanup"),
         )
         return r
 
@@ -857,6 +863,21 @@ class Cluster(SlurmOps):
         if st.stderr_path and st.stderr_path != st.stdout_path:
             stderr_tail = self._tail_or_empty(job_id, tail, "stderr")
 
+        log_errors: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        for stream in ("stderr", "stdout"):
+            try:
+                output = self.job_output(job_id, tail=1, max_bytes=1024, stream=stream)
+                log_path = str(output["path"])
+                if log_path not in seen_paths:
+                    seen_paths.add(log_path)
+                    log_errors.append(self.call("log_errors", path=log_path))
+            except RemoteSlurmError as exc:
+                log_errors.append({"stream": stream, "available": False, "error": exc.code})
+        error_text = "\n".join(
+            excerpt["content"] for log in log_errors for excerpt in log.get("excerpts", [])
+        )
+
         steps: list[dict[str, Any]] = []
         req_mem: int | None = None
         max_rss = st.max_rss
@@ -889,7 +910,7 @@ class Cluster(SlurmOps):
             max_rss=max_rss,
             req_mem=req_mem,
             stdout_tail=stdout_tail,
-            stderr_tail=stderr_tail,
+            stderr_tail=stderr_tail + "\n" + error_text,
             cancelled_by=cancelled_by,
             whoami=self._safe_user(),
             elapsed=st.elapsed,
@@ -915,6 +936,7 @@ class Cluster(SlurmOps):
             "script": script,
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
+            "log_errors": log_errors,
             "steps": steps,
             "sync": sync,
             "verdict": verdict,

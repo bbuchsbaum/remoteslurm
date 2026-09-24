@@ -104,6 +104,34 @@ rslurm watch 12345 --notify
 rslurm output 12345 -n 100
 ```
 
+For a long cohort, register a background watch and keep the returned `watch_id`:
+
+```bash
+rslurm watch 12345 12346 --background --notify --poll 60
+rslurm watch --watch-id WATCH_ID --json
+rslurm watch --watch-id WATCH_ID --stop
+
+rslurm jobs --name 'cohort-*' --state RUNNING --limit 25
+rslurm jobs --since 2026-09-01 --fields job_id,name,state,exit_code
+```
+
+MCP exposes the same subscription as `watch(job_ids=[...], notify=True)`. The default condition
+is all jobs terminal **or any job failed**; `condition="all_terminal"` waits for the whole set.
+Identical starts return the same subscription. The local daemon keeps observing after the tool
+call or agent exits, and resumes saved subscriptions on its next start. Stopping a watch never
+cancels jobs. Desktop notifications are best effort; `delivery` records sent, failed, or unknown.
+Agent wakeup requires client integration. Local status reads preserve the result for every reader
+and expose observer heartbeat, observation age, and authentication/connectivity errors. Laptop
+sleep and daemon downtime create observation gaps; this feature adds no login/reboot supervisor.
+The observer batches up to 1,000 explicit IDs across overlapping watches, with a minimum 30-second
+subscription interval. Existing foreground `watch` and legacy `events` remain available.
+
+Job listings default to 50 compact records and a 32 KiB JSON budget. Arrays show counts and a
+failure sample. Use `next_offset` while `has_more`, or narrow by ID, name glob, submission time,
+and state. Pages reflect live state, so filtering a changing queue is not a frozen snapshot.
+`compact=False` (CLI `--detail`) and `fields` still obey the byte limit; an oversized record
+returns `detail_omitted`. A single `jobs(job_id=...)` / CLI `status` retrieves full detail.
+
 Sample live resource use without dropping to SSH or parsing cluster-specific command output:
 
 ```bash
@@ -172,7 +200,21 @@ rslurm diagnose 12345
 ```
 
 `diagnose` combines job state, exit status, resource use, pending reason, scheduler metadata, and
-bounded log tails into a verdict with concrete next steps.
+bounded log tails into a verdict with concrete next steps. It also scans up to 1 MiB from the
+start of each log and returns up to eight error excerpts with surrounding context and line
+numbers, so an appended scheduler epilogue does not hide early errors. `scan_truncated` and
+`match_limit_reached` report incomplete scans.
+
+Before submission, fixed `--output`/`--error` parent directories are created using the effective
+script-directive, environment, and command-line options. Unresolved Slurm tokens in directory
+components are refused with an actionable error; tokens in filenames such as `logs/%A_%a.out`
+are supported. Compute runs enforce `queue_timeout` separately from execution walltime and
+cancel their owned allocation when abandoned. Their result includes `job_ids`, `allocation_name`,
+and cleanup evidence; unconfirmed cleanup requires reconciliation before resubmitting.
+
+For transfers, `rslurm put LOCAL HOST:REMOTE` and `rslurm get HOST:REMOTE LOCAL` handle files and
+directories, using rsync for large transfers. Use `rslurm sync PROJECT --pull` for a configured
+project's results. `pack` combines compute commands into allocations; it is not an archive tool.
 
 For work that must be recoverable across lost clients and independently validated, describe one
 batch job as a durable task and repeat `ensure` until it is verified:

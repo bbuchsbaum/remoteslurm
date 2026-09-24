@@ -48,6 +48,7 @@ CORE_EXPECTED = {
     "cancel",
     "connection",
     "wait",
+    "watch",
 }
 ALL_EXPECTED = CORE_EXPECTED | {
     "glob",

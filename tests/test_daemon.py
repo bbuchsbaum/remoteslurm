@@ -93,6 +93,34 @@ def test_no_daemon_env_bypasses(daemon_env: Path, monkeypatch: pytest.MonkeyPatc
     assert daemon.connect_via_daemon("fake", Config.load(), autostart=False) is None
 
 
+def test_background_watch_outlives_mcp_request(daemon_env: Path):
+    import asyncio
+
+    from remoteslurm import server
+    from remoteslurm.job_monitor import WatchStore
+
+    c = daemon.connect_via_daemon("fake", Config.load(), autostart=False)
+    job = c.submit(script="#!/bin/sh\ntrue\n")
+    started = asyncio.run(server.watch(job_ids=[job.job_id], host="fake", notify=False, poll=30))
+    watch_id = started["watch_id"]
+    store = WatchStore()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        result = store.read(watch_id, host="fake")
+        if result["status"] == "finished":
+            break
+        with store.connect() as db:
+            db.execute("UPDATE watches SET next_poll=0 WHERE id=?", (watch_id,))
+        time.sleep(0.1)
+    else:
+        pytest.fail(str(result))
+    assert result["result"]["all_terminal"]
+    assert (
+        asyncio.run(server.watch(action="status", watch_id=watch_id, host="fake"))["result"]
+        == result["result"]
+    )
+
+
 def test_stale_daemon_build_is_rejected(daemon_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         daemon,

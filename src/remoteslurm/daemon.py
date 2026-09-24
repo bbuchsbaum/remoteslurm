@@ -170,6 +170,11 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
         self.calls = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        from .job_monitor import JobMonitor, WatchStore
+
+        self.monitor = JobMonitor(
+            WatchStore(), self._cluster, lambda name: Config.load(self.config_path).host(name)
+        )
 
     def touch(self) -> None:
         self.last_activity = time.time()
@@ -256,11 +261,14 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
         return c.session.call_stream(op, args, timeout=req.get("timeout"), request_id=req.get("id"))
 
     def serve(self) -> None:
+        self.monitor.start()
         watchdog = threading.Thread(target=self._idle_watch, daemon=True)
         watchdog.start()
         try:
             self.serve_forever(poll_interval=0.5)
         finally:
+            self._stop.set()
+            self.monitor.close()
             from .cluster import _clusters
 
             for c in list(_clusters.values()):
@@ -281,7 +289,10 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
     def _idle_watch(self) -> None:
         while not self._stop.is_set():
             time.sleep(5)
-            if time.time() - self.last_activity > self.idle_seconds:
+            if (
+                time.time() - self.last_activity > self.idle_seconds
+                and not self.monitor.store.active()
+            ):
                 log.info("idle for %ss; exiting", self.idle_seconds)
                 self._stop.set()
                 self.shutdown()

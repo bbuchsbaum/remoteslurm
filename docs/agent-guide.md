@@ -17,6 +17,9 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   `projects` tool returns the same contracts in the full MCP tool set).
 - To change one file remotely, use `edit` (exact string replace) — do **not** `read` the
   whole file and `write` it back. `diff` checks a remote file against what you expect.
+- CLI `put LOCAL HOST:REMOTE` and `get HOST:REMOTE LOCAL` handle individual files, directories,
+  and tarballs; large files/directories use rsync. `sync(direction="pull")` retrieves a configured
+  project. `pack` schedules compute commands; it does not create or transfer archives.
 
 ## Running jobs
 - Use `ensure` for a single job whose result must survive a lost client and be checked before
@@ -40,17 +43,30 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   (`lingering: true`) and the background process survives only as long as this session.
 - Keep each call under ~25 min: `run` timeouts are capped at 1500 s, and a `compute=True` run
   must fit its `queue_timeout` + `time` in that. For longer work use `submit` or
-  `run(detach=True)`, then loop on `wait` (≤300 s per call).
+  `run(detach=True)` for login-node work. For a Slurm cohort, use
+  `watch(job_ids=[...], notify=True)` and retain its watch_id. This returns immediately; the
+  daemon watches until all jobs finish or any job fails. `watch(action="status", watch_id=...)`
+  reads the saved result and observer health locally; `action="stop"` unsubscribes without
+  cancelling jobs. Notifications are desktop delivery; agent wakeup needs client integration.
+- A compute queue deadline is enforced separately from runtime. On timeout/cancellation,
+  remoteslurm checks cleanup of its owned allocation. If `cleanup.confirmed` is false, reconcile
+  `job_ids`/`allocation_name` before resubmitting. Missing evidence is not successful cleanup.
+- Submit creates fixed stdout/stderr parent directories before sbatch. Put Slurm substitutions
+  such as `%j` in filenames; unresolved substitutions in directory components are refused.
 
 ## After a job finishes (or won't start)
 - Use `diagnose <job_id>` instead of manually reading logs. It returns a plain-English
   `verdict` (out-of-memory, timeout, missing module, cancelled, pending-reason, …), concrete
-  `hints`, the stderr/stdout tails, the sacct steps, and the sync marker. Act on the hints.
-- To check state, call `jobs` (all) or `jobs(job_id=...)` (one). Each record has
+  `hints`, stderr/stdout tails, bounded `log_errors` excerpts with line numbers, the sacct steps,
+  and the sync marker. `scan_truncated` means the error scan did not cover the entire log.
+- To check state, call `jobs` (a compact page) or `jobs(job_id=...)` (one full record). Filter by
+  `name` (glob), `since` (submission time, ISO/epoch), `states`, or `job_ids`; `fields` selects
+  fields. Follow `next_offset` while `has_more`. Listings default to 50 rows and 32 KiB, with
+  array counts and a failure sample. `compact=False` remains byte-bounded. Each record has
   `terminal` (done?), `state`, `exit_code`, `reason`. For one job, `jobs(job_id=..., usage=True)`
   adds normalized live `sstat` or terminal `sacct` telemetry; submit may persist a bounded
-  `file_count` progress observer. Poll `jobs`; avoid tight `wait` loops
-  (MCP `wait` is bounded and returns `terminal:false` on timeout — loop only if needed). When
+  `file_count` progress observer. MCP `wait` is bounded and returns `terminal:false` on timeout;
+  it does not create a background watcher. When
   `registry_available` is false, the result contains scheduler-visible data without local history.
 
 ## Rules of thumb

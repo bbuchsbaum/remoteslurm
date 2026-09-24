@@ -256,3 +256,19 @@ def test_mcp_diagnose_is_core(make_cluster, monkeypatch) -> None:
 
     d = asyncio.run(go())
     assert "time" in d["verdict"].lower()
+
+
+def test_diagnose_finds_error_before_long_epilogue(cluster, sandbox):
+    job = cluster.submit(script="#!/bin/sh\ntrue\n", cwd=str(sandbox), output="failure.log")
+    path = sandbox / "failure.log"
+    # Let the fake scheduler complete before replacing its output with the regression fixture.
+    for _ in range(6):
+        job.status(refresh=True)
+    path.write_text(
+        "Error in fit_model(): singular design\nExecution halted\n"
+        + "scheduler accounting footer\n" * 150
+    )
+    result = cluster.diagnose(job.job_id, tail=20)
+    assert "singular design" not in result["stdout_tail"]
+    excerpts = [ex for log in result["log_errors"] for ex in log.get("excerpts", [])]
+    assert any("singular design" in ex["content"] and ex["line"] == 1 for ex in excerpts)

@@ -30,6 +30,7 @@ import os
 import re
 import select
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -303,9 +304,18 @@ def _kill_group(proc, sig):
 
 
 def _kill_proc(proc, new_session):
-    """SIGKILL ``proc`` (its whole process group when it was started in a new session)."""
+    """Terminate a process, allowing cleanup before killing its owned process group."""
     if new_session:
-        _kill_group(proc, signal.SIGKILL)
+        _kill_group(proc, signal.SIGTERM)
+        try:
+            proc.wait(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
+        # The session leader may have exited after TERM; its PID remains the owned PGID.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
         return
     try:
         proc.kill()
@@ -1375,7 +1385,11 @@ def _srun_flags(args):
     # allocation when it is omitted (for example, 192 CPUs with `-c 2` can become 96 tasks),
     # duplicating the command once per inferred task. Pin the step to one task while `-c`
     # continues to describe the CPUs assigned to that task.
-    flags = ["srun", "--quiet", "--unbuffered", "--ntasks=1"]
+    flags = ["srun", "--unbuffered", "--ntasks=1"]
+    if args.get("queue_timeout") is not None:
+        flags.append("--immediate=%d" % int(args["queue_timeout"]))
+    if args.get("_job_name"):
+        flags.append("--job-name=" + args["_job_name"])
     part = args.get("partition")
     if part:
         flags += ["-p", str(part)]
@@ -1441,15 +1455,90 @@ def _srun_result(stdout, stderr, rc, queue_timeout, elapsed, timed_out=False):
     }
 
 
+def _cleanup_compute(name, job_ids):
+    """Cancel only allocations proven to belong to this invocation, then check the queue.
+
+    The unique name recovers a queued allocation even if srun died before printing its ID.
+    Missing/failed scheduler evidence is not a successful cancellation receipt.
+    """
+    result = {"confirmed": False, "job_ids": sorted(job_ids)}
+    deadline = time.monotonic() + 20
+
+    def query(argv):
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise StubError("timeout", "allocation cleanup deadline exceeded")
+        return _slurm(argv, timeout=min(3, remaining))
+
+    try:
+        found = query(
+            [
+                "squeue",
+                "--noheader",
+                "--user",
+                getpass.getuser(),
+                "--name=" + name,
+                "--format=%i|%j",
+            ],
+        )
+        if found["rc"] != 0:
+            result["reason"] = "allocation lookup failed"
+            return result
+        for line in found["stdout"].splitlines():
+            jid, _, label = line.strip().partition("|")
+            if label == name and re.match(r"^[0-9]+$", jid):
+                job_ids.add(jid)
+        result["job_ids"] = sorted(job_ids)
+        if not job_ids:
+            result["reason"] = "no allocation ID recovered; cancellation cannot be confirmed"
+            return result
+        for jid in sorted(job_ids):
+            active = query(["squeue", "--noheader", "--jobs", jid, "--format=%i"])
+            if active["rc"] == 0 and not active["stdout"].strip():
+                continue
+            control = query(["scontrol", "show", "job", jid, "-o"])
+            if control["rc"] == 0:
+                text = control["stdout"]
+                owner = re.search(r"\bUserId=([^\s(]+)", text)
+                marker = re.search(r"\bJobName=(\S+)", text)
+                if (
+                    not owner
+                    or owner.group(1) != getpass.getuser()
+                    or not marker
+                    or marker.group(1) != name
+                ):
+                    result["reason"] = "allocation ownership could not be verified"
+                    return result
+                cancelled = query(["scancel", jid])
+                if cancelled["rc"] != 0:
+                    result["reason"] = "scancel failed"
+                    return result
+            # A completed job may already have left scontrol. Only a successful queue query
+            # with no rows proves it is no longer pending/running.
+            for attempt in range(5):
+                active = query(["squeue", "--noheader", "--jobs", jid, "--format=%i"])
+                if active["rc"] != 0:
+                    result["reason"] = "post-cancel queue lookup failed"
+                    return result
+                if not active["stdout"].strip():
+                    break
+                if attempt == 4:
+                    result["reason"] = "allocation still visible after cancellation"
+                    return result
+                time.sleep(0.2)
+        result["confirmed"] = True
+    except (StubError, OSError) as exc:
+        result["reason"] = str(exc)
+    return result
+
+
 def op_srun(args):
     """Run a command on a *compute node* via ``srun`` (a SLOW, cancellable op).
 
     Wraps the command so it first echoes an ``RS_NODE=$SLURMD_NODENAME`` sentinel to stderr;
     the client uses that to report the node and to tell a real run from one that only sat in
-    the queue. The total client budget (``timeout``) is queue-wait + walltime + slack, computed
-    client-side; ``queue_timeout`` is used only for the "still queued" message. Because the step
-    runs in its own session, ``cancel``/timeout kills the whole ``srun`` tree, which releases
-    the allocation.
+    the queue. Slurm's --immediate enforces the queue deadline independently of walltime.
+    Abandoned runs also cancel the exact owned allocation and report cleanup evidence.
     """
     if not _which("srun"):
         raise StubError("slurm_error", "srun not found on PATH (is this a Slurm login node?)")
@@ -1457,7 +1546,24 @@ def op_srun(args):
     cmd = args.get("cmd")
     login = bool(args.get("login"))
     flag = "-lc" if login else "-c"
-    sentinel = 'echo "%s$SLURMD_NODENAME" >&2; ' % RS_NODE_SENTINEL
+    name = "rs-run-" + uuid.uuid4().hex
+    args = dict(args, _job_name=name)
+    if args.get("_cancel_event") and args["_cancel_event"].is_set():
+        return {
+            "started": False,
+            "cancelled": True,
+            "reason": "cancelled before allocation request",
+            "allocation_name": name,
+            "job_ids": [],
+            "cleanup": {"confirmed": True, "job_ids": []},
+        }
+    queue_timeout = int(args.get("queue_timeout", DEFAULT_QUEUE_TIMEOUT))
+    if queue_timeout < 1:
+        raise StubError("invalid_arg", "queue_timeout must be at least 1 second")
+    args["queue_timeout"] = queue_timeout
+    sentinel = (
+        'echo "RS_JOB_ID=$SLURM_JOB_ID" >&2; echo "%s$SLURMD_NODENAME" >&2; ' % RS_NODE_SENTINEL
+    )
     if cmd is not None:
         if not isinstance(cmd, str):
             raise StubError("invalid_arg", "cmd must be a string")
@@ -1477,9 +1583,24 @@ def op_srun(args):
     full = _srun_flags(args) + ["--"] + wrapped
     timeout = _clamp(args.get("timeout"), DEFAULT_QUEUE_TIMEOUT + 30, MAX_SRUN_TIMEOUT, lo=1)
     max_output = _clamp(args.get("max_output"), DEFAULT_RUN_OUTPUT, MAX_RUN_OUTPUT)
-    queue_timeout = args.get("queue_timeout") or DEFAULT_QUEUE_TIMEOUT
     cwd = args.get("cwd")
     t0 = time.time()
+    job_ids = set()
+    pending_text = [""]
+
+    def capture(chunk):
+        if chunk.get("stream") == "stderr":
+            pending_text[0] += chunk.get("data", "")
+            lines = pending_text[0].split("\n")
+            pending_text[0] = lines.pop()[-1024:]
+            for line in lines:
+                match = re.search(r"(?:srun: job |RS_JOB_ID=)([0-9]+)", line)
+                if match:
+                    job_ids.add(match.group(1))
+        if args.get("_emit"):
+            args["_emit"](chunk)
+
+    timed_out = False
     try:
         res = _run(
             full,
@@ -1493,22 +1614,37 @@ def op_srun(args):
             # When streaming, output is emitted live; the RS_NODE sentinel line (echoed to
             # stderr before the command runs) is stripped from the final captured stderr but
             # is also emitted as a stderr chunk. No client surface streams srun today.
-            emit=args.get("_emit"),
+            emit=capture,
         )
     except StubError as e:
         if e.code == "timeout":
             # Budget exhausted: turn it into a structured started/queued result rather than a
             # bare timeout error (the process group was already killed by `_run`).
-            return _srun_result(
-                e.details.get("stdout", ""),
-                e.details.get("stderr", ""),
-                None,
-                queue_timeout,
-                round(time.time() - t0, 3),
-                timed_out=True,
-            )
-        raise
-    return _srun_result(res["stdout"], res["stderr"], res["rc"], queue_timeout, res.get("duration"))
+            timed_out = True
+            res = dict(e.details, rc=None, duration=round(time.time() - t0, 3))
+        else:
+            raise
+    result = _srun_result(
+        res["stdout"],
+        res["stderr"],
+        res["rc"],
+        queue_timeout,
+        res.get("duration"),
+        timed_out=timed_out,
+    )
+    result["stderr"] = re.sub(r"(?m)^RS_JOB_ID=[0-9]+\n?", "", result["stderr"])
+    result["allocation_name"] = name
+    result["job_ids"] = sorted(job_ids)
+    if (
+        timed_out
+        or res["rc"] != 0
+        or (args.get("_cancel_event") and args["_cancel_event"].is_set())
+    ):
+        result["cleanup"] = _cleanup_compute(name, job_ids)
+        result["job_ids"] = sorted(job_ids)
+        if not result["cleanup"]["confirmed"]:
+            result["action"] = "verify allocation_name/job_ids with Slurm before resubmitting"
+    return result
 
 
 def op_follow(args):
@@ -2175,6 +2311,95 @@ def _slurm_soft(argv, timeout=60, cwd=None):
     return _run(argv, timeout=timeout, cwd=cwd, max_output=MAX_RUN_OUTPUT)
 
 
+def _prepare_log_dirs(path, extra, cwd, protected):
+    """Resolve Slurm's directive < environment < argv precedence before creating log parents."""
+    options = {}
+
+    def parse(tokens):
+        aliases = {
+            "-o": "output",
+            "-e": "error",
+            "-D": "chdir",
+            "--output": "output",
+            "--error": "error",
+            "--chdir": "chdir",
+        }
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            key, eq, value = token.partition("=")
+            if key in aliases:
+                if not eq:
+                    i += 1
+                    if i >= len(tokens):
+                        raise StubError("invalid_arg", "missing value for " + key)
+                    value = tokens[i]
+                options[aliases[key]] = value
+            elif token[:2] in ("-o", "-e", "-D") and len(token) > 2:
+                options[aliases[token[:2]]] = token[2:]
+            i += 1
+
+    consumed = 0
+    with io.open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            consumed += len(line)
+            if consumed > 65536:
+                raise StubError("invalid_arg", "batch header exceeds log preflight limit")
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                break
+            if stripped.startswith("#SBATCH ") or stripped.startswith("#SBATCH\t"):
+                try:
+                    parse(shlex.split(stripped[7:], comments=True))
+                except ValueError as exc:
+                    raise StubError("invalid_arg", "cannot parse batch directive: " + str(exc))
+    for key in ("output", "error", "chdir"):
+        value = os.environ.get("SBATCH_" + key.upper())
+        if value is not None:
+            options[key] = value
+    parse(extra)
+    workdir = os.path.abspath(os.path.join(cwd, options.get("chdir", ".")))
+    if not os.path.isdir(workdir):
+        raise StubError("not_found", "batch working directory does not exist", path=workdir)
+    parents = set()
+    need_writable_parent = set()
+    for key in ("output", "error"):
+        value = options.get(key)
+        if not value:
+            continue
+        parent = os.path.dirname(os.path.abspath(os.path.join(workdir, value)))
+        destination = os.path.abspath(os.path.join(workdir, value.replace("%%", "%")))
+        # Job-ID/node substitutions in directory components cannot be resolved before sbatch.
+        if re.search(r"%(?!%)", parent.replace("%%", "")):
+            raise StubError(
+                "invalid_arg",
+                "unresolved Slurm token in log directory",
+                path=parent,
+                action="use a fixed log directory and put %j/%A/%a in the filename",
+            )
+        parent = parent.replace("%%", "%")
+        target = os.path.realpath(parent)
+        for pattern in protected:
+            pat = os.path.expanduser(os.path.expandvars(pattern))
+            if fnmatch.fnmatch(target + "/", pat) or fnmatch.fnmatch(target, pat):
+                raise StubError("permission", "log directory is protected", path=parent)
+        parents.add(parent)
+        if not os.path.exists(destination):
+            need_writable_parent.add(parent)
+        elif not os.access(destination, os.W_OK):
+            raise StubError(
+                "permission", "existing log destination is not writable", path=destination
+            )
+    for parent in sorted(parents):
+        try:
+            os.makedirs(parent, exist_ok=True)
+            if parent in need_writable_parent and not os.access(parent, os.W_OK | os.X_OK):
+                raise StubError("permission", "log directory is not writable", path=parent)
+        except OSError as exc:
+            raise _os_error(exc, parent)
+    return sorted(parents)
+
+
 def op_sbatch(args):
     """Submit a job. Either `script` (content) or `path` (existing file) must be given.
 
@@ -2211,6 +2436,9 @@ def op_sbatch(args):
         path = _path(path, must_exist=True)
     else:
         raise StubError("invalid_arg", "either script or path is required")
+    log_dirs = _prepare_log_dirs(
+        path, extra, cwd or os.path.expanduser("~"), args.get("protected_paths") or []
+    )
     argv = ["sbatch", "--parsable"] + extra + [path]
     res = _slurm(
         argv,
@@ -2221,7 +2449,45 @@ def op_sbatch(args):
     )
     res["script_path"] = path
     res["argv"] = argv
+    res["log_directories"] = log_dirs
     return res
+
+
+def op_log_errors(args):
+    """Bounded head scan returning error lines with context, independent of a log epilogue."""
+    path = _path(args.get("path"), must_exist=True)
+    budget = _clamp(args.get("max_bytes"), 1024 * 1024, 1024 * 1024, lo=1024)
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        data = f.read(budget)
+    lines = _decode(data).splitlines()
+    pattern = re.compile(
+        r"\berror\b|execution halted|traceback|exception|fatal|segmentation fault|out of memory",
+        re.I,
+    )
+    excerpts = []
+    end = -1
+    for i, line in enumerate(lines):
+        if i <= end or not pattern.search(line):
+            continue
+        start, end = max(0, i - 2), min(len(lines) - 1, i + 3)
+        excerpts.append(
+            {
+                "line": i + 1,
+                "start_line": start + 1,
+                "content": "\n".join(lines[start : end + 1])[:1024],
+            }
+        )
+        if len(excerpts) >= 8:
+            break
+    return {
+        "path": path,
+        "excerpts": excerpts,
+        "scanned_bytes": len(data),
+        "size": size,
+        "scan_truncated": size > len(data),
+        "match_limit_reached": len(excerpts) == 8,
+    }
 
 
 TASK_SCHEMA = 1
@@ -4048,6 +4314,7 @@ OPS = {
     "proc_kill": op_proc_kill,
     "waitfor": op_waitfor,
     "sbatch": op_sbatch,
+    "log_errors": op_log_errors,
     "task_fingerprint": op_task_fingerprint,
     "task_ensure": op_task_ensure,
     "task_update": op_task_update,
@@ -4096,6 +4363,7 @@ class Server(object):
         # queued behind a busy pool (or not yet spawned) is not lost; and those so cancelled.
         self.pending = set()
         self.precancelled = set()
+        self.compute = set()
         self.alive = True
 
     def send(self, payload):
@@ -4111,7 +4379,8 @@ class Server(object):
     def _register(self, rid, proc):
         with self.reg_lock:
             self.running[rid] = proc
-            early = rid in self.precancelled
+            event = self.events.get(rid)
+            early = rid in self.precancelled or (event is not None and event.is_set())
             if early:
                 self.precancelled.discard(rid)
                 self.cancelled.add(rid)
@@ -4157,6 +4426,8 @@ class Server(object):
                 if proc.poll() is not None:
                     return {"cancelled": False, "id": target, "reason": "not running"}
                 self.cancelled.add(target)
+                if event is not None:
+                    event.set()
                 # fall through to kill the process group outside the lock
             elif event is not None:
                 # A non-subprocess cancellable (e.g. `follow`): flag it and set its event so the
@@ -4193,7 +4464,7 @@ class Server(object):
             if fn is None:
                 raise StubError("invalid_arg", "unknown op: %r" % (op,))
             registers_proc = op in SLOW_OPS
-            registers_event = op in LONG_OPS
+            registers_event = op in LONG_OPS or op == "srun"
             # `run`/`srun` stream only when asked; `follow` always streams; `waitfor` never does.
             streaming = (op in STREAM_OPS and bool(args.get("stream"))) or (op in ALWAYS_STREAM_OPS)
             cancellable = registers_proc or registers_event
@@ -4246,6 +4517,7 @@ class Server(object):
                 with self.reg_lock:
                     self.pending.discard(rid)
                     self.precancelled.discard(rid)
+                    self.compute.discard(rid)
 
     def serve(self, inp):
         for raw in inp:
@@ -4275,8 +4547,15 @@ class Server(object):
                 # dispatched to the fast pool first) finds it even while it is still queued.
                 with self.reg_lock:
                     self.pending.add(req.get("id"))
+                    if op == "srun":
+                        self.compute.add(req.get("id"))
             pool = self.long if op in LONG_OPS else (self.slow if op in SLOW_OPS else self.fast)
             pool.submit(self.handle, req)
+        # An interactive allocation belongs to this connection; EOF must not leave it queued.
+        with self.reg_lock:
+            abandoned = list(self.compute)
+        for rid in abandoned:
+            self._cancel({"id": rid})
         self.fast.shutdown(wait=True)
         self.slow.shutdown(wait=True)
         self.long.shutdown(wait=True)

@@ -111,6 +111,48 @@ def test_submit_respects_configured_script_directory(make_cluster, sandbox, _iso
     assert Path(rec["script_path"]).parent == custom
 
 
+def test_submit_prepares_log_parents_before_scheduler_acceptance(cluster, sandbox):
+    job = cluster.submit(
+        script="#!/bin/bash\n#SBATCH -o ignored/log.out\necho hi\n",
+        cwd=str(sandbox),
+        output="logs/nested/%j.out",
+        error="errors/%j.err",
+    )
+    assert (sandbox / "logs/nested").is_dir()
+    assert (sandbox / "errors").is_dir()
+    assert not (sandbox / "ignored").exists()
+    assert job.job_id
+
+
+def test_submit_prepares_directive_log_path_with_spaces(cluster, sandbox):
+    cluster.submit(
+        script='#!/bin/bash\n#SBATCH --output="logs with spaces/%j.out"\ntrue\n', cwd=str(sandbox)
+    )
+    assert (sandbox / "logs with spaces").is_dir()
+
+
+def test_submit_rejects_dynamic_directory_before_scheduler(cluster, sandbox):
+    from remoteslurm.errors import InvalidArgument
+
+    with pytest.raises(InvalidArgument):
+        cluster.submit(script="#!/bin/sh\ntrue\n", output=str(sandbox / "%j/log.out"))
+    assert not (sandbox / ".fakeslurm.json").exists()
+    assert not (sandbox / "%j").exists()
+
+
+def test_submit_log_parent_is_file_fails_before_scheduler(cluster, sandbox):
+    (sandbox / "blocked").write_text("file")
+    from remoteslurm.errors import RemoteSlurmError
+
+    with pytest.raises(RemoteSlurmError):
+        cluster.submit(script="#!/bin/sh\ntrue\n", output=str(sandbox / "blocked/out.log"))
+    assert not (sandbox / ".fakeslurm.json").exists()
+
+
+def test_submit_supports_dev_null_output(cluster):
+    assert cluster.submit(script="#!/bin/sh\ntrue\n", output="/dev/null").job_id
+
+
 def test_submit_argument_validation(cluster):
     with pytest.raises(InvalidArgument):
         cluster.submit()

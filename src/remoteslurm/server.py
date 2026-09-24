@@ -74,6 +74,7 @@ CORE_TOOLS = {
     "cancel",
     "connection",
     "wait",
+    "watch",
 }
 
 
@@ -408,7 +409,9 @@ async def run(
     ``template`` then ``partition``/``time``/``cpus``/``mem``/``gpus`` (account from the host
     default). ``queue_timeout`` bounds the wait for an allocation; the result is
     ``{started: true, rc, stdout, stderr, node, elapsed}`` when a node was granted, else
-    ``{started: false, reason}``. ``cmd`` may be a shell string or an argv list. The argv form is
+    ``{started: false, reason}``. Results include allocation_name/job_ids; abandoned runs include
+    cleanup.confirmed. When false, reconcile those allocations before resubmitting. ``cmd`` may
+    be a shell string or an argv list. The argv form is
     required when the host uses ``allow_run = "safe"``. Returns ``error: permission`` when the
     configured run policy forbids the command.
 
@@ -514,7 +517,9 @@ async def submit(
     ``template`` names a config template (see ``info``'s ``templates``): its options merge in
     (host defaults < template < your ``options``) and, for ``script=``, its preamble wraps the
     body. A template with a preamble refuses a ``path=`` submission unless ``force_preamble``.
-    Returns job_id, script_path, stdout_path, stderr_path, workdir and initial state; poll
+    Fixed output/error parent directories are created before sbatch; unresolved Slurm directory
+    tokens are refused (put %j/%A/%a in the filename). Returns job_id, script_path,
+    stdout_path, stderr_path, workdir and initial state; poll
     with ``jobs(job_id=...)`` and explain finished/stuck jobs with ``diagnose``.
     """
 
@@ -694,15 +699,28 @@ async def jobs(
     host: str | None = None,
     usage: bool = False,
     progress: dict[str, Any] | None = None,
+    compact: bool = True,
+    job_ids: list[str] | None = None,
+    name: str | None = None,
+    since: str | None = None,
+    states: list[str] | None = None,
+    fields: list[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    max_bytes: int = 32768,
 ) -> dict[str, Any]:
     """Job status. With ``job_id``: one merged record (squeue/sacct/scontrol/local registry).
 
-    Without it: ``{"jobs": [...], "count": n}`` covering your live queue plus jobs submitted
+    Without it: a bounded compact page covering your live queue plus jobs submitted
     through remoteslurm (finished ones too unless ``include_finished=False``). Each record has
     ``state``, ``terminal`` (done?), ``exit_code``, ``reason``, ``elapsed``, paths.
     With one ``job_id``, ``usage=True`` samples normalized ``sstat`` telemetry while running and
     ``sacct`` after completion. A declared ``progress`` file-count table is sampled at the same
     time; submit can persist that table so later usage queries recover it automatically.
+    Listing filters: ``job_ids``, ``name`` (shell glob), ``since`` (submission time, ISO/epoch),
+    ``states``. Use ``next_offset`` while ``has_more``; these are live pages, not a frozen
+    snapshot. ``fields`` selects record fields; ``compact=False`` requests detail subject to
+    the total ``max_bytes`` budget. An oversized record returns a summary with detail_omitted.
     squeue is cached ~10 s; ``refresh=True`` bypasses the cache. A job array is one record
     keyed by its base id, with an ``extra`` block (``tasks`` counts, ``failed_tasks``,
     ``task_states``); pass a task id (``123_4``) for a single task.
@@ -715,15 +733,19 @@ async def jobs(
                     job_id, refresh=refresh, usage=True, progress=progress
                 ).to_dict()
             return c.job_status(job_id, refresh=refresh).to_dict()
-        lst = c.jobs(include_finished=include_finished, refresh=refresh)
-        result: dict[str, Any] = {
-            "jobs": [s.to_dict() for s in lst],
-            "count": len(lst),
-            "registry_available": c.registry_error is None,
-        }
-        if c.registry_error:
-            result["registry_error"] = c.registry_error
-        return result
+        return c.jobs_page(
+            include_finished=include_finished,
+            refresh=refresh,
+            compact=compact,
+            job_ids=job_ids,
+            name=name,
+            since=since,
+            states=states,
+            fields=fields,
+            limit=limit,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
 
     return await _guard(host, f)
 
@@ -1077,7 +1099,9 @@ async def diagnose(job_id: str, tail: int = 60, host: str | None = None) -> dict
     Returns a plain-English ``verdict`` (out-of-memory, timeout, missing module, permission,
     cancelled-by-whom, or the pending reason), actionable ``hints``, the ``stderr_tail`` /
     ``stdout_tail``, the sacct ``steps``, the merged ``status``, the submit ``script`` and any
-    project ``sync`` marker. Prefer this over reading logs by hand. ``tail`` sets how many log
+    project ``sync`` marker. ``log_errors`` scans the first 1 MiB per log for up to eight error
+    excerpts with context/line numbers; scan_truncated/match_limit_reached flag incomplete scans.
+    Prefer this over reading logs by hand. ``tail`` sets how many log
     lines to include; the whole payload is capped (~64 KB, ``truncated`` flags a cut).
     """
 
@@ -1391,6 +1415,44 @@ async def events(since: str | None = None, host: str | None = None) -> dict[str,
         return {"error": "internal", "message": f"{type(e).__name__}: {e}"}
 
 
+async def watch(
+    job_ids: list[str] | None = None,
+    watch_id: str | None = None,
+    action: str = "start",
+    condition: str = "all_terminal_or_any_failed",
+    poll: float = 60,
+    notify: bool = True,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Persist a job-set completion subscription and return immediately with watch_id.
+
+    The local daemon observes after this call/agent exits and restores subscriptions on its
+    next start. Conditions: all_terminal, any_failed, all_terminal_or_any_failed (default).
+    poll is 30..3600 seconds. notify requests a desktop notification when the condition fires;
+    waking an agent requires client integration. action=status reads the saved result/health
+    locally; action=stop unsubscribes without cancelling any job. Both need watch_id.
+    Duplicate starts with the same specification return the same watch. Authentication loss
+    is reported as an observation error; unknown/missing jobs never count as completion.
+    """
+    from .job_monitor import watch_jobs
+
+    try:
+        return await asyncio.to_thread(
+            watch_jobs,
+            host=host,
+            job_ids=job_ids,
+            watch_id=watch_id,
+            action=action,
+            condition=condition,
+            poll=poll,
+            notify=notify,
+        )
+    except RemoteSlurmError as exc:
+        return exc.to_dict()
+    except Exception as exc:
+        return {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+
+
 # -- resources ---------------------------------------------------------------------------------
 def guide_resource() -> str:
     """The agent guide (also `rslurm agent-guide`)."""
@@ -1442,6 +1504,7 @@ ALL_TOOLS: dict[str, Any] = {
     "sync": sync,
     "projects": projects,
     "wait": wait,
+    "watch": watch,
     "queue_info": queue_info,
     "quota": quota,
     "events": events,
