@@ -1,0 +1,39 @@
+{
+  "host_alias": "nibi",
+  "local_stub_sha": "270102c7019988b7",
+  "checks": [
+    {
+      "direction": "put",
+      "path": "/scratch/brad/remoteslurm-transfer-check-8246d8ae8ba14af8a420b5519b3b9e1b/payload.bin",
+      "sha256": "c9ea60764499c6031e1d8698b3f36bcdab959a202531ac802f58f02f0d2b4e71",
+      "size": 48,
+      "source_trailing_slash": true
+    },
+    {
+      "direction": "get",
+      "path": "/scratch/brad/remoteslurm-transfer-check-8246d8ae8ba14af8a420b5519b3b9e1b/payload.bin",
+      "sha256": "c9ea60764499c6031e1d8698b3f36bcdab959a202531ac802f58f02f0d2b4e71",
+      "size": 48
+    }
+  ],
+  "endpoint": "l3.nibi.sharcnet",
+  "user": "brad",
+  "remote_stub_sha": "270102c7019988b7",
+  "control_path": "/Users/bbuchsbaum/.ssh/remoteslurm-%C",
+  "remote_root": "/scratch/brad/remoteslurm-transfer-check-8246d8ae8ba14af8a420b5519b3b9e1b",
+  "authenticated_master_after": true,
+  "source_sha256": {
+    "src/remoteslurm/cli.py": "954dbbf52e24c0619c2894a84cab0267e8e15ef28b8b41b585d432386adf3c77",
+    "src/remoteslurm/sync.py": "5c6689ef97b5e2c6ed96d0043cb6c8217b84b61f45ee7a25fbba15845503ceff",
+    "src/remoteslurm/transport.py": "e4d496fdfdddfc350daee3ea698d62ad8f72015d39422c068cd11a9e5411b11c"
+  },
+  "fixture_cleanup": "removed owned payload and empty fixture directories",
+  "recorded_at": "2026-09-26T16:43:34.955813+00:00",
+  "method": "cmd_put and cmd_get with a connected Nibi Cluster, real local rsync, existing authenticated SSH master, source with spaces and trailing slash; remote stub read and downloaded bytes hashed locally",
+  "limitations": [
+    "Existing Nibi transport only; no interactive MFA or Trillium transfer attempted.",
+    "Remote shell emitted module warnings, including missing singularity/3.6; both transfers returned rc 0.",
+    "Initial home-cache fixture was refused by protected-path checks; scratch fixture used without force. Owned fixture files and directories were removed."
+  ],
+  "raw_log": "/tmp/remoteslurm-live-transfer-scratch.log"
+}

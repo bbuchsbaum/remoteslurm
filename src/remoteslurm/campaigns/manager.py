@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .. import slurm
+from ..activity.attention import project_attention
 from ..attempts import (
     ensure_campaign_attempt,
     submission_control,
@@ -416,10 +417,9 @@ class CampaignManager:
         run_id = self._resolve_run(name, run_id)
         if refresh:
             snapshot = self._refresh(name, run_id)
-        elif include_units or stage is not None:
-            snapshot = self.store.read_complete_snapshot(name, run_id)
         else:
-            snapshot = self.store.read_snapshot(name, run_id)
+            # Attention needs all evidence axes, including their current age.
+            snapshot = self.store.read_complete_snapshot(name, run_id)
         if stage is not None:
             snapshot["units"] = [unit for unit in snapshot["units"] if unit["stage"] == stage]
         return self._page(snapshot, include_units=include_units, offset=offset, limit=limit)
@@ -2196,68 +2196,15 @@ class CampaignManager:
 
     @staticmethod
     def _next_action(snapshot: Mapping[str, Any]) -> dict[str, Any]:
-        units = snapshot["units"]
-        priorities = [
-            (
-                "unresolved_execution",
-                [unit for unit in units if unit["execution"]["state"] == "UNKNOWN"],
-                "Refresh or resolve adopted jobs before changing execution intent.",
-            ),
-            (
-                "validation_failed",
-                [
-                    unit
-                    for unit in units
-                    if unit["validation"]["state"] in {"FAILED", "STALE", "ERROR"}
-                ],
-                "Inspect validation evidence for the affected units.",
-            ),
-            (
-                "execution_failed",
-                [unit for unit in units if unit["execution"]["state"] == "FAILED"],
-                "Inspect scheduler evidence and logs before authorizing retries.",
-            ),
-            (
-                "ready",
-                [
-                    unit
-                    for unit in units
-                    if unit["execution"]["state"] == "UNBOUND"
-                    and unit["dependency"]["state"] in {"SATISFIED", "NOT_APPLICABLE"}
-                ],
-                "Units are ready but have no execution attempt.",
-            ),
-            (
-                "active",
-                [unit for unit in units if unit["execution"]["state"] in {"PENDING", "RUNNING"}],
-                "Active jobs need no intervention.",
-            ),
-            (
-                "awaiting_validation",
-                [
-                    unit
-                    for unit in units
-                    if unit["artifacts"]["state"] == "PRESENT"
-                    and unit["validation"]["state"] == "NOT_RUN"
-                ],
-                "Present outputs have not been validated.",
-            ),
-        ]
-        for kind, selected, reason in priorities:
-            if selected:
-                return {
-                    "kind": kind,
-                    "count": len(selected),
-                    "examples": [unit["unit_id"] for unit in selected[:5]],
-                    "reason": reason,
-                }
-        return {"kind": "complete", "count": len(units), "reason": "No unresolved work remains."}
+        return project_attention(snapshot)
 
     @staticmethod
     def _page(
         snapshot: dict[str, Any], *, include_units: bool, offset: int = 0, limit: int = 200
     ) -> dict[str, Any]:
         result = dict(snapshot)
+        # Cached observations age even when no refresh/observer is running.
+        result["next_action"] = CampaignManager._next_action(snapshot)
         result.pop("stage_specs", None)
         result.pop("pilots", None)
         units = result.pop("units", [])

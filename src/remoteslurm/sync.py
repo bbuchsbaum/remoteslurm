@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from .config import HostConfig, ProjectConfig
 from .errors import ConfigError, InvalidArgument, RemoteSlurmError, RemoteTimeout, TooLarge
+from .transport import SSHTransport
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .cluster import Cluster
@@ -126,20 +127,11 @@ def _require_rsync() -> str:
 
 # ----------------------------------------------------------------------- remote expansion
 def transport_ssh_opts(cluster: Cluster) -> list[str] | None:
-    """Reconstruct rsync's ``-e`` ssh args from the cluster's transport so rsync reuses the
+    """Use rsync's ``-e`` ssh args from the cluster's transport so rsync reuses the
     same ControlMaster (and any ProxyJump/extra opts) remoteslurm itself uses, instead of
     depending solely on the user's ~/.ssh/config."""
     t = cluster.transport
-    alias = getattr(t, "alias", None)
-    if alias is None:
-        return None
-    opts = list(DEFAULT_SSH_ARGS)
-    control_path = getattr(t, "control_path", None)
-    if control_path:
-        opts += ["-o", f"ControlPath={control_path}"]
-    for extra in getattr(t, "extra_ssh_opts", None) or []:
-        opts.append(extra)
-    return opts
+    return t._ssh_base() if isinstance(t, SSHTransport) else None
 
 
 def expand_remote(cluster: Cluster, path: str) -> str:

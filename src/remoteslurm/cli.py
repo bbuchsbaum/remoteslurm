@@ -562,7 +562,11 @@ def cmd_put(args: argparse.Namespace) -> int:
     c = get_cluster(args, host)
     if args.rsync or src.is_dir() or src.stat().st_size > 4 * 1024 * 1024:
         c._check_protected(dest, force=args.force, action="put into")
-        return _rsync(c, str(src), dest, to_remote=True, args=args)
+        # Path normalizes away the slash that tells rsync to copy contents.
+        source = str(src)
+        if args.src.endswith("/") and not source.endswith("/"):
+            source += "/"
+        return _rsync(c, source, dest, to_remote=True, args=args)
     if dest.endswith("/"):
         dest = dest + src.name
     r = c.write(dest, src.read_bytes(), force=args.force)
@@ -664,7 +668,7 @@ def _rsync(c: Cluster, src: str, dest: str, *, to_remote: bool, args: argparse.N
         "-s",
         "--info=progress2",
         "-e",
-        sync_mod.DEFAULT_SSH,
+        shlex.join(c.transport._ssh_base()),
     ]
     rs += [src, f"{alias}:{remote}"] if to_remote else [f"{alias}:{remote}", dest]
     if not args.json:
