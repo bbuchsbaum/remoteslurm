@@ -1246,6 +1246,11 @@ Gates:
 
 ### WP8 — Campaign watch, top, and evidence-based advice
 
+The companion [shared activity journal proposal](activity-journal.md) develops the visibility
+layer across ordinary jobs, durable tasks, and campaigns. It proposes splitting this package into
+WP8a (shared activity and persistent observation) and WP8b (resource interpretation), with explicit
+provenance, recovery, and multi-consumer acceptance gates. That split remains proposed.
+
 Extend WP3's current-sample summary with foreground monitoring, telemetry retention/rollups,
 interval calculations, and pure advice rules.
 
