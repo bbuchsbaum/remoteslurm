@@ -2862,9 +2862,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--where", action="append", default=[], metavar="FIELD=VALUE")
     sp.add_argument("--state", action="append", default=[], metavar="AXIS=STATE")
     sp.add_argument("--reason", required=True)
-    sp.add_argument("--accept-duplicate-risk", action="store_true")
+    sp.add_argument(
+        "--accept-duplicate-risk",
+        action="store_true",
+        help="also retry UNKNOWN work and cancellations not yet confirmed by squeue/sacct",
+    )
     sp.add_argument("--dry-run", action="store_true", help="preview selection without authorizing")
-    sp.add_argument("--apply", action="store_true")
+    sp.add_argument(
+        "--apply", action="store_true", help="also submit one apply pass after authorizing"
+    )
     sp.add_argument("--max-groups", type=int, default=100)
     sp.add_argument("--require-preflight", nargs="?", const="", metavar="PILOT")
 

@@ -72,11 +72,18 @@ Report them separately too:
 ## Retries and cancellation
 
 - Retries need an open run, a selector (`stage`, `unit_id`, `where`, or `states`), and a
-  `reason`. Only units whose execution is `FAILED` or `UNKNOWN`, or whose validation is `FAILED`,
-  `STALE`, or `ERROR`, are retryable; cancelled units are not, so rerunning them needs a new run. Preview
+  `reason`. Units whose execution is `FAILED`, `CANCELLED`, or `UNKNOWN`, or whose validation is
+  `FAILED`, `STALE`, or `ERROR`, are retryable. Preview
   with `dry_run=true`. Without `apply`, a retry records authorization only; with `apply=true` it
-  also runs one apply pass. Retrying `UNKNOWN` work also needs `accept_duplicate_risk=true`; set
-  it only on the user's explicit instruction. Earlier attempts and receipts stay in history.
+  also runs one apply pass. Retrying `UNKNOWN` work also needs `accept_duplicate_risk=true`, and
+  so does a cancellation recorded only by remoteslurm's own `scancel` request. Refresh first: once
+  `squeue` or `sacct` confirms the cancellation, the retry needs no duplicate-risk acceptance.
+  Packed units are judged by per-unit markers, so a cancelled pack allocation leaves unfinished
+  units `UNKNOWN`. Set `accept_duplicate_risk` only on the user's explicit instruction.
+- A refresh voids a pending retry authorization when the original job is live again or its
+  output valid; `apply` lists these in `voided_retry_units` and submits nothing for them. Report
+  them, and authorize a new retry only if that attempt later fails.
+- Earlier attempts and receipts stay in history.
 - `campaign_cancel` needs a selector: `stage` and/or `unit_id`, or `all_active` alone. It
   previews the affected jobs by default, including every packed sibling that
   shares an allocation. Cancel with `apply=true` only when the user asked for cancellation of

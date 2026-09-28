@@ -1022,7 +1022,14 @@ async def campaign_retry(
     require_preflight: str | None = None,
     host: str | None = None,
 ) -> dict[str, Any]:
-    """Authorize selected retries; UNKNOWN work requires duplicate-risk acceptance."""
+    """Authorize retries of failed, cancelled, unresolved, or invalid units.
+
+    ``accept_duplicate_risk`` is required for UNKNOWN work and for cancellations recorded only by
+    remoteslurm's own scancel request; refresh first so squeue/sacct can confirm them. Without
+    ``apply`` the authorization is only recorded. A refresh that shows the original attempt live
+    again or its output valid voids the authorization (``voided_retry_units``); authorize anew if
+    that attempt later fails.
+    """
 
     return await _guard(
         host,
@@ -1053,9 +1060,13 @@ async def campaign_cancel(
     confirm: bool = False,
     host: str | None = None,
 ) -> dict[str, Any]:
-    """Preview cancellation by default; apply only to recorded selected allocations."""
+    """Preview cancellation by default; apply only to recorded selected allocations.
 
-    return await _guard(
+    When the host requires confirmation for ``cancel``, an ``apply=True`` call cancels nothing
+    and replies ``{needs_confirmation: true, what}`` — re-call with ``confirm=True``.
+    """
+
+    return await _guard_confirmable(
         host,
         lambda c: c.campaigns.cancel(
             name,

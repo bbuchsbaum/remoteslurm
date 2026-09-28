@@ -160,6 +160,17 @@ def test_campaign_verify_and_receipt_tools(mcp_cluster: Cluster, sandbox) -> Non
     assert cancellation["applied"] is False
     assert len(cancellation["job_ids"]) == 1
 
+    mcp_cluster.host.confirm = ["cancel"]
+    try:
+        unconfirmed = call(
+            "campaign_cancel", name="mcpreceipt", run_id="mcp-run", all_active=True, apply=True
+        )
+        assert unconfirmed["needs_confirmation"] is True
+        snapshot = mcp_cluster.campaigns.store.read_complete_snapshot("mcpreceipt", "mcp-run")
+        assert snapshot["units"][0]["execution"]["state"] != "CANCELLED"
+    finally:
+        mcp_cluster.host.confirm = []
+
 
 def test_guide_resource_present() -> None:
     async def go() -> str:

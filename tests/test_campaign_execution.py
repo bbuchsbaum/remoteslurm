@@ -518,6 +518,163 @@ def test_cancel_remains_terminal_while_scheduler_accounting_lags(
     assert execution["current_attempt"]["scheduler_state"] == "CANCELLED"
 
 
+def test_scheduler_confirmed_cancellation_can_be_retried(make_cluster, sandbox: Path) -> None:
+    cluster = make_cluster({"FAKESLURM_FREEZE": "1"})
+    cluster.campaigns.start(definition(sandbox, count=1), run_id="cancel-retry")
+    cluster.campaigns.apply("managed", run_id="cancel-retry")
+    cluster.campaigns.cancel(
+        "managed", run_id="cancel-retry", all_active=True, apply=True, confirm=True
+    )
+
+    # Before a refresh, the only evidence is our own scancel request.
+    preview = cluster.campaigns.retry(
+        "managed", run_id="cancel-retry", stage="analysis", reason="resume", dry_run=True
+    )
+    assert preview["selected"] == 1
+    assert preview["duplicate_risk_units"] == preview["unit_ids"]
+
+    status = cluster.campaigns.status(
+        "managed", run_id="cancel-retry", refresh=True, include_units=True
+    )
+    execution = status["units"][0]["execution"]
+    assert execution["state"] == "CANCELLED"
+    assert execution["scheduler_source"] in {"squeue", "sacct", "scontrol"}
+
+    preview = cluster.campaigns.retry(
+        "managed", run_id="cancel-retry", stage="analysis", reason="resume", dry_run=True
+    )
+    assert preview["selected"] == 1 and preview["duplicate_risk_units"] == []
+    retried = cluster.campaigns.retry(
+        "managed", run_id="cancel-retry", stage="analysis", reason="resume", apply=True
+    )
+    assert retried["authorized"] == 1
+    assert retried["apply"]["applied_groups"] == 1
+    assert len(fake_jobs(sandbox)) == 2
+
+    snapshot = cluster.campaigns.store.read_complete_snapshot("managed", "cancel-retry")
+    execution = snapshot["units"][0]["execution"]
+    authorization = execution["retry_authorizations"][-1]
+    assert authorization["execution_state"] == "CANCELLED"
+    assert authorization["accept_duplicate_risk"] is False
+    assert authorization["consumed_by"] == execution["current_attempt"]["attempt_id"]
+    assert execution["state"] in {"PENDING", "RUNNING"}
+    assert len(execution["attempts"]) == 2
+
+
+def test_unconfirmed_cancellation_retry_requires_duplicate_risk(
+    make_cluster, sandbox: Path
+) -> None:
+    cluster = make_cluster(
+        {
+            "FAKESLURM_FREEZE": "1",
+            "FAKESLURM_ACCOUNTING_LAG": "1000",
+            "FAKESLURM_SCONTROL_TTL": "0",
+        }
+    )
+    cluster.campaigns.start(definition(sandbox, count=1), run_id="cancel-unconfirmed")
+    cluster.campaigns.apply("managed", run_id="cancel-unconfirmed")
+    cluster.campaigns.cancel(
+        "managed", run_id="cancel-unconfirmed", all_active=True, apply=True, confirm=True
+    )
+    status = cluster.campaigns.status(
+        "managed", run_id="cancel-unconfirmed", refresh=True, include_units=True
+    )
+    assert status["units"][0]["execution"]["scheduler_source"] == "registry"
+
+    with pytest.raises(InvalidArgument, match="duplicate-risk"):
+        cluster.campaigns.retry(
+            "managed", run_id="cancel-unconfirmed", stage="analysis", reason="resume"
+        )
+    assert len(fake_jobs(sandbox)) == 1
+
+    retried = cluster.campaigns.retry(
+        "managed",
+        run_id="cancel-unconfirmed",
+        stage="analysis",
+        reason="checked sacct by hand",
+        accept_duplicate_risk=True,
+        apply=True,
+    )
+    assert retried["apply"]["applied_groups"] == 1
+    assert len(fake_jobs(sandbox)) == 2
+    snapshot = cluster.campaigns.store.read_complete_snapshot("managed", "cancel-unconfirmed")
+    authorization = snapshot["units"][0]["execution"]["retry_authorizations"][-1]
+    assert authorization["accept_duplicate_risk"] is True
+
+
+def test_pack_cancel_keeps_finished_sibling_terminal(make_cluster, sandbox: Path) -> None:
+    cluster = make_cluster({"FAKESLURM_FREEZE": "1"})
+    cluster.campaigns.start(definition(sandbox, mode="pack", count=2), run_id="pack-cancel")
+    cluster.campaigns.apply("managed", run_id="pack-cancel")
+    snapshot = cluster.campaigns.store.read_complete_snapshot("managed", "pack-cancel")
+    finished, running = snapshot["units"]
+    assert (
+        finished["execution"]["current_attempt"]["job_id"]
+        == running["execution"]["current_attempt"]["job_id"]
+    )
+    finished["execution"]["state"] = "COMPLETED"
+    finished["validation"]["state"] = "PASSED"
+    cluster.campaigns._commit_snapshot(snapshot, [])
+
+    cancelled = cluster.campaigns.cancel(
+        "managed", run_id="pack-cancel", all_active=True, apply=True, confirm=True
+    )
+    assert cancelled["affected_units"] == [running["unit_id"]]
+    snapshot = cluster.campaigns.store.read_complete_snapshot("managed", "pack-cancel")
+    states = {unit["unit_id"]: unit["execution"]["state"] for unit in snapshot["units"]}
+    assert states == {finished["unit_id"]: "COMPLETED", running["unit_id"]: "CANCELLED"}
+
+    preview = cluster.campaigns.retry(
+        "managed", run_id="pack-cancel", stage="analysis", reason="resume", dry_run=True
+    )
+    assert preview["unit_ids"] == [running["unit_id"]]
+    assert preview["duplicate_risk_units"] == [running["unit_id"]]
+
+    # Per-unit markers decide packed outcomes: an unfinished unit in a terminal allocation is
+    # UNKNOWN, so retrying it always requires duplicate-risk acceptance.
+    status = cluster.campaigns.status(
+        "managed", run_id="pack-cancel", refresh=True, include_units=True
+    )
+    by_id = {unit["unit_id"]: unit for unit in status["units"]}
+    assert by_id[running["unit_id"]]["execution"]["state"] == "UNKNOWN"
+    with pytest.raises(InvalidArgument, match="duplicate-risk"):
+        cluster.campaigns.retry("managed", run_id="pack-cancel", stage="analysis", reason="resume")
+
+
+def test_apply_defers_retry_when_refresh_shows_original_job_live(
+    make_cluster, sandbox: Path
+) -> None:
+    cluster = make_cluster({"FAKESLURM_FREEZE": "1"})
+    cluster.campaigns.start(definition(sandbox, count=1), run_id="live-retry")
+    cluster.campaigns.apply("managed", run_id="live-retry")
+    # Stored evidence claims a confirmed cancellation, but the job is still queued.
+    snapshot = cluster.campaigns.store.read_complete_snapshot("managed", "live-retry")
+    execution = snapshot["units"][0]["execution"]
+    execution.update(state="CANCELLED", scheduler_source="sacct")
+    execution.setdefault("scheduler", {})["terminal"] = True
+    cluster.campaigns._commit_snapshot(snapshot, [])
+
+    retried = cluster.campaigns.retry(
+        "managed", run_id="live-retry", stage="analysis", reason="resume", apply=True
+    )
+    assert retried["authorized"] == 1
+    assert retried["apply"]["applied_groups"] == 0
+    assert retried["apply"]["voided_retry_units"] == retried["unit_ids"]
+    assert len(fake_jobs(sandbox)) == 1
+    snapshot = cluster.campaigns.store.read_complete_snapshot("managed", "live-retry")
+    execution = snapshot["units"][0]["execution"]
+    assert execution["state"] in {"PENDING", "RUNNING"}
+    authorization = execution["retry_authorizations"][-1]
+    assert "consumed_by" not in authorization
+    assert authorization["voided_at"] and "execution" in authorization["voided_reason"]
+    events = cluster.campaigns.events("managed", run_id="live-retry")["events"]
+    assert any(event["type"] == "retry_authorizations_voided" for event in events)
+
+    # If that original attempt later fails, the voided approval must not resubmit it.
+    execution["state"] = "FAILED"
+    assert plan_job_groups(snapshot, marker_root="/markers") == []
+
+
 def test_apply_can_require_exact_current_preflight(cluster, sandbox: Path) -> None:
     campaign = definition(sandbox, count=1)
     receipt = cluster.campaigns.preflight(campaign)

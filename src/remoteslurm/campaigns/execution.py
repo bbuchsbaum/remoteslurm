@@ -12,6 +12,29 @@ from ..errors import InvalidArgument
 from .spec import canonical_json
 
 WRAPPER_SCHEMA = 1
+RETRYABLE_EXECUTION = frozenset({"FAILED", "CANCELLED", "UNKNOWN"})
+RETRYABLE_VALIDATION = frozenset({"FAILED", "STALE", "ERROR"})
+LIVE_EXECUTION = frozenset({"INTENDED", "PENDING", "RUNNING"})
+
+
+def pending_retry_authorization(execution: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The newest retry authorization when it is neither consumed nor voided."""
+    authorizations = execution.get("retry_authorizations") or []
+    if not authorizations:
+        return None
+    latest = authorizations[-1]
+    if latest.get("consumed_by") or latest.get("voided_at"):
+        return None
+    return latest
+
+
+def retry_eligible(unit: Mapping[str, Any]) -> bool:
+    """Whether a unit's current evidence permits replacing its attempt."""
+    execution = unit.get("execution", {}).get("state")
+    if execution in LIVE_EXECUTION:
+        return False
+    validation = unit.get("validation", {}).get("state")
+    return execution in RETRYABLE_EXECUTION or validation in RETRYABLE_VALIDATION
 
 
 def _chunks(values: list[Any], size: int) -> Iterable[list[Any]]:
@@ -88,8 +111,9 @@ def plan_job_groups(
         if unit_ids is not None and unit.get("unit_id") not in unit_ids:
             continue
         execution = unit.get("execution", {})
-        retry_authorizations = execution.get("retry_authorizations", [])
-        retry_ready = bool(retry_authorizations and not retry_authorizations[-1].get("consumed_by"))
+        # An authorization only replaces work that the latest observation still shows as
+        # retryable; refresh voids one whose original job is live again or whose output is valid.
+        retry_ready = pending_retry_authorization(execution) is not None and retry_eligible(unit)
         if execution.get("state") != "UNBOUND" and not retry_ready:
             continue
         if unit.get("dependency", {}).get("state") not in {"SATISFIED", "NOT_APPLICABLE"}:

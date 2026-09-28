@@ -64,7 +64,8 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   while attached. `campaigns(name=..., refresh=True)` observes only and never submits.
 - Only `campaign_verify` writes production validation receipts. Report scheduler completion,
   output presence, and validation separately; pilot receipts are not production validation.
-- Retries need a selector and a `reason`; preview with `dry_run=True`. `UNKNOWN` work also needs
+- Retries need a selector and a `reason`; preview with `dry_run=True`. `UNKNOWN` work, and a
+  cancellation not yet confirmed by squeue/sacct (refresh first), also need
   `accept_duplicate_risk=True` — only on the user's explicit instruction. `campaign_cancel`
   previews unless `apply=True`.
 

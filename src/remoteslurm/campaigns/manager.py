@@ -31,7 +31,13 @@ from .contracts import (
     stage_contract,
     unit_contract,
 )
-from .execution import array_spec, plan_job_groups, render_group_script
+from .execution import (
+    array_spec,
+    pending_retry_authorization,
+    plan_job_groups,
+    render_group_script,
+    retry_eligible,
+)
 from .model import CampaignDefinition, Stage, WorkUnit
 from .spec import canonical_json, pilot_alternative_coverage, pilot_units
 from .store import CampaignStore
@@ -55,6 +61,21 @@ DEPENDENCY_STATES = ("NOT_APPLICABLE", "BLOCKED", "SATISFIED", "CONFLICT")
 FRESHNESS_STATES = ("FRESH", "STALE", "PARTIAL", "UNAVAILABLE", "CONFLICT")
 ACTIVE_EXECUTION = frozenset({"INTENDED", "PENDING", "RUNNING", "UNKNOWN"})
 FAILED_EXECUTION = frozenset(TERMINAL_STATES - {"COMPLETED", "CANCELLED"})
+# Sources that observed the job itself; "scancel" and "registry" only restate our own request.
+SCHEDULER_SOURCES = frozenset({"squeue", "sacct", "scontrol"})
+
+
+def _duplicate_risk(execution: Mapping[str, Any]) -> bool:
+    """Whether replacing this attempt could run alongside a still-live original job."""
+    state = execution.get("state")
+    if state == "UNKNOWN":
+        return True
+    if state != "CANCELLED":
+        return False
+    scheduler = execution.get("scheduler") or {}
+    return not (
+        scheduler.get("terminal") and execution.get("scheduler_source") in SCHEDULER_SOURCES
+    )
 
 
 def _now() -> str:
@@ -537,11 +558,10 @@ class CampaignManager:
                         ):
                             execution.pop(key, None)
                         execution["state"] = new_state
-                        for authorization in reversed(execution.get("retry_authorizations", [])):
-                            if not authorization.get("consumed_by"):
-                                authorization["consumed_by"] = attempt["attempt_id"]
-                                authorization["consumed_at"] = _now()
-                                break
+                        pending = pending_retry_authorization(execution)
+                        if pending is not None:
+                            pending["consumed_by"] = attempt["attempt_id"]
+                            pending["consumed_at"] = _now()
                     elif execution.get("state") not in {"COMPLETED", "CANCELLED"} or new_state in {
                         "COMPLETED",
                         "CANCELLED",
@@ -591,6 +611,11 @@ class CampaignManager:
         snapshot = self.store.read_complete_snapshot(name, run_id)
         if snapshot.get("lifecycle") != "OPEN":
             raise InvalidArgument("campaign apply requires an open run")
+        pending_before = {
+            str(pending["authorization_id"])
+            for unit in snapshot["units"]
+            if (pending := pending_retry_authorization(unit["execution"])) is not None
+        }
         try:
             snapshot = self._refresh(name, run_id)
         except StoreConflict:
@@ -621,6 +646,13 @@ class CampaignManager:
         )
         planned = len(groups)
         groups = groups[:max_groups]
+        voided_retries = sorted(
+            unit["unit_id"]
+            for unit in snapshot["units"]
+            if (authorization := (unit["execution"].get("retry_authorizations") or [None])[-1])
+            and authorization.get("authorization_id") in pending_before
+            and authorization.get("voided_at")
+        )
         control = submission_control(self.cluster) if groups else None
         outcomes_by_attempt: dict[tuple[str, str], dict[str, Any]] = {}
         by_id = {unit["unit_id"]: unit for unit in snapshot["units"]}
@@ -637,14 +669,7 @@ class CampaignManager:
             retry_claims: list[dict[str, Any]] = []
             for item in group["mapping"]:
                 execution = by_id[item["unit_id"]]["execution"]
-                authorization = next(
-                    (
-                        entry
-                        for entry in reversed(execution.get("retry_authorizations", []))
-                        if not entry.get("consumed_by")
-                    ),
-                    None,
-                )
+                authorization = pending_retry_authorization(execution)
                 if authorization:
                     retry = retry or execution.get("state") != "UNKNOWN"
                     retry_unknown = retry_unknown or execution.get("state") == "UNKNOWN"
@@ -709,6 +734,7 @@ class CampaignManager:
             "planned_groups": planned,
             "applied_groups": len(outcomes),
             "remaining_groups": max(0, planned - len(outcomes)),
+            "voided_retry_units": voided_retries,
             "submitted_groups": sum(outcome["submitted"] for outcome in outcomes),
             "recovered_groups": sum(
                 bool((self._attempt_for(outcome["record"]) or {}).get("recovered"))
@@ -807,18 +833,13 @@ class CampaignManager:
                 continue
             if any(unit[axis].get("state") != state for axis, state in requested_states.items()):
                 continue
-            retryable = unit["execution"]["state"] in {"FAILED", "UNKNOWN"} or unit["validation"][
-                "state"
-            ] in {"FAILED", "STALE", "ERROR"}
-            if retryable:
+            if retry_eligible(unit):
                 candidates.append(unit)
         if not candidates:
             raise InvalidArgument(
-                "retry selection contains no failed, invalid, or unresolved units"
+                "retry selection contains no failed, cancelled, invalid, or unresolved units"
             )
-        unknown = [
-            unit["unit_id"] for unit in candidates if unit["execution"]["state"] == "UNKNOWN"
-        ]
+        unknown = [unit["unit_id"] for unit in candidates if _duplicate_risk(unit["execution"])]
         if dry_run:
             return {
                 "campaign": name,
@@ -832,8 +853,12 @@ class CampaignManager:
             }
         if unknown and not accept_duplicate_risk:
             raise InvalidArgument(
-                "UNKNOWN attempts require explicit duplicate-risk authorization",
-                action="repeat with accept_duplicate_risk=True after checking scheduler evidence",
+                "UNKNOWN attempts and cancellations not yet confirmed by the scheduler require "
+                "explicit duplicate-risk authorization",
+                action=(
+                    "refresh the run to confirm cancellations from squeue/sacct, or repeat with "
+                    "accept_duplicate_risk=True after checking scheduler evidence"
+                ),
                 units=unknown[:20],
                 unit_count=len(unknown),
             )
@@ -846,7 +871,7 @@ class CampaignManager:
                     "authorization_id": authorization_id,
                     "authorized_at": authorized_at,
                     "reason": reason.strip(),
-                    "accept_duplicate_risk": unit["execution"]["state"] == "UNKNOWN",
+                    "accept_duplicate_risk": _duplicate_risk(unit["execution"]),
                     "execution_state": unit["execution"]["state"],
                     "validation_state": unit["validation"]["state"],
                     "previous_attempt_id": current.get("attempt_id"),
@@ -921,10 +946,13 @@ class CampaignManager:
         job_ids = sorted({str(unit["execution"]["current_attempt"]["job_id"]) for unit in selected})
         if len(job_ids) > 1000:
             raise InvalidArgument("cancel selection exceeds the 1000-job bound")
+        # Packed siblings share an allocation job ID. A sibling that already finished keeps its
+        # terminal state; only work that could still be running becomes CANCELLED.
         affected = [
             unit
             for unit in snapshot["units"]
             if str(unit["execution"].get("current_attempt", {}).get("job_id")) in job_ids
+            and unit["execution"]["state"] in active_states
         ]
         result: dict[str, Any] = {
             "campaign": name,
@@ -1390,6 +1418,7 @@ class CampaignManager:
             artifact_observation_count += len(output_results)
 
         self._derive_dependencies(snapshot)
+        voided = self._void_stale_retry_authorizations(snapshot)
         snapshot["telemetry"] = self._sample_telemetry(snapshot)
         snapshot["source_availability"] = availability
         snapshot["refreshed_at"] = _now()
@@ -1413,8 +1442,39 @@ class CampaignManager:
                 evidence_location="committed unit view",
             ),
         ]
+        if voided:
+            events.append(
+                _event(
+                    snapshot,
+                    "retry_authorizations_voided",
+                    unit_ids=voided,
+                    reason="refreshed evidence shows the attempt live or valid",
+                )
+            )
         self._commit_snapshot(snapshot, events)
         return snapshot
+
+    @staticmethod
+    def _void_stale_retry_authorizations(snapshot: dict[str, Any]) -> list[str]:
+        """Void pending authorizations whose unit no longer needs replacing.
+
+        An authorization approves replacing the attempt as it looked then. If fresh evidence
+        shows that attempt live again or its output valid, a later failure must be authorized
+        anew rather than resubmitted by a stale approval (for example, during ``drive``).
+        """
+        voided: list[str] = []
+        voided_at = _now()
+        for unit in snapshot["units"]:
+            pending = pending_retry_authorization(unit["execution"])
+            if pending is None or retry_eligible(unit):
+                continue
+            pending["voided_at"] = voided_at
+            pending["voided_reason"] = (
+                f"execution {unit['execution'].get('state')}, "
+                f"validation {unit['validation'].get('state')}"
+            )
+            voided.append(str(unit["unit_id"]))
+        return voided
 
     def _observe_outputs(
         self, outputs: list[dict[str, Any]]

@@ -157,7 +157,15 @@ rslurm campaign retry study --run analysis-1 --unit preprocess.0123456789ab \
   --reason 'fixed input' --apply
 ```
 
-An `UNKNOWN` attempt additionally requires `--accept-duplicate-risk`. Authorization consumption,
+Failed, cancelled, unresolved, and invalid units are retryable. An `UNKNOWN` attempt additionally
+requires `--accept-duplicate-risk`, as does a cancellation recorded only by remoteslurm's own
+`scancel` request: refresh until `squeue` or `sacct` confirms it, or accept the risk that the
+original job is still running. Packed units are judged by their per-unit markers, so a cancelled
+allocation leaves unfinished units `UNKNOWN`, which always needs that acceptance. An authorization
+approves replacing the attempt as it looked then: if a refresh shows the original job live again
+or its output valid, the authorization is voided (`voided_retry_units` in the `apply` result and a
+`retry_authorizations_voided` event) and nothing is submitted. A later failure needs a new retry.
+Authorization consumption,
 the expected previous attempt identity, replacement intent, and replacement unit reservations are
 committed atomically before scheduler mutation. A concurrent caller follows that same replacement;
 prior failed attempts and validation receipts remain in history. `drive` repeats bounded

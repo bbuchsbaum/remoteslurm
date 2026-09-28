@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `campaign retry` now accepts cancelled units. A cancellation confirmed by `squeue` or `sacct`
+  retries like a failure; one known only from remoteslurm's own `scancel` request requires
+  `--accept-duplicate-risk`, because the original job may still be running. A refresh now voids a
+  pending retry authorization when the original attempt is live again or its output valid, so
+  neither `apply` nor `drive` submits a duplicate or reuses a stale approval after a later failure;
+  `apply` reports these as `voided_retry_units`.
+  Cancelling a packed allocation no longer marks already-finished sibling units `CANCELLED`. MCP
+  `campaign_cancel` now returns `needs_confirmation` instead of an error when the host requires
+  confirmation for `cancel`.
 - `connect` checks the effective SSH ControlPath before authentication and verifies the master
   before reporting success. Missing sockets now produce configuration-specific diagnostics.
   Master checks, PID queries, shutdown, and `doctor` honor the same host SSH options used to
