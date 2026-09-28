@@ -185,7 +185,7 @@ def _stage_function(stage_spec: Mapping[str, Any], attempt_id: str) -> list[str]
         "  rs_first_line=",
         '  IFS= read -r rs_first_line < "$rs_stage_file" || true',
         '  case "$rs_first_line" in',
-        '    \#!*) "$rs_stage_file" ;;',
+        '    \\#!*) "$rs_stage_file" ;;',
         '    *) /bin/bash "$rs_stage_file" ;;',
         "  esac",
         "  rs_stage_rc=$?",

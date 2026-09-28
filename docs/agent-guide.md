@@ -16,7 +16,8 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   `sync(dry_run=true)` first if unsure; `info.projects` lists what's configured (the optional
   `projects` tool returns the same contracts in the full MCP tool set).
 - To change one file remotely, use `edit` (exact string replace) — do **not** `read` the
-  whole file and `write` it back. `diff` checks a remote file against what you expect.
+  whole file and `write` it back. `diff` (full tool set) checks a remote file against what you
+  expect.
 - CLI `put LOCAL HOST:REMOTE` and `get HOST:REMOTE LOCAL` handle individual files, directories,
   and tarballs; large files/directories use rsync. `sync(direction="pull")` retrieves a configured
   project. `pack` schedules compute commands; it does not create or transfer archives.
@@ -41,7 +42,8 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   `wait(pid=...)` — or `wait(pid=..., pattern="READY")` to return as soon as its log prints a
   marker. Don't put `&` in a plain `run`: the call returns ~2 s after the command exits
   (`lingering: true`) and the background process survives only as long as this session.
-- Keep each call under ~25 min: `run` timeouts are capped at 1500 s, and a `compute=True` run
+- Keep each call under ~25 min: `run` timeouts are capped at the per-call limit
+  (`REMOTESLURM_MCP_MAX_CALL`, default 1500 s), and a `compute=True` run
   must fit its `queue_timeout` + `time` in that. For longer work use `submit` or
   `run(detach=True)` for login-node work. For a Slurm cohort, use
   `watch(job_ids=[...], notify=True)` and retain its watch_id. This returns immediately; the
@@ -53,6 +55,18 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   `job_ids`/`allocation_name` before resubmitting. Missing evidence is not successful cleanup.
 - Submit creates fixed stdout/stderr parent directories before sbatch. Put Slurm substitutions
   such as `%j` in filenames; unresolved substitutions in directory components are refused.
+
+## Campaigns (many units across stages)
+- A campaign TOML defines inventories, stages, output contracts, and validators. Use the
+  `campaign_*` tools when the user needs to know which of many units produced valid outputs.
+- `campaign_start` creates a run and submits nothing. `campaign_adopt` binds jobs or outputs that
+  already exist. `campaign_apply` submits one bounded pass; `campaign_drive` repeats apply/refresh
+  while attached. `campaigns(name=..., refresh=True)` observes only and never submits.
+- Only `campaign_verify` writes production validation receipts. Report scheduler completion,
+  output presence, and validation separately; pilot receipts are not production validation.
+- Retries need a selector and a `reason`; preview with `dry_run=True`. `UNKNOWN` work also needs
+  `accept_duplicate_risk=True` — only on the user's explicit instruction. `campaign_cancel`
+  previews unless `apply=True`.
 
 ## After a job finishes (or won't start)
 - Use `diagnose <job_id>` instead of manually reading logs. It returns a plain-English

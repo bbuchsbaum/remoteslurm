@@ -1,31 +1,46 @@
 # remoteslurm
 
-[Codex skill](skills/remoteslurm/SKILL.md) · [Agent guide](docs/agent-guide.md) ·
-[Changelog](CHANGELOG.md) ·
-[v2 design notes](docs/plans/v2-plan.md) ·
-[Campaign workspace plan](docs/plans/v3-campaign-workspaces.md) ·
-[Issues](https://github.com/bbuchsbaum/remoteslurm/issues)
+[Agent skill](skills/remoteslurm/SKILL.md) · [Agent guide](docs/agent-guide.md) ·
+[Durable tasks](docs/durable-tasks.md) · [Campaigns](docs/campaigns.md) ·
+[Changelog](CHANGELOG.md) · [Issues](https://github.com/bbuchsbaum/remoteslurm/issues)
 
 **remoteslurm is a Python toolkit for operating a Slurm cluster through an SSH alias.** It gives
 people, scripts, and coding agents one coherent way to inspect remote files, synchronize projects,
 submit work, follow jobs, retrieve results, and diagnose failures.
 
-Connect interactively once when MFA is required; subsequent operations use the established
-OpenSSH connection. A small, standard-library-only Python stub supplies structured, bounded
-operations on the login node, while cluster names, accounts, partitions, storage paths, templates,
-and policy notes remain in local configuration—not in the package.
+You authenticate once in a terminal, including MFA where the site requires it; later operations
+reuse that OpenSSH connection. A small, standard-library-only Python stub performs structured,
+bounded operations on the login node. Cluster names, accounts, partitions, storage paths,
+templates, and policy notes live in your local configuration, not in the package.
 
-> **Status:** Version 0.2.0 is a source preview. Install it from a checkout; there is currently no
-> `remoteslurm` release on PyPI. APIs may still change.
+remoteslurm has three interfaces over the same operations:
 
-## Quick start
+- the `rslurm` command line (also installed as `remoteslurm`), where every operational command
+  accepts `--json`;
+- the `remoteslurm-mcp` server for coding agents such as Claude Code and Codex; and
+- the `remoteslurm` Python library.
 
-Install from this checkout on a local machine with Python 3.11 or newer:
+> **Status:** Version 0.2.0 is a source preview. Install it from GitHub; there is no release on
+> PyPI yet. APIs may still change.
+
+## Install
+
+You need Python 3.11 or newer and OpenSSH locally. Install the tools with
+[uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv tool install .
+uv tool install git+https://github.com/bbuchsbaum/remoteslurm
 remoteslurm --version
 ```
+
+This installs `remoteslurm`, `rslurm`, and `remoteslurm-mcp`. Upgrade later with
+`uv tool upgrade remoteslurm`; from a clone, `uv tool install .` also works.
+
+Nothing needs to be installed on the cluster. The login node needs Python 3.6 or newer and the
+usual Slurm command-line tools. Project `sync` needs rsync 3.1 or newer locally; `put` and `get`
+use rsync on both ends for directories and files larger than 4 MiB.
+
+## Connect to a cluster
 
 First make sure a normal SSH alias reaches the cluster. For an MFA-protected cluster, configure a
 persistent OpenSSH master so authentication happens in a visible terminal instead of a hidden
@@ -40,26 +55,124 @@ Host mycluster
   ControlPersist 12h
 ```
 
-Create the socket directory once, generate the local configuration, and verify the entire path to
-Slurm:
+Create the socket directory, generate the local configuration, then connect and check the whole
+path to Slurm:
 
 ```bash
 mkdir -p ~/.ssh/sockets
-remoteslurm config --init
-remoteslurm connect mycluster
-remoteslurm doctor --host mycluster
+remoteslurm config --init        # writes ~/.config/remoteslurm/config.toml
+remoteslurm connect mycluster    # authenticate here, once
+remoteslurm doctor mycluster
 rslurm info
 ```
 
-`config --init` writes `~/.config/remoteslurm/config.toml` with `mycluster` as the example host.
-Edit the alias and site values before connecting. `doctor` checks the SSH setup, remote Python,
-stub startup, writable home directory, and Slurm command-line tools. Every operational command
-also accepts `--json` for machine-readable output.
+`config --init` uses `mycluster` as a placeholder host; edit the alias and site values before
+connecting. `REMOTESLURM_CONFIG` or the global `--config` option selects a different file.
+`doctor` checks the SSH setup, remote Python, stub startup, a writable remote home, and the Slurm
+command-line tools.
+
+## Use it from a coding agent
+
+Two optional add-ons make remoteslurm easier for an agent to use: the MCP server, which gives it
+structured tools, and the agent skill, which tells it how to use them safely. Without either, an
+agent can still drive the `rslurm` CLI with `--json`.
+
+### Register the MCP server
+
+```bash
+# Claude Code
+claude mcp add remoteslurm -s user -e REMOTESLURM_DEFAULT_HOST=mycluster -- remoteslurm-mcp
+
+# Codex
+codex mcp add remoteslurm --env REMOTESLURM_DEFAULT_HOST=mycluster -- remoteslurm-mcp
+```
+
+For other clients, `remoteslurm mcp-config mycluster` prints the JSON registration. Restart the
+agent session so the tools load. The default `core` tool set covers the normal workflow; add
+`REMOTESLURM_MCP_TOOLS=all` for optional extras (see [MCP server details](#mcp-server-details)).
+
+### Install the agent skill
+
+The skill in [`skills/remoteslurm`](skills/remoteslurm/SKILL.md) is a standard `SKILL.md`
+directory. It covers orientation, execution choices, durable tasks, campaigns, monitoring, and
+setup, and loads each part only when a task needs it. Copy it into your agent's skills
+directory:
+
+```bash
+src="$(mktemp -d)"
+git clone --depth 1 https://github.com/bbuchsbaum/remoteslurm "$src"
+
+# Claude Code
+mkdir -p ~/.claude/skills
+rsync -a --delete "$src/skills/remoteslurm/" ~/.claude/skills/remoteslurm/
+
+# Codex
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+rsync -a --delete "$src/skills/remoteslurm/" "${CODEX_HOME:-$HOME/.codex}/skills/remoteslurm/"
+
+rm -rf "$src"
+```
+
+Run the same commands again to update the skill; `--delete` replaces the installed copy, so any
+local edits to it are lost. The third-party
+[`skills`](https://www.npmjs.com/package/skills) installer can do this too:
+`npx skills add bbuchsbaum/remoteslurm -g`.
+
+### Let the agent do the setup
+
+Paste this into Claude Code, Codex, or another agent that can run shell commands:
+
+```text
+Install remoteslurm (https://github.com/bbuchsbaum/remoteslurm) and set it up for my Slurm cluster.
+1. Install the tools: uv tool install git+https://github.com/bbuchsbaum/remoteslurm
+2. Install the agent skill from skills/remoteslurm in that repository into your own skills
+   directory (~/.claude/skills/remoteslurm for Claude Code, ${CODEX_HOME:-$HOME/.codex}/skills/remoteslurm
+   for Codex), then read its SKILL.md and references/setup.md.
+3. Ask me for my cluster's SSH alias. Check ~/.ssh/config for a persistent ControlMaster entry
+   and propose one if it is missing. Run `remoteslurm config --init` and fill in the host with
+   values I confirm; do not invent accounts, partitions, or paths.
+4. Tell me the exact `remoteslurm connect <alias>` command to run in my own terminal. I will do
+   any MFA myself.
+5. Run `remoteslurm doctor <alias>` and fix what it reports.
+6. Register the MCP server for yourself with REMOTESLURM_DEFAULT_HOST=<alias>, then tell me to
+   restart the session.
+```
+
+The MCP resource `remoteslurm://guide` and `rslurm agent-guide` print a short instruction block
+suitable for a project's `CLAUDE.md` or `AGENTS.md`; it is the same text as the
+[agent guide](docs/agent-guide.md).
+
+## What you can do
+
+| Goal | Commands |
+|---|---|
+| Inspect the remote workspace | `info`, `ls`, `cat`, `tail`, `grep`, `find`, `diff` |
+| Move or update work | `sync`, `put`, `get`, `edit` |
+| Run work through Slurm | `submit`, `pack`, `sweep`, `run --compute` |
+| Run one job whose result must be validated and recoverable | `ensure` |
+| Run and validate many units across stages | `campaign` (`plan`, `preflight`, `start`, `list`, `runs`, `adopt`, `apply`, `drive`, `status`, `verify`, `retry`, `cancel`, `close`, …) |
+| Keep login-node work running | `run --detach`, `proc`, `wait --pid`/`--path` |
+| Observe or recover jobs | `jobs`, `status`, `watch`, `wait`, `events`, `adopt` |
+| Understand or stop a job | `diagnose`, `output`, `cancel` |
+| Inspect capacity and storage | `sinfo`, `queue`, `quota` |
+| Read site configuration | `templates`, `projects`, `notes`, `config` |
+| Housekeeping | `forget`, `clean`, `daemon status\|start\|stop` |
+
+`rslurm COMMAND --help` documents every option. Remote paths may use `~` and variables exported
+by the remote login environment. Select a cluster with `HOST:PATH`, `--host`, `default_host`, or
+`REMOTESLURM_DEFAULT_HOST`.
+
+Use `run` only for short login-node checks. `run --compute` requests an interactive allocation
+through `srun`; substantial work should normally go through `submit`. For login-node work that
+must outlive the call, such as a server, an install, or a setup script, `run --detach` returns the
+process ID and log path at once. `proc status|tail|kill` manage the process, and
+`wait --pid PID [--pattern REGEX]` blocks until it exits or its log prints a marker.
 
 ## From a local project to a finished job
 
-A useful host configuration captures the details that otherwise leak into scripts and agent
-prompts:
+### Describe the cluster once
+
+A host configuration captures the details that otherwise leak into scripts and agent prompts:
 
 ```toml
 default_host = "mycluster"
@@ -86,10 +199,10 @@ exclude = [".git", "__pycache__", "results/"]
 delete = false
 ```
 
-The account, partition, storage variable, module, and paths above are examples—not package
+The account, partition, storage variable, module, and paths above are examples, not package
 defaults. Replace them with values from your cluster.
 
-With that configuration, the ordinary workflow stays short:
+### Sync, submit, and follow
 
 ```bash
 # Preview, then synchronize the configured project.
@@ -104,6 +217,11 @@ rslurm watch 12345 --notify
 rslurm output 12345 -n 100
 ```
 
+To bring results back, use `rslurm sync analysis --pull`, or `rslurm get HOST:REMOTE LOCAL` for
+individual files and directories. `rslurm put LOCAL HOST:REMOTE` uploads.
+
+### Follow many jobs
+
 For a long cohort, register a background watch and keep the returned `watch_id`:
 
 ```bash
@@ -115,36 +233,32 @@ rslurm jobs --name 'cohort-*' --state RUNNING --limit 25
 rslurm jobs --since 2026-09-01 --fields job_id,name,state,exit_code
 ```
 
-MCP exposes the same subscription as `watch(job_ids=[...], notify=True)`. The default condition
-is all jobs terminal **or any job failed**; `condition="all_terminal"` waits for the whole set.
-Identical starts return the same subscription. The local daemon keeps observing after the tool
-call or agent exits, and resumes saved subscriptions on its next start. Stopping a watch never
-cancels jobs. Desktop notifications are best effort; `delivery` records sent, failed, or unknown.
-Agent wakeup requires client integration. Local status reads preserve the result for every reader
-and expose observer heartbeat, observation age, and authentication/connectivity errors. Laptop
-sleep and daemon downtime create observation gaps; this feature adds no login/reboot supervisor.
-The observer batches up to 1,000 explicit IDs across overlapping watches, with a minimum 30-second
-subscription interval. Existing foreground `watch` and legacy `events` remain available.
+A background watch lives in the local session daemon (`rslurm daemon status`). It keeps observing
+after the command or agent exits and resumes saved subscriptions when the daemon next starts. The
+default condition is all jobs terminal **or any job failed**; `--condition all_terminal` waits
+for the whole set. Identical starts return the same watch, and stopping a watch never cancels
+jobs. Desktop notifications are best effort, and waking an agent requires client integration.
+Status reads expose the observer heartbeat, observation age, and connection errors. Laptop sleep
+and daemon downtime create observation gaps; nothing restarts the daemon after login or reboot.
 
-Job listings default to 50 compact records and a 32 KiB JSON budget. Arrays show counts and a
-failure sample. Use `next_offset` while `has_more`, or narrow by ID, name glob, submission time,
-and state. Pages reflect live state, so filtering a changing queue is not a frozen snapshot.
-`compact=False` (CLI `--detail`) and `fields` still obey the byte limit; an oversized record
-returns `detail_omitted`. A single `jobs(job_id=...)` / CLI `status` retrieves full detail.
+Job listings default to 50 compact records within a 32 KiB JSON budget. Arrays show task counts
+and a failure sample. Follow `next_offset` while `has_more`, or narrow by ID, name glob,
+submission time, and state. `--detail` and `--fields` still obey the byte limit; `rslurm status
+JOB` returns full detail for one job.
 
-Sample live resource use without dropping to SSH or parsing cluster-specific command output:
+### Resource use and progress
 
 ```bash
 rslurm status 12345 --usage
 rslurm watch 12345 --usage --usage-interval 60
 ```
 
-Running jobs use `sstat`; terminal jobs use compatible `sacct` fields. The result records the
+Running jobs are sampled with `sstat` and finished jobs with `sacct`. The result records its
 source and sample time and normalizes allocated CPUs, live PIDs, CPU time, effective CPU use,
-allocation utilization, and RSS. Live PIDs are processes rather than inferred worker counts.
-`watch` refuses usage intervals below 60 seconds because `sstat` contacts the Slurm controller.
+allocation utilization, and RSS. `watch` refuses usage intervals below 60 seconds because `sstat`
+contacts the Slurm controller.
 
-For computations with countable artifacts, declare what constitutes progress at submission:
+For computations that write countable files, declare progress at submission:
 
 ```bash
 rslurm submit scripts/fit.sh --cwd '$WORK/analysis' \
@@ -152,194 +266,165 @@ rslurm submit scripts/fit.sh --cwd '$WORK/analysis' \
 rslurm status 12345 --usage
 ```
 
-The bounded file scan then reports observed, total, percentage, and whether its scan was
-truncated. Progress remains observational; completion and durable-task validation are separate.
+`status --usage` then reports observed, total, and percentage from a bounded file scan, and says
+whether the scan was truncated. Progress is an observation: it does not validate the files.
 
-Before calling `sbatch`, remoteslurm verifies that its local job registry can be updated. If the
-registry becomes unavailable after Slurm accepts the job, the command still succeeds and returns
-`submitted: true`, `recorded: false`, the Slurm job ID, and a recovery command. Recover that same
-job once local state is writable:
+### Pack many small commands
 
-```bash
-rslurm adopt 12345
-```
-
-`jobs` and `status` continue with scheduler-visible data when local history is unavailable and
-mark the result with `registry_available: false`. Set `REMOTESLURM_STATE_DIR` when the default
-state location is not writable, including sandboxed agent sessions:
-
-```bash
-REMOTESLURM_STATE_DIR=/tmp/remoteslurm-state rslurm --no-daemon submit scripts/fit.sh
-```
-
-Generated batch wrappers are staged under `~/.remoteslurm/scripts` by default, independently of
-`--cwd`, so submitting from a clean Git checkout does not modify that checkout. Configure a remote
-`script_dir` for a different staging location. Submission results expose the exact `script_path`.
-
-Pack independent shell commands onto one or more one-node allocations with GNU Parallel. The two
-limits are intentionally separate: `--max-processes` controls concurrent processes inside each
-node, while `--max-concurrent` throttles the packed array allocations in Slurm.
+`pack` runs independent shell commands with GNU Parallel inside one or more one-node
+allocations. `--max-processes` limits concurrent processes on each node; `--max-concurrent`
+limits how many allocations Slurm runs at once.
 
 ```bash
 # One allocation, at most 10 commands running on its node at once.
 rslurm pack commands.txt --template cpu --max-processes 10
 
-# Split the list across 4 allocations, run 10 processes per node, at most 2 nodes at once.
+# Split the list across 4 allocations, 10 processes per node, at most 2 nodes at once.
 rslurm pack commands.txt --template cpu --batches 4 --max-processes 10 --max-concurrent 2
 ```
 
-Each nonblank line is a shell command. GNU Parallel must be available in the template's job
-environment. Unless the host, template, or `--cpus` specifies otherwise, each allocation requests
-one CPU per concurrent process.
+Each nonblank line is one shell command. GNU Parallel must be available in the template's job
+environment. Unless the host, template, or `--cpus` says otherwise, each allocation requests one
+CPU per concurrent process. For a parameter grid, `rslurm sweep script.sh -P alpha=0.1,0.2`
+submits a job array with one task per combination.
 
-If the job fails or never starts, ask for an explanation instead of manually spelunking through
-scheduler records and log files:
+### When a job fails or never starts
 
 ```bash
 rslurm diagnose 12345
 ```
 
 `diagnose` combines job state, exit status, resource use, pending reason, scheduler metadata, and
-bounded log tails into a verdict with concrete next steps. It also scans up to 1 MiB from the
-start of each log and returns up to eight error excerpts with surrounding context and line
-numbers, so an appended scheduler epilogue does not hide early errors. `scan_truncated` and
-`match_limit_reached` report incomplete scans.
+bounded log tails into a verdict with concrete next steps. It scans up to 1 MiB from the start of
+each log and returns up to eight error excerpts with line numbers, so a scheduler epilogue does
+not hide early errors. `scan_truncated` and `match_limit_reached` report incomplete scans.
 
-Before submission, fixed `--output`/`--error` parent directories are created using the effective
-script-directive, environment, and command-line options. Unresolved Slurm tokens in directory
-components are refused with an actionable error; tokens in filenames such as `logs/%A_%a.out`
-are supported. Compute runs enforce `queue_timeout` separately from execution walltime and
-cancel their owned allocation when abandoned. Their result includes `job_ids`, `allocation_name`,
-and cleanup evidence; unconfirmed cleanup requires reconciliation before resubmitting.
+Before submission, remoteslurm creates the fixed parent directories of `--output` and `--error`.
+It refuses Slurm substitutions in directory components (`%j/log.out`) but accepts them in
+filenames (`logs/%A_%a.out`). Compute runs enforce `queue_timeout` separately from walltime and
+cancel their own allocation when abandoned. Their result includes `job_ids`, `allocation_name`,
+and cleanup evidence; if cleanup is unconfirmed, reconcile before resubmitting.
 
-For transfers, `rslurm put LOCAL HOST:REMOTE` and `rslurm get HOST:REMOTE LOCAL` handle files and
-directories, using rsync for large transfers. Use `rslurm sync PROJECT --pull` for a configured
-project's results. `pack` combines compute commands into allocations; it is not an archive tool.
+### Local records and recovery
 
-For work that must be recoverable across lost clients and independently validated, describe one
-batch job as a durable task and repeat `ensure` until it is verified:
+remoteslurm keeps a local registry of submitted jobs. It checks that the registry is writable
+before calling `sbatch`. If the registry fails after Slurm accepts a job, the command still
+succeeds and returns `submitted: true`, `recorded: false`, the job ID, and a recovery command.
+Do not resubmit; adopt the job once local state is writable:
+
+```bash
+rslurm adopt 12345
+```
+
+`jobs` and `status` fall back to scheduler-visible data when local history is unavailable and
+mark the result `registry_available: false`. Set `REMOTESLURM_STATE_DIR` when the default state
+location is not writable, as in some sandboxed agent sessions:
+
+```bash
+REMOTESLURM_STATE_DIR=/tmp/remoteslurm-state rslurm --no-daemon submit scripts/fit.sh
+```
+
+Generated batch wrappers are staged under `~/.remoteslurm/scripts` on the cluster regardless of
+`--cwd`, so submitting from a clean Git checkout leaves it clean. Set the host's `script_dir` to
+stage elsewhere; submission results give the exact `script_path`.
+
+## Durable tasks
+
+For one batch job whose result must survive a lost client and be validated before reuse,
+describe it in a task manifest and repeat `ensure` until it reports `VERIFIED`:
 
 ```bash
 rslurm ensure fit.toml
 ```
 
 The task identity covers the script, remote input fingerprints, resolved resources, declared
-environment, outputs, validation command, and an optional `[progress]` observer. Intent is persisted
-on the cluster before `sbatch`;
-an interrupted submission is reconciled by its unique attempt marker and ambiguous submission is
-reported as `UNKNOWN` without an automatic retry. `VERIFIED` means the validation command passed
-and declared output fingerprints still match the receipt. See [durable tasks](docs/durable-tasks.md)
-for the manifest, retry semantics, Python API, and MCP tool.
+environment, outputs, validation command, and an optional `[progress]` observer. Intent is stored
+on the cluster before `sbatch`. An interrupted submission is reconciled by its unique attempt
+marker; an ambiguous one is reported as `UNKNOWN` and never retried automatically. `VERIFIED`
+means the validation command passed and the declared outputs still match their recorded
+fingerprints; `COMPLETED` means only that Slurm finished. See
+[durable tasks](docs/durable-tasks.md) for the manifest, retries, Python API, and MCP tool.
 
-## Campaign workspaces
+## Campaigns
 
-A campaign definition groups finite inventories and stage dependencies into stable work-unit
-identities. Campaigns can create a durable run, adopt already-running arrays or output-only
-products, reconcile scheduler and filesystem evidence, qualify named pilots, validate output
-contracts, and close or archive the run. `status --refresh` observes once and never submits work or
-runs validators.
+A campaign definition groups finite inventories (for example, subjects and sessions) and stage
+dependencies into work units with stable identities. A run of that definition can adopt work
+that already exists, submit the rest in bounded passes, reconcile scheduler and filesystem
+evidence, validate output contracts, and be closed or archived.
+
+In the commands below, `study` is the `name` declared in `campaign.toml`:
 
 ```bash
-# Compile locally. Inventory rows and exact script bytes contribute to the definition id.
+# Compile locally and inspect units and execution policy.
 rslurm campaign plan campaign.toml
 
-# Create durable remote intent, then adopt work that already exists.
+# Qualify the definition, remote tools, and permissions; this stores a preflight receipt.
+rslurm campaign preflight campaign.toml
+
+# Create the run (submits nothing), then bind work that already exists.
 rslurm campaign start campaign.toml --run-id first-pass
-rslurm campaign apply analysis --run first-pass --require-preflight small
-rslurm campaign adopt analysis --run first-pass --stage preprocess --array-job 12345
-rslurm campaign adopt analysis --run first-pass --stage group --output-only
+rslurm campaign adopt study --run first-pass --stage preprocess --array-job 12345
+rslurm campaign adopt study --run first-pass --stage group --output-only
 
-# One bounded refresh combines squeue, sacct, retained evidence, output metadata, and sstat.
-rslurm campaign status analysis --run first-pass --refresh
-rslurm campaign failures analysis --run first-pass
+# Submit one bounded pass of eligible work, or repeat passes while attached.
+rslurm campaign apply study --run first-pass --require-preflight
+rslurm campaign drive study --run first-pass --max-passes 20 --interval 30
 
-# Qualify the definition and an exact pilot layout, then validate production outputs separately.
-rslurm campaign preflight campaign.toml --against small
-rslurm campaign verify analysis --run first-pass --stage preprocess
-rslurm campaign receipts analysis --kind validation --run first-pass
+# Observe once (squeue, sacct, output metadata, sstat); never submits or validates.
+rslurm campaign status study --run first-pass --refresh
+rslurm campaign failures study --run first-pass
 
-# Retry authorization is explicit; UNKNOWN also requires --accept-duplicate-risk.
-rslurm campaign retry analysis --run first-pass --stage preprocess \
+# Validate outputs; only this writes production validation receipts.
+rslurm campaign verify study --run first-pass --stage preprocess
+rslurm campaign receipts study --kind validation --run first-pass
+
+# Retries are explicit. Preview first; --apply also submits. UNKNOWN work also
+# requires --accept-duplicate-risk.
+rslurm campaign retry study --run first-pass --stage preprocess \
   --state validation=failed --reason 'fixed validator' --dry-run
-rslurm campaign drive analysis --run first-pass --max-passes 20 --interval 30
 
-# Closing blocks new adoption while preserving refresh and revalidation. Archival is read-only.
-rslurm campaign close analysis --run first-pass
-rslurm campaign archive analysis --run first-pass
+# Closing blocks new submission, adoption, and retries; refresh and revalidation still work.
+rslurm campaign close study --run first-pass
+rslurm campaign archive study --run first-pass
 ```
 
-Each unit reports dependency, execution, artifact, validation, and freshness states separately.
-Scheduler `COMPLETED`, present outputs, and passed validation therefore remain distinct claims.
-Current telemetry summarizes active allocations, allocated CPUs, observed effective CPUs/RSS, and
-sample coverage; it does not yet make packing recommendations. Configure `campaign_dir` on the
-host when `~/.remoteslurm/campaigns` is not visible from every login node.
+Each unit reports dependency, execution, artifact, validation, and freshness states separately,
+so scheduler `COMPLETED`, present outputs, and passed validation remain distinct claims. Stages
+run as `single`, `array`, or `pack` jobs. Each `apply` pass records its exact submission intent on
+the cluster before calling `sbatch`, so a lost reply is recovered rather than resubmitted; an
+ambiguous attempt stays `UNKNOWN`. Retries append new attempts instead of replacing failures; cancelled units cannot be retried
+within the same run. `campaign cancel` previews the affected jobs unless given `--apply`.
 
-Managed stages choose `single`, `array`, or `pack` execution. One `apply` pass refreshes evidence,
-plans stable bounded groups, persists exact submission intent remotely, and then calls `sbatch`.
-Lost replies recover by attempt marker; an ambiguous attempt remains `UNKNOWN`. Arrays retain exact
-unit/index maps, and packed wrappers record per-unit start, finish, exit, and diagnostic evidence.
-Retries append authorization and immutable attempts instead of replacing failures. `campaign
-cancel` previews resolved jobs unless `--apply` is given, and cancellation remains available for
-active work in a run closed with `--allow-active`.
+A definition may declare named `[pilots]`, each a small inventory selection with its own output
+root. `preflight --against PILOT` validates outputs that already exist there, and
+`apply --require-preflight PILOT` then requires that receipt. Preflight never submits work, so
+produce pilot outputs first.
 
-Output contracts support required or optional file, directory, and symlink outputs; exact/minimum/
-maximum glob cardinality and byte size; optional SHA-256 evidence; and explicit settling intervals.
-Light validators are argv arrays with bounded time and output and pass through the host's
-`allow_run` policy. Verification writes content-addressed immutable receipts. A later artifact
-change marks current validation `STALE` while retaining the old receipt. Named-pilot receipts never
-count as production validation. See the [campaign guide](docs/campaigns.md) for the schema and APIs.
+Output contracts describe required or optional files, directories, and symlinks, with glob
+cardinality, size limits, optional SHA-256 digests, and settling intervals. Validators are argv
+arrays with bounded time and output and obey the host's `allow_run` policy. A later change to a
+validated artifact marks it `STALE` while keeping the old receipt. Pilot receipts never count as
+production validation. Set the host's `campaign_dir` when `~/.remoteslurm/campaigns` is not
+visible from every login node. The [campaign guide](docs/campaigns.md) documents the schema and
+APIs.
 
-## What you can do
+## MCP server details
 
-| Goal | Commands |
-|---|---|
-| Inspect the remote workspace | `info`, `ls`, `cat`, `tail`, `grep`, `find`, `diff` |
-| Move or update work | `sync`, `put`, `get`, `edit` |
-| Run work through Slurm | `submit`, `ensure`, `pack`, `sweep`, `run --compute` |
-| Keep login-node work running | `run --detach`, `proc`, `wait --pid`/`--path` |
-| Observe or recover jobs | `jobs`, `status`, `adopt`, `wait`, `watch`, `events` |
-| Run or validate a campaign | `campaign apply`, `campaign drive`, `campaign retry`, `campaign status`, `campaign preflight`, `campaign verify` |
-| Understand or stop a job | `output`, `diagnose`, `cancel` |
-| Inspect capacity and storage | `sinfo`, `queue`, `quota` |
+`remoteslurm-mcp` is a stdio MCP server. Its default `core` tool set covers cluster information,
+bounded file reading and editing, login-node and compute execution, detached processes,
+submission, `adopt`, `ensure`, `pack`, job listing, waiting and watches, diagnosis,
+synchronization, cancellation, connection state, and all campaign tools. Set
+`REMOTESLURM_MCP_TOOLS=all` to add `glob`, `diff`, `job_output`, `sinfo`, `projects`, `sweep`,
+`queue_info`, `quota`, and `events`.
 
-Remote paths may use `~` and variables exported by the remote login environment. Select a cluster
-with `HOST:PATH`, `--host`, `default_host`, or `REMOTESLURM_DEFAULT_HOST`.
+`run` and `sync` calls stay under 25 minutes (`REMOTESLURM_MCP_MAX_CALL`, default 1500 s),
+because clients such as Claude Code abort silent calls after 30 minutes. Cancelling a `run` or
+`wait` call stops its remote process or wait; side-effecting calls such as `submit` finish, so
+their results are kept.
 
-Use `run` only for short login-node checks. `run --compute` requests an interactive allocation
-through `srun`; substantial work should normally go through `submit`. For login-node work that
-must outlive the call, such as a server, an install, or a setup script, `run --detach` returns the
-process id and log path at once. `proc status|tail|kill` manage the process, and
-`wait --pid PID [--pattern REGEX]` blocks until it exits or its log prints a marker.
-
-## Coding agents and MCP
-
-`remoteslurm-mcp` is a stdio MCP server exposing the same cluster-neutral operations. Generate a
-client registration snippet with:
-
-```bash
-remoteslurm mcp-config --host mycluster
-```
-
-The default `core` tool set covers cluster information, bounded file operations, execution
-(including detached login-node processes), submission, durable `ensure`, campaign observation,
-job monitoring, diagnosis, synchronization, cancellation, waiting, and connection state. Set
-`REMOTESLURM_MCP_TOOLS=all` to
-add project and queue inspection, quota, sweeps, output, events, globbing, and diffs. `run` and
-`sync` stay under 25 minutes (`REMOTESLURM_MCP_MAX_CALL`, default 1500 s) because clients such as
-Claude Code abort silent calls after 30 minutes. Cancelling a `run` or `wait` call stops its
-remote process or wait; side-effecting calls such as `submit` finish, so their results are kept.
-
-An agent should call `info` first. The returned `notes`, `templates`, `projects`, and
-`learned_notes` are its local policy contract: they say where work belongs and how it should be
-submitted without teaching this repository about one institution. Print a ready-to-use agent
-instruction block with:
-
-```bash
-rslurm agent-guide
-```
-
-The same instructions are available as the MCP resource `remoteslurm://guide` and in the
-[agent guide](docs/agent-guide.md).
+An agent should call `info` first. Its `notes`, `templates`, `projects`, and `learned_notes` are
+the local policy contract: they say where work belongs and how to submit it, without teaching
+this repository about any one institution.
 
 ## Python API
 
@@ -362,9 +447,10 @@ with Cluster.connect("mycluster") as cluster:
     print(job.output(tail=20)["content"])
 ```
 
-`Cluster` also exposes the bounded file, search, synchronization, queue, quota, sweep, and
-diagnostic operations used by the CLI and MCP server. Errors are structured subclasses of
-`RemoteSlurmError`, including `NotConnected`, `NotFound`, `PermissionDenied`, and `SlurmError`.
+`Cluster` also exposes the bounded file, search, removal, synchronization, queue, quota, sweep,
+and diagnostic operations, plus `ensure` and `cluster.campaigns`. Errors are structured
+subclasses of `RemoteSlurmError`, including `NotConnected`, `NotFound`, `PermissionDenied`, and
+`SlurmError`.
 
 ## Safety and trust boundaries
 
@@ -375,12 +461,12 @@ diagnostic operations used by the CLI and MCP server. Errors are structured subc
   executable against `run_allowlist`, and rejects shell `-c` forms.
 - `protected_paths` guard writes, edits, removals, uploads, and sync deletion unless explicitly
   overridden.
-- Recursive removal refuses `/`, the remote home and its parent, shallow paths, and every root in
-  `protected_roots`.
-- Cancellation verifies scheduler ownership before calling `scancel`. Operations named in
-  `confirm`, such as `rm` or `cancel`, require explicit confirmation.
-- Submissions, runs, cancellations, edits, removals, and synchronization operations are recorded
-  in local per-host state.
+- Recursive removal (Python `Cluster.rm`; the CLI and MCP have no remove command) refuses `/`,
+  the remote home and its parent, shallow paths, and every root in `protected_roots`.
+- Cancellation verifies scheduler ownership before calling `scancel`. Operations named in the
+  host's `confirm` list, such as `rm` or `cancel`, require explicit confirmation.
+- Submissions, runs, cancellations, edits, removals, and synchronization are recorded in local
+  per-host state.
 
 The daemon socket and local configuration are same-user trust boundaries. remoteslurm is an
 operator tool, not a privilege-separation layer or a multi-tenant security boundary. It does not
@@ -388,23 +474,23 @@ provision cluster access, bypass MFA, or replace the rules enforced by Slurm and
 
 ## Compatibility and site integration
 
-The intended target is a Slurm login node reachable through system OpenSSH with:
+The intended target is a Slurm login node reachable through system OpenSSH, with:
 
 - Python 3.11 or newer on the local machine;
 - Python 3.6 or newer on the remote login node;
 - standard Slurm tools such as `sbatch`, `squeue`, `sacct`, and `scontrol`; and
-- `rsync` 3.1 or newer only for project synchronization and large transfers.
+- rsync 3.1 or newer locally for project `sync`, and rsync on both ends for large or directory
+  `put`/`get` transfers.
 
-CI is configured to test Python 3.11–3.13 on Linux and macOS. The remote stub is
-standard-library-only; its Python 3.6 syntax floor is checked statically and its boot path is
-exercised under Python 3.7. Real-cluster behavior remains dependent on the installed Slurm version
-and site policy.
+CI tests Python 3.11–3.13 on Linux and macOS. The remote stub is standard-library-only; its Python
+3.6 syntax floor is checked statically and its startup is exercised under Python 3.7. Real-cluster
+behavior still depends on the installed Slurm version and site policy.
 
 Prefer `ProxyJump` in `~/.ssh/config` for jump hosts. If that is not possible, set
-`ssh_opts = ["-o", "ProxyJump=bastion.example.edu"]` for the host; the same options flow to SSH
+`ssh_opts = ["-o", "ProxyJump=bastion.example.edu"]` for the host; the same options apply to SSH
 and project synchronization.
 
-For site-specific quota tooling, configure a command and select its output contract explicitly:
+For site-specific quota tooling, configure a command and select its output format explicitly:
 
 ```toml
 [hosts.mycluster]
@@ -424,14 +510,17 @@ results when a cluster does not provide them.
 | The ControlMaster check fails | Add `ControlMaster`, `ControlPath`, and `ControlPersist` to the SSH alias. |
 | Remote Python is missing | Set `python = "/path/to/python3"` for that host. |
 | A configured variable is absent | Export it in the remote login environment. |
-| Project sync rejects local rsync | Install rsync 3.1+ or use bounded `put` and `get`. |
+| Project sync rejects local rsync | Install rsync 3.1+ locally (for example, `brew install rsync`). |
 | A finished job is temporarily unknown | Slurm accounting may be lagging; retry after a few seconds. |
+| Agent tools are missing after registration | Restart the agent session; check `remoteslurm mcp-config`. |
 
 Set `REMOTESLURM_DEBUG=1` for additional local error detail.
 
 ## Development
 
 ```bash
+git clone https://github.com/bbuchsbaum/remoteslurm
+cd remoteslurm
 uv venv
 uv pip install -e '.[dev]'
 uv run --no-sync pytest -q
@@ -442,8 +531,8 @@ uvx vermin -t=3.6- --violations src/remoteslurm/stub.py
 uv build
 ```
 
-The regular suite uses a fake Slurm installation. Live tests are fully opt-in and carry no
-built-in cluster, account, partition, path, or walltime:
+The regular suite uses a fake Slurm installation. Live tests are opt-in and carry no built-in
+cluster, account, partition, path, or walltime:
 
 ```bash
 REMOTESLURM_LIVE=1 \
@@ -454,16 +543,17 @@ uv run --no-sync pytest -q tests/live
 
 You may instead provide `REMOTESLURM_LIVE_PARTITION`, `REMOTESLURM_LIVE_QOS`,
 `REMOTESLURM_LIVE_TIME`, or `REMOTESLURM_LIVE_CWD`. Omitted values fall back to configured or
-scheduler defaults.
-The durable-task live test runs when `REMOTESLURM_LIVE_CWD` is set, creates an isolated
-subdirectory there, and removes both its outputs and remote task record after validation.
-Set `REMOTESLURM_LIVE_FAULTS=1` to also exercise recovery after the submitting stub exits
-immediately following scheduler acceptance.
+scheduler defaults. The durable-task live test runs when `REMOTESLURM_LIVE_CWD` is set, creates an
+isolated subdirectory there, and removes its outputs and remote task record after validation. Set
+`REMOTESLURM_LIVE_FAULTS=1` to also exercise recovery after the submitting stub exits immediately
+following scheduler acceptance.
 
 The campaign live test also requires `REMOTESLURM_LIVE_CWD`. It exercises lost-response array
 recovery, mixed array outcomes, packed markers, concurrent retry authorization, verified per-unit
 dependency release, and cancellation with isolated campaigns and work directories. Set
 `REMOTESLURM_LIVE_EVIDENCE` to write its machine-readable qualification receipt.
+
+Design history lives in [docs/plans](docs/plans/).
 
 ## License
 
