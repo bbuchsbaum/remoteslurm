@@ -392,8 +392,9 @@ Each unit reports dependency, execution, artifact, validation, and freshness sta
 so scheduler `COMPLETED`, present outputs, and passed validation remain distinct claims. Stages
 run as `single`, `array`, or `pack` jobs. Each `apply` pass records its exact submission intent on
 the cluster before calling `sbatch`, so a lost reply is recovered rather than resubmitted; an
-ambiguous attempt stays `UNKNOWN`. Retries append new attempts instead of replacing failures; cancelled units cannot be retried
-within the same run. `campaign cancel` previews the affected jobs unless given `--apply`.
+ambiguous attempt stays `UNKNOWN`. Retries append new attempts instead of replacing failures or cancellations. Retrying a
+cancelled unit needs `--accept-duplicate-risk` until a refresh has confirmed the cancellation
+from `squeue` or `sacct`. `campaign cancel` previews the affected jobs unless given `--apply`.
 
 A definition may declare named `[pilots]`, each a small inventory selection with its own output
 root. `preflight --against PILOT` validates outputs that already exist there, and
@@ -557,4 +558,4 @@ Design history lives in [docs/plans](docs/plans/).
 
 ## License
 
-MIT
+[MIT](LICENSE)
