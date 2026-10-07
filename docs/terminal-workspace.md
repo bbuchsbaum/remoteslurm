@@ -164,7 +164,7 @@ The source preview has local automated and terminal qualification. Hosted CI and
 an exercise on a real cluster are separate evidence; this guide does not claim
 either has run for the current changes.
 
-The completed observation candidate `761b941` passed 725 tests with 8 opt-in live
+The completed observation candidate `73f8044` passed 726 tests with 8 opt-in live
 tests skipped, plus static checks, package/base-install and actual PTY exit checks.
 See [current qualification](qualification/activity-observation.md) for exact
 identity, specimens and the pending two-job live gate. The older first-viewer

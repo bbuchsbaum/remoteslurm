@@ -29,6 +29,16 @@ pytestmark = [
 ]
 
 
+def stop_owned(socket: Path, owner: int) -> None:
+    assert daemon.daemon_status(socket)["pid"] == owner
+    assert daemon.stop_daemon(socket)
+    deadline = time.monotonic() + 60
+    while daemon.daemon_available(socket):
+        if time.monotonic() >= deadline:
+            pytest.fail("owned daemon did not complete shutdown within one minute")
+        time.sleep(0.2)
+
+
 @pytest.mark.timeout(900)
 def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, monkeypatch):
     host = os.environ.get("REMOTESLURM_LIVE_HOST")
@@ -161,8 +171,7 @@ def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, 
         while time.monotonic() < deadline:
             work = store.documents("work", limit=1000)
             if work and not restarted:
-                assert daemon.stop_daemon(socket)
-                time.sleep(2)
+                stop_owned(socket, owner)
                 assert daemon.spawn_daemon(socket, config_path=cfg.path)
                 new_owner = daemon.daemon_status(socket)["pid"]
                 assert new_owner != owner
@@ -184,6 +193,11 @@ def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, 
         else:
             pytest.fail("live observation did not converge within ten minutes")
         assert restarted and all(w["validation"] == "NOT_RUN" for w in work)
+        output_receipts = {
+            filename: cluster.read_text(work_root + "/" + filename)
+            for filename in ("array-one.txt", "array-two.txt", "pack-success.txt")
+        }
+        assert all(value == "observation fixture\n" for value in output_receipts.values())
         snapshot = service.snapshot(workspace)
         assert not snapshot["attention"]["authorization"]["grants_authority"]
         evidence.update(
@@ -213,6 +227,7 @@ def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, 
                     if e["kind"] == "submission.recovered"
                 ]
             ),
+            output_receipts=output_receipts,
         )
     finally:
         if (
@@ -220,7 +235,7 @@ def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, 
             and daemon.daemon_available(socket)
             and daemon.daemon_status(socket)["pid"] == owner
         ):
-            daemon.stop_daemon(socket)
+            stop_owned(socket, owner)
         cluster.close()
         output = os.environ.get("REMOTESLURM_LIVE_EVIDENCE")
         if output:
