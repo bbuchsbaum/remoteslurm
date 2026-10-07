@@ -16,6 +16,7 @@ import pytest
 from remoteslurm import Cluster, daemon
 from remoteslurm.activity.monitor import enroll, status
 from remoteslurm.activity.store import ActivityStore
+from remoteslurm.campaigns.spec import compile_campaign, load_campaign
 from remoteslurm.config import Config
 from remoteslurm.identity import control_identity
 from remoteslurm.workspace import service
@@ -120,8 +121,25 @@ def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, 
                     }
                 },
             }
-            path = tmp_path / (name + ".json")
-            path.write_text(json.dumps(spec))
+            path = tmp_path / (name + ".toml")
+            path.write_text(
+                f"schema = 1\nname = {json.dumps(name)}\nhost = {json.dumps(host)}\n"
+                f"[workspace]\nremote_root = {json.dumps(work_root)}\n"
+                f"output_root = {json.dumps(work_root)}\n"
+                '[inventories.samples]\nkey = ["sample"]\nrows = ['
+                + ", ".join("{sample = " + json.dumps(s) + "}" for s in samples)
+                + ']\n[stages.analysis]\nforeach = "samples"\n'
+                + f"script = {json.dumps(str(script))}\n"
+                + "[stages.analysis.execution]\n"
+                + "".join(f"{k} = {json.dumps(v)}\n" for k, v in execution.items())
+                + "[stages.analysis.resources]\n"
+                + "".join(f"{k} = {json.dumps(v)}\n" for k, v in evidence["resources"].items())
+                + '[[stages.analysis.outputs]]\nname = "result"\nkind = "file"\n'
+                + f'path = "{mode}-{{sample}}.txt"\nmin_bytes = 1\n'
+            )
+            # The CLI loads TOML, while the Python API accepts compiled mappings.
+            expected = compile_campaign(spec, base_dir=tmp_path, host_config=hc)
+            assert load_campaign(path, host_config=hc).definition_id == expected.definition_id
             command = [
                 sys.executable,
                 "-m",
