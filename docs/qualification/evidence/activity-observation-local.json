@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "started_utc": "2026-10-07T01:46:57.221948+00:00",
+  "finished_utc": "2026-10-07T01:52:11.377189+00:00",
+  "duration_seconds": 314.149148,
+  "command": [
+    ".venv/bin/pytest",
+    "-q"
+  ],
+  "cwd": "/Users/bbuchsbaum/code/pycode/remoteslurm",
+  "log": "/private/tmp/remoteslurm-motes-full-06.log",
+  "exit_code": 0,
+  "child_returncode": 0,
+  "reason": "exited",
+  "detail": null,
+  "timeout_seconds": 900.0,
+  "log_bytes": 923,
+  "candidate": "8bc5a6aa8acee5fcdb58df62b84ee20f4d31c6e5",
+  "identity": {
+    "control_protocol": 1,
+    "version": "0.2.0",
+    "stub_sha": "25019df537b83a72",
+    "source_sha": "ac3cfa34ff30d5eb",
+    "build_id": "1:0.2.0:ac3cfa34ff30d5eb:25019df537b83a72"
+  },
+  "pytest_result": {
+    "passed": 726,
+    "skipped": 8,
+    "seconds": 313.42
+  },
+  "static_checks": {
+    "ruff": "PASS",
+    "ruff_format_files": 99,
+    "mypy_source_files": 44
+  }
+}

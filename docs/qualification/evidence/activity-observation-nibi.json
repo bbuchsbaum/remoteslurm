@@ -1,0 +1,532 @@
+{
+  "candidate": "8bc5a6aa8acee5fcdb58df62b84ee20f4d31c6e5",
+  "identity": {
+    "control_protocol": 1,
+    "version": "0.2.0",
+    "stub_sha": "25019df537b83a72",
+    "source_sha": "ac3cfa34ff30d5eb",
+    "build_id": "1:0.2.0:ac3cfa34ff30d5eb:25019df537b83a72"
+  },
+  "host": "nibi",
+  "root": "/scratch/brad/rslurm-observation-6c58eb0a95",
+  "resources": {
+    "account": "def-brad_cpu",
+    "partition": "cpubase_bycore_b2",
+    "time": "00:05:00",
+    "cpus_per_task": 1,
+    "mem": "256M"
+  },
+  "result": "PASS",
+  "campaigns": [
+    "observearray6c58eb0a95",
+    "observepack6c58eb0a95"
+  ],
+  "job_ids": [
+    "23355244",
+    "23355246"
+  ],
+  "socket": "/var/folders/9h/nkjq6vss7mqdl4ck7q1hd8ph0000gp/T/rsoa-azx865bl/d.sock",
+  "daemon_pids": [
+    255,
+    3467
+  ],
+  "monitor": {
+    "enabled": true,
+    "policy": {
+      "scheduler_seconds": 30,
+      "recovery_seconds": 60,
+      "usage_seconds": 60,
+      "artifacts_seconds": 60,
+      "max_calls": 8,
+      "read_seconds": 10,
+      "max_jobs": 1000,
+      "max_outputs": 1024,
+      "max_hash_bytes": 67108864,
+      "max_log_excerpts": 3,
+      "max_host_workers": 2
+    },
+    "observer": {
+      "build_id": "1:0.2.0:ac3cfa34ff30d5eb:25019df537b83a72",
+      "heartbeat": 1791337599.3389068,
+      "pid": 3467
+    },
+    "subscriptions": [
+      {
+        "campaign": "observearray6c58eb0a95",
+        "created_at": 1791337471.831159,
+        "enabled": true,
+        "host": "nibi",
+        "id": "79ca6e0832ebf9c804428e3c45a80ab495db73fe7901310241028297b995b6ab",
+        "next_poll": 1791337619.104993,
+        "run_id": "qualification",
+        "target_id": "9064f11ae942cddc7be7463d5587cbf01646c36acc5a6af46b467c61d248eec6"
+      },
+      {
+        "campaign": "observepack6c58eb0a95",
+        "created_at": 1791337484.133164,
+        "enabled": true,
+        "host": "nibi",
+        "id": "478693963c0a2badaba95b9b639af7743c83ee6613ad384aead55ac6103356f0",
+        "next_poll": 1791337609.619709,
+        "run_id": "qualification",
+        "target_id": "9064f11ae942cddc7be7463d5587cbf01646c36acc5a6af46b467c61d248eec6"
+      }
+    ],
+    "sources": [
+      {
+        "cadence": 30,
+        "error": null,
+        "host": "nibi",
+        "id": "5d1f4f0d894c8a2d48f068419b44953855cbeb560ce738b3ea268c2759e1aabd",
+        "kind": "scheduler",
+        "next_poll": 1791337629.058109,
+        "observed_at": 1791337596.058109,
+        "result": {
+          "coverage": "complete",
+          "next_page": null,
+          "remote_calls": 2,
+          "work_count": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "79ca6e0832ebf9c804428e3c45a80ab495db73fe7901310241028297b995b6ab",
+        "stale": false
+      },
+      {
+        "cadence": 30,
+        "error": null,
+        "host": "nibi",
+        "id": "d48d18588a8dd89df92452eea7f60da724eb67089b7a6f6f608137610f62a308",
+        "kind": "scheduler",
+        "next_poll": 1791337617.921215,
+        "observed_at": 1791337585.921215,
+        "result": {
+          "coverage": "complete",
+          "next_page": null,
+          "remote_calls": 0,
+          "work_count": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "478693963c0a2badaba95b9b639af7743c83ee6613ad384aead55ac6103356f0",
+        "stale": false
+      },
+      {
+        "cadence": 60,
+        "error": null,
+        "host": "nibi",
+        "id": "414a997c4de44a57e0033d28dbb5f706e0b10b5870255967cbd2126a72b54a65",
+        "kind": "usage",
+        "next_poll": 1791337619.403575,
+        "observed_at": 1791337559.403575,
+        "result": {
+          "coverage": "complete",
+          "next_page": null,
+          "remote_calls": 0,
+          "work_count": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "79ca6e0832ebf9c804428e3c45a80ab495db73fe7901310241028297b995b6ab",
+        "stale": false
+      },
+      {
+        "cadence": 60,
+        "error": null,
+        "host": "nibi",
+        "id": "a6b588741c978a59325538e1ea09c5256f5c0406c0d4bee1af00b2e16de81c92",
+        "kind": "artifacts",
+        "next_poll": 1791337619.342093,
+        "observed_at": 1791337558.342093,
+        "result": {
+          "coverage": "complete",
+          "next_page": null,
+          "remote_calls": 1,
+          "work_count": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "79ca6e0832ebf9c804428e3c45a80ab495db73fe7901310241028297b995b6ab",
+        "stale": false
+      },
+      {
+        "cadence": 60,
+        "error": null,
+        "host": "nibi",
+        "id": "a7ed23c8e9ef97d8e6faeb29c7d6153f3c68a804a3e91448265603107f28a4f0",
+        "kind": "recovery",
+        "next_poll": 1791337619.104993,
+        "observed_at": 1791337557.104993,
+        "result": {
+          "continuation": {
+            "after": "c0ae28876079486fb93c09bea7851df6",
+            "history_gap": false,
+            "ledger_digest": null,
+            "ledger_offset": 0,
+            "snapshot_commit": null,
+            "unit_page": 0
+          },
+          "coverage": "complete",
+          "head": {
+            "journal": "journal/00000000000000000003-c0ae28876079486fb93c09bea7851df6.json",
+            "revision": 3,
+            "schema": 1,
+            "transaction_id": "c0ae28876079486fb93c09bea7851df6",
+            "view": "views/00000000000000000003-c0ae28876079486fb93c09bea7851df6"
+          },
+          "imported": 2,
+          "ledger_available": true,
+          "remote_calls": 5,
+          "unit_total": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "79ca6e0832ebf9c804428e3c45a80ab495db73fe7901310241028297b995b6ab",
+        "stale": false
+      },
+      {
+        "cadence": 60,
+        "error": null,
+        "host": "nibi",
+        "id": "d29b1dccaabd87f9632e82f286f7d96ee4743ab1b740391695c0ed689e9a4d8b",
+        "kind": "usage",
+        "next_poll": 1791337614.059198,
+        "observed_at": 1791337554.059198,
+        "result": {
+          "coverage": "complete",
+          "next_page": null,
+          "remote_calls": 0,
+          "work_count": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "478693963c0a2badaba95b9b639af7743c83ee6613ad384aead55ac6103356f0",
+        "stale": false
+      },
+      {
+        "cadence": 60,
+        "error": null,
+        "host": "nibi",
+        "id": "5d2c5b7f9be749a16eb2e3064cdca223bf96913be3883e73b04523a60c79d03e",
+        "kind": "recovery",
+        "next_poll": 1791337613.79658,
+        "observed_at": 1791337550.79658,
+        "result": {
+          "continuation": {
+            "after": "6c685b96aefd474581d7bba3e461a035",
+            "history_gap": false,
+            "ledger_digest": null,
+            "ledger_offset": 0,
+            "snapshot_commit": null,
+            "unit_page": 0
+          },
+          "coverage": "complete",
+          "head": {
+            "journal": "journal/00000000000000000003-6c685b96aefd474581d7bba3e461a035.json",
+            "revision": 3,
+            "schema": 1,
+            "transaction_id": "6c685b96aefd474581d7bba3e461a035",
+            "view": "views/00000000000000000003-6c685b96aefd474581d7bba3e461a035"
+          },
+          "imported": 0,
+          "ledger_available": true,
+          "remote_calls": 5,
+          "unit_total": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "478693963c0a2badaba95b9b639af7743c83ee6613ad384aead55ac6103356f0",
+        "stale": false
+      },
+      {
+        "cadence": 60,
+        "error": null,
+        "host": "nibi",
+        "id": "c3576453d085c7443a2a6a8e601a6ab1315bfae327f429e615d96f33d6903199",
+        "kind": "artifacts",
+        "next_poll": 1791337609.619709,
+        "observed_at": 1791337549.619709,
+        "result": {
+          "coverage": "complete",
+          "next_page": null,
+          "remote_calls": 2,
+          "work_count": 2
+        },
+        "state": "HEALTHY",
+        "subscription_id": "478693963c0a2badaba95b9b639af7743c83ee6613ad384aead55ac6103356f0",
+        "stale": false
+      }
+    ],
+    "budgets": [
+      {
+        "bytes": 644,
+        "calls": 2,
+        "host": "nibi",
+        "started": 1791337596.077163
+      }
+    ],
+    "omitted": {
+      "subscription": 0,
+      "source": 0,
+      "budget": 0
+    },
+    "response_budget_bytes": 131072
+  },
+  "work": [
+    {
+      "campaign": "observearray6c58eb0a95",
+      "unit_id": "analysis.42b7d9715799ebae2dde1faa",
+      "attempt_id": "190bf6d7d21545c193e78f24bde2cb7d",
+      "job_id": "23355244_0",
+      "execution": "COMPLETED",
+      "artifacts": "PRESENT",
+      "validation": "NOT_RUN",
+      "marker_dir": null
+    },
+    {
+      "campaign": "observepack6c58eb0a95",
+      "unit_id": "analysis.69ce54591e4e4ebd4800d6b9",
+      "attempt_id": "90bd2ec18dbe4fadb7ac01839b09335f",
+      "job_id": "23355246_0",
+      "execution": "FAILED",
+      "artifacts": "MISSING",
+      "validation": "NOT_RUN",
+      "marker_dir": "/home/brad/.remoteslurm/campaigns/observepack6c58eb0a95/runs/qualification/markers/2e843468d4ff7a79e9ec011aae3447671fe70b44e3ce97701ad0e16d034d03e1/90bd2ec18dbe4fadb7ac01839b09335f/analysis.69ce54591e4e4ebd4800d6b9"
+    },
+    {
+      "campaign": "observepack6c58eb0a95",
+      "unit_id": "analysis.5c1be6f76808604c7b09f866",
+      "attempt_id": "90bd2ec18dbe4fadb7ac01839b09335f",
+      "job_id": "23355246_0",
+      "execution": "COMPLETED",
+      "artifacts": "PRESENT",
+      "validation": "NOT_RUN",
+      "marker_dir": "/home/brad/.remoteslurm/campaigns/observepack6c58eb0a95/runs/qualification/markers/2e843468d4ff7a79e9ec011aae3447671fe70b44e3ce97701ad0e16d034d03e1/90bd2ec18dbe4fadb7ac01839b09335f/analysis.5c1be6f76808604c7b09f866"
+    },
+    {
+      "campaign": "observearray6c58eb0a95",
+      "unit_id": "analysis.acf062558ec1241fbb5e7593",
+      "attempt_id": "190bf6d7d21545c193e78f24bde2cb7d",
+      "job_id": "23355244_1",
+      "execution": "COMPLETED",
+      "artifacts": "PRESENT",
+      "validation": "NOT_RUN",
+      "marker_dir": null
+    }
+  ],
+  "recovery_events": 4,
+  "output_receipts": {
+    "array-one.txt": "observation fixture\n",
+    "array-two.txt": "observation fixture\n",
+    "pack-success.txt": "observation fixture\n"
+  },
+  "independent_receipts_observed_at": "2026-10-07T01:47:23.870544+00:00",
+  "scheduler_receipts": [
+    {
+      "job_id": "23355244_0",
+      "state": "COMPLETED",
+      "source": "sacct",
+      "name": "rsc-fcd1a5ab47-190bf6d7d2",
+      "exit_code": 0,
+      "exit_code_raw": "0:0",
+      "elapsed": "00:00:00",
+      "time_limit": "00:05:00",
+      "nodelist": "c549",
+      "partition": "cpubase_bycore_b2",
+      "account": "def-brad_cpu",
+      "submit_time": "2026-10-06T21:44:30",
+      "start_time": "2026-10-06T21:45:11",
+      "end_time": "2026-10-06T21:45:11",
+      "max_rss": 6553600,
+      "workdir": "/scratch/brad/rslurm-observation-6c58eb0a95",
+      "accounting_pending": false,
+      "terminal": true,
+      "extra": {
+        "steps": [
+          {
+            "step": "batch",
+            "state": "COMPLETED",
+            "max_rss": 6553600
+          },
+          {
+            "step": "extern",
+            "state": "COMPLETED",
+            "max_rss": null
+          }
+        ],
+        "reconciliation": {
+          "freshness": "retained",
+          "observed_at": 1791337643.8718169,
+          "sources": [
+            {
+              "source": "squeue",
+              "available": true,
+              "observed_at": 1791337643.8718169,
+              "matched": false,
+              "identity": {
+                "cluster": "nibi",
+                "job_id": "23355244_0",
+                "submit_time": null,
+                "attempt_marker": null
+              }
+            },
+            {
+              "source": "sacct",
+              "available": true,
+              "observed_at": 1791337643.8718169,
+              "matched": true,
+              "durable": true,
+              "identity": {
+                "cluster": "nibi",
+                "job_id": "23355244_0",
+                "submit_time": null,
+                "attempt_marker": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "job_id": "23355244_1",
+      "state": "COMPLETED",
+      "source": "sacct",
+      "name": "rsc-fcd1a5ab47-190bf6d7d2",
+      "exit_code": 0,
+      "exit_code_raw": "0:0",
+      "elapsed": "00:00:00",
+      "time_limit": "00:05:00",
+      "nodelist": "c550",
+      "partition": "cpubase_bycore_b2",
+      "account": "def-brad_cpu",
+      "submit_time": "2026-10-06T21:44:30",
+      "start_time": "2026-10-06T21:45:11",
+      "end_time": "2026-10-06T21:45:11",
+      "max_rss": 6434816,
+      "workdir": "/scratch/brad/rslurm-observation-6c58eb0a95",
+      "accounting_pending": false,
+      "terminal": true,
+      "extra": {
+        "steps": [
+          {
+            "step": "batch",
+            "state": "COMPLETED",
+            "max_rss": 6434816
+          },
+          {
+            "step": "extern",
+            "state": "COMPLETED",
+            "max_rss": null
+          }
+        ],
+        "reconciliation": {
+          "freshness": "retained",
+          "observed_at": 1791337644.0207071,
+          "sources": [
+            {
+              "source": "squeue",
+              "available": true,
+              "observed_at": 1791337644.0207071,
+              "matched": false,
+              "identity": {
+                "cluster": "nibi",
+                "job_id": "23355244_1",
+                "submit_time": null,
+                "attempt_marker": null
+              }
+            },
+            {
+              "source": "sacct",
+              "available": true,
+              "observed_at": 1791337644.0207071,
+              "matched": true,
+              "durable": true,
+              "identity": {
+                "cluster": "nibi",
+                "job_id": "23355244_1",
+                "submit_time": null,
+                "attempt_marker": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "job_id": "23355246_0",
+      "state": "FAILED",
+      "source": "sacct",
+      "name": "rsc-2e843468d4-90bd2ec18d",
+      "exit_code": 1,
+      "exit_code_raw": "1:0",
+      "elapsed": "00:00:01",
+      "time_limit": "00:05:00",
+      "nodelist": "c550",
+      "partition": "cpubase_bycore_b2",
+      "account": "def-brad_cpu",
+      "submit_time": "2026-10-06T21:44:42",
+      "start_time": "2026-10-06T21:45:11",
+      "end_time": "2026-10-06T21:45:12",
+      "max_rss": 7872512,
+      "workdir": "/scratch/brad/rslurm-observation-6c58eb0a95",
+      "accounting_pending": false,
+      "terminal": true,
+      "extra": {
+        "steps": [
+          {
+            "step": "batch",
+            "state": "FAILED",
+            "max_rss": 7872512
+          },
+          {
+            "step": "extern",
+            "state": "COMPLETED",
+            "max_rss": null
+          }
+        ],
+        "reconciliation": {
+          "freshness": "retained",
+          "observed_at": 1791337644.142217,
+          "sources": [
+            {
+              "source": "squeue",
+              "available": true,
+              "observed_at": 1791337644.142217,
+              "matched": false,
+              "identity": {
+                "cluster": "nibi",
+                "job_id": "23355246_0",
+                "submit_time": null,
+                "attempt_marker": null
+              }
+            },
+            {
+              "source": "sacct",
+              "available": true,
+              "observed_at": 1791337644.142217,
+              "matched": true,
+              "durable": true,
+              "identity": {
+                "cluster": "nibi",
+                "job_id": "23355246_0",
+                "submit_time": null,
+                "attempt_marker": null
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "member_marker_receipts": {
+    "analysis.69ce54591e4e4ebd4800d6b9": {
+      "schema": 1,
+      "unit_id": "analysis.69ce54591e4e4ebd4800d6b9",
+      "finished_at": 1791337511,
+      "exit_code": 7,
+      "stdout": "stdout.log",
+      "stderr": "stderr.log"
+    },
+    "analysis.5c1be6f76808604c7b09f866": {
+      "schema": 1,
+      "unit_id": "analysis.5c1be6f76808604c7b09f866",
+      "finished_at": 1791337512,
+      "exit_code": 0,
+      "stdout": "stdout.log",
+      "stderr": "stderr.log"
+    }
+  }
+}

@@ -1,18 +1,19 @@
 # Local terminal view of remote workspaces
 
-Status: first terminal viewer implemented locally, 2026-10-06, on top of
-`89770dbf80b77e02030c3692046dd26300b4a2ce`. See the
+Status updated 2026-10-06: terminal viewer and the shared WP8a observation foundation
+are implemented; the authorized Nibi lifecycle passed on `8bc5a6a`. See the
 [user guide](../terminal-workspace.md) for shipped command forms, limits, and
-remaining evidence gaps. The broader WP8a campaign/ledger observation work below
-remains open; this document preserves the full target design.
+the [qualification receipt](../qualification/activity-observation.md) for exact evidence.
+This document preserves the original target design and acceptance criteria.
 
 Implementation choices for the first viewer: consistent tabs at both widths,
 with a split file tree/preview above 100 columns; `/` edits the remote path;
 bounded repeated log tails use expiring shared requests instead of a continuous
 stream lease. The file cache has a stricter combined 64 MiB cap and directory
 captures a 1 MiB metadata cap. Scheduler jobs are shown from local registrations;
-artifact/validation columns remain explicitly unchecked. These choices deliver
-the two-terminal workflow without claiming passive campaign recovery is finished.
+canonical campaign bindings also recover array and packed member identities. Artifact
+and validation columns show independently evidenced states; validation remains `NOT_RUN`
+until explicitly performed. Passive campaign recovery survives daemon restart.
 
 ## Outcome and first complete experience
 
@@ -31,7 +32,7 @@ The user requested a plan for this workflow. Textual, the command forms, limits,
 and delivery phases below are proposed implementation decisions. This document
 does not authorize deployment, publication, or remote test submissions.
 
-## Current foundation
+## Foundation at planning time (historical)
 
 | Source | Present behavior | Work needed |
 | --- | --- | --- |
@@ -326,7 +327,7 @@ Mote is authoritative for status and dependencies:
 | Work | Issue |
 | --- | --- |
 | Existing WP8a epic | `bd-01M2ZFABZXW9EP5VKPJ5B8W9J7` |
-| A1.1 journal, next ready foundation task | `bd-01M2ZFC39QNXCZ58GWK2ZQ50WB` |
+| A1.1 journal | `bd-01M2ZFC39QNXCZ58GWK2ZQ50WB` |
 | Terminal workspace epic | `bd-01M49EP3E4RR2R1BEVPFKJ5W8G` |
 | V1; depends on A1.2 and A2.1 | `bd-01M49EP3KXK80VTH8PCTK0A9XF` |
 | V2; depends on V1 and A3.2 | `bd-01M49EP3T764KMGB5HXTQ6J7RS` |
@@ -391,10 +392,11 @@ byte counts, UI evidence, and validation receipts. Simulate auth expiry/sleep in
 automated tests; document any live cases not exercised. Report local tests,
 terminal inspection, hosted CI, live qualification, and release separately.
 
-## Next action
+## Completion boundary
 
-The local journal, shared producers, daemon-owned workspace observation, bounded
-files, structured tools, and optional terminal view are implemented. Finish the
-remaining WP8a passive campaign/ledger recovery and semantic artifact/validation
-projection against their existing issues; then qualify the expanded view with
-that evidence. Live cluster qualification and hosted CI remain distinct gates.
+The local journal, shared producers, daemon-owned workspace observation, bounded files,
+structured tools, optional terminal view, passive canonical recovery and semantic
+artifact/validation projection are implemented. The authorized small-array/mixed-pack
+lifecycle recovered four units after agent exit and daemon restart. See the linked
+qualification report for automated, terminal and live evidence. Hosted CI, publication
+and release have not been performed; earlier WP4/WP5 gates and WP8b remain separate work.

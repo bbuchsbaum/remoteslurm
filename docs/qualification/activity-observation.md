@@ -1,23 +1,30 @@
 # Activity and terminal observation qualification
 
-The final code candidate is `73f804495463ef14625e9047250eea3e55d9e85e`.
-Its full suite passed **726 tests, 8 opt-in live tests skipped** in 308.86 seconds.
+The qualified candidate is `8bc5a6aa8acee5fcdb58df62b84ee20f4d31c6e5`.
+Its full suite passed **726 tests, 8 opt-in live tests skipped** in 313.42 seconds;
+the authorized observation lifecycle passed separately on this same candidate.
+Production source, package configuration, lockfile and CI workflow are identical to
+`73f804495463ef14625e9047250eea3e55d9e85e`, which passed the preceding local matrix.
 Build identity: `1:0.2.0:ac3cfa34ff30d5eb:25019df537b83a72`.
 Ruff, formatting, mypy (44 source files), the helper's static Python 3.6 floor,
 source archive and wheel builds passed. A fresh base-wheel environment imported CLI/MCP
 without Textual and refused UI startup before configuration/authentication. Actual CLI PTYs
 restored alternate screen and cursor on both `q` and Ctrl-C, with exit status zero.
 
-Raw suite evidence: `/private/tmp/remoteslurm-motes-full-04.log` and its `.meta.json` sidecar.
-This report and the checked-in specimens provide a portable reproduction; the raw log is local.
-Hosted CI has not run for this candidate, and no new live jobs have been submitted for this work.
+Raw suite evidence: `/private/tmp/remoteslurm-motes-full-06.log` and its `.meta.json` sidecar.
+A [copy of the raw log](evidence/activity-observation-local.log) and
+[candidate-bound metadata](evidence/activity-observation-local.json) are checked in alongside
+the live receipt and reproducible specimens.
+Hosted CI has not run for this candidate. The authorized Nibi live lifecycle passed;
+no publication or release was performed.
 The preceding implementation candidate `761b941` passed 725 tests. Final installed-state
 verification exposed a trailing-separator cache lookup mismatch; the final candidate fixes it
 without normalizing remote `..` or unknown symlinks. Its 28 affected reader/file/UI checks passed,
 then the complete matrix passed again. Installed command and daemon identities match the final
 code, and `/scratch/brad` now resolves the root previously enrolled as `/scratch/brad/` offline.
-The opt-in live specimen remains unexecuted; its final preparation adds bounded owned-daemon
-shutdown and independent fixture output receipts.
+The live specimen uses bounded owned-daemon shutdown and independent fixture output receipts.
+Its CLI subprocess invokes `remoteslurm.cli` and its TOML campaign files are locally compiled
+before submission. Earlier preparation attempts failed before any allocations were submitted.
 
 The automated specimens cover early acknowledgements before campaign projection, Python/MCP
 causal equivalence, array and packed member identity, unavailable journal recording, passive
@@ -39,7 +46,7 @@ uvx vermin -t=3.6- --no-tips --violations src/remoteslurm/stub.py
 uv build
 ```
 
-## Prepared live gate
+## Passing live gate
 
 [The opt-in test](../../tests/live/test_activity_observation.py) submits exactly two job groups:
 an array of two successful one-CPU tasks and one one-CPU allocation with two sequential packed
@@ -53,11 +60,29 @@ available as evidence. The test never starts an agent on the login node or promp
 
 Read-only prerequisites checked: an existing Nibi SSH master is alive; configured account is
 `def-brad_cpu`, partition is `cpubase_bycore_b2`; the helper reports working Slurm tools.
-The live gate requires explicit submission authorization. The terminal workspace plan says
-“This document does not authorize deployment, publication, or remote test submissions.”
-Preparation and local tests therefore do not close A4.2, V4 or their parent epics.
+The user explicitly authorized these two submissions. The test passed in 141.67 seconds
+on 2026-10-06 (local date), against the candidate above. Its
+[portable receipt](evidence/activity-observation-nibi.json) retains the exact build,
+campaign/attempt identities, observations and independent scheduler/member/output receipts.
 
-After authorization, run from the immutable candidate:
+| Submission | Verified outcome |
+| --- | --- |
+| Array `23355244` | Tasks `_0` and `_1` completed with exit 0; both expected files contain `observation fixture\n`. |
+| Pack `23355246` | Allocation `_0` failed with exit 1; exact member markers distinguish exit 7 from exit 0, and the successful member's file is present. |
+
+The submitting processes exited before observation began. After clearing only the isolated
+imports, daemon PID 255 recovered work; restart to PID 3467 retained/recovered all four units
+and four `submission.recovered` events. All validation states remain `NOT_RUN`; the deliberately
+failed member's artifact is `MISSING`, while the other three are `PRESENT`. Attention remains
+advisory and grants no execution authority. The call budget temporarily suspended a scheduler
+source; its visible gap resolved before the test converged.
+
+The isolated daemon stopped successfully. The user's existing daemon PID 69264 and its
+Nibi helper stayed alive. No jobs were resubmitted and no remote evidence was removed.
+Live MFA expiry, laptop sleep and storage faults were not induced; those cases are covered
+by automated fault tests, not this live receipt.
+
+For a separately authorized reproduction, run from the immutable candidate:
 
 ```sh
 REMOTESLURM_LIVE=1 REMOTESLURM_LIVE_HOST=nibi \
@@ -65,6 +90,16 @@ REMOTESLURM_LIVE=1 REMOTESLURM_LIVE_HOST=nibi \
   REMOTESLURM_LIVE_EVIDENCE=/private/tmp/rslurm-observation-live.json \
   .venv/bin/pytest -q tests/live/test_activity_observation.py
 ```
+
+Raw live evidence: `/private/tmp/remoteslurm-observation-live-04.log`, its `.meta.json`
+sidecar and `/private/tmp/rslurm-observation-live-04.json`. A
+[copy of the raw live log](evidence/activity-observation-live.log) is checked in.
+The checked-in receipt also adds
+independent read-only accounting and exact member-marker checks collected after the test.
+
+A4.2, V4 and their WP8a/terminal-workspace parent epics are complete against these local,
+terminal and live receipts. Earlier WP4/WP5 gates and later WP8b work are unaffected.
+Closing these implementation issues does not assert hosted CI, publication or release.
 
 The test fails before remote writes when source/tests differ from HEAD. A passing receipt must
 retain candidate SHA, client/helper identities, daemon restart PIDs, allocation IDs and unit

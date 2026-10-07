@@ -160,14 +160,16 @@ exceed those logical payload totals. Local recording failures are reported
 without turning an accepted submission into a failed submission. Never resubmit
 solely because `activity_recorded` is false.
 
-The source preview has local automated and terminal qualification. Hosted CI and
-an exercise on a real cluster are separate evidence; this guide does not claim
-either has run for the current changes.
+The source preview has local automated, terminal and authorized Nibi lifecycle qualification.
+Hosted CI, publication and release have not been performed for this candidate.
 
-The completed observation candidate `73f8044` passed 726 tests with 8 opt-in live
+The completed observation candidate `8bc5a6a` passed 726 tests with 8 opt-in live
 tests skipped, plus static checks, package/base-install and actual PTY exit checks.
 See [current qualification](qualification/activity-observation.md) for exact
-identity, specimens and the pending two-job live gate. The older first-viewer
+identity, specimens and the passing two-job live gate on `8bc5a6a`. That live check recovered
+all four units after submitting-process exit and an isolated daemon restart, verified
+the three successful output files, and retained the failed packed member separately.
+The older first-viewer
 receipt below is historical evidence.
 
 Local qualification recorded on 2026-10-06 for build
