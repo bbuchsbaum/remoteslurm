@@ -125,26 +125,28 @@ def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, 
             command = [
                 sys.executable,
                 "-m",
-                "remoteslurm",
+                "remoteslurm.cli",
                 "--no-daemon",
                 "--json",
                 "-H",
                 host,
                 "campaign",
             ]
-            subprocess.run(
+            started = subprocess.run(
                 [*command, "start", str(path), "--run-id", "qualification"],
-                check=True,
                 capture_output=True,
+                text=True,
                 timeout=120,
             )
+            assert started.returncode == 0, started.stdout + started.stderr
             # The submitting agent process exits before observation starts.
-            subprocess.run(
+            applied = subprocess.run(
                 [*command, "apply", name, "--run", "qualification"],
-                check=True,
                 capture_output=True,
+                text=True,
                 timeout=180,
             )
+            assert applied.returncode == 0, applied.stdout + applied.stderr
             ledger = cluster.call(
                 "campaign_ledger_read",
                 campaign_dir=hc.campaign_dir,
@@ -154,6 +156,7 @@ def test_live_activity_agent_exit_daemon_restart_array_and_mixed_pack(tmp_path, 
             jobs.extend(
                 str(a["job_id"]) for g in ledger["groups"] for a in g["attempts"] if a.get("job_id")
             )
+            evidence.update(campaigns=names[:], job_ids=jobs[:], socket=str(socket))
             enroll(hc, name, "qualification")
         assert len(jobs) == 2
         # Erase our isolated local imports, exercising passive recovery after agent loss.
