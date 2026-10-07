@@ -1,12 +1,15 @@
 # remoteslurm
 
 [Agent skill](skills/remoteslurm/SKILL.md) · [Agent guide](docs/agent-guide.md) ·
+[Workspace viewer](docs/terminal-workspace.md) ·
 [Durable tasks](docs/durable-tasks.md) · [Campaigns](docs/campaigns.md) ·
 [Changelog](CHANGELOG.md) · [Issues](https://github.com/bbuchsbaum/remoteslurm/issues)
 
 **remoteslurm is a Python toolkit for operating a Slurm cluster through an SSH alias.** It gives
 people, scripts, and coding agents one coherent way to inspect remote files, synchronize projects,
 submit work, follow jobs, retrieve results, and diagnose failures.
+An optional terminal viewer lets you watch remote work and browse files beside Claude Code or
+Codex, while both the agent and viewer run on your own computer.
 
 You authenticate once in a terminal, including MFA where the site requires it; later operations
 reuse that OpenSSH connection. A small, standard-library-only Python stub performs structured,
@@ -36,31 +39,20 @@ remoteslurm --version
 This installs `remoteslurm`, `rslurm`, and `remoteslurm-mcp`. Upgrade later with
 `uv tool upgrade remoteslurm`; from a clone, `uv tool install .` also works.
 
-For the optional terminal workspace viewer, install a checkout with
-`uv tool install '.[tui]'` (or `uv pip install -e '.[dev,tui]'` for development).
+To include the terminal workspace viewer, install the `tui` extra:
+
+```bash
+uv tool install --reinstall 'remoteslurm[tui] @ git+https://github.com/bbuchsbaum/remoteslurm'
+```
+
+From a clone, use `uv tool install --reinstall '.[tui]'`. The base installation keeps the
+CLI, MCP server, Python API, and plain-text viewer available without Textual.
 
 Nothing needs to be installed on the cluster. The login node needs Python 3.6 or newer and the
 usual Slurm command-line tools. Project `sync` needs rsync 3.1 or newer locally; `put` and `get`
 use rsync on both ends for directories and files larger than 4 MiB.
 
 ## Connect to a cluster
-
-To watch remote work while Claude Code or Codex stays in its own terminal, use a
-second local terminal:
-
-```bash
-rslurm connect mycluster --view --project analysis
-# Or attach after authentication:
-rslurm -H mycluster view analysis
-```
-
-The viewer shows recorded jobs, files, bounded log previews, and activity. `q`
-closes the view; workspace monitoring continues until
-`rslurm -H mycluster monitor remove --project analysis`. Both terminals use the
-same local configuration and state directory. Agents read the same observations
-with `workspace` and `activity`; the agent itself stays local.
-See the [terminal workspace guide](docs/terminal-workspace.md) for offline/plain
-modes, installation, keyboard controls, and observation limits.
 
 First make sure a normal SSH alias reaches the cluster. For an MFA-protected cluster, configure a
 persistent OpenSSH master so authentication happens in a visible terminal instead of a hidden
@@ -90,6 +82,38 @@ rslurm info
 connecting. `REMOTESLURM_CONFIG` or the global `--config` option selects a different file.
 `doctor` checks the SSH setup, remote Python, stub startup, a writable remote home, and the Slurm
 command-line tools.
+
+## Watch remote work in another terminal
+
+Keep Claude Code or Codex in one terminal and launch the viewer in a second local terminal:
+
+```bash
+# Authenticate, then view a configured project:
+rslurm connect mycluster --view --project analysis
+
+# Attach using the existing connection, or browse a remote directory directly:
+rslurm -H mycluster view analysis
+rslurm -H mycluster view --path /scratch/user/analysis
+
+# Read retained observations without SSH; use --plain for scrolling text:
+rslurm -H mycluster view analysis --offline --plain
+```
+
+Work, Files, Logs, and Activity tabs show known jobs, file trees, bounded previews, and recorded
+events. Use arrows and Enter to navigate files, `/` to enter a remote path, and `q` or Ctrl-C to
+close the viewer. Closing it leaves jobs and background observation running; to stop observing
+this project, run `rslurm -H mycluster monitor remove --project analysis`.
+
+Both terminals share local configuration and state. The daemon shares collection across
+readers and resumes observation after restart. Agents read the same cached facts through
+`workspace`, `activity`, and `monitor_status`, and request file inspection with `workspace_inspect`.
+Readers retain independent cursors. The observer never submits, retries, cancels, or validates work.
+
+Scheduler completion, output presence, and validation are separate states; `NOT_RUN` means no
+validator has run. Missing or stale evidence remains visible. The viewer follows registered jobs
+and enrolled campaigns; it does not discover arbitrary jobs submitted outside remoteslurm.
+See the [terminal workspace guide](docs/terminal-workspace.md) for project selection, observation
+limits, offline behavior, and the shared-state requirements for agents in containers.
 
 ## Use it from a coding agent
 
@@ -166,6 +190,8 @@ suitable for a project's `CLAUDE.md` or `AGENTS.md`; it is the same text as the
 
 | Goal | Commands |
 |---|---|
+| Watch work and browse files beside a coding agent | `connect --view`, `view`, `monitor` |
+| Read shared observations and activity | `workspace`, `workspace-inspect`, `activity` |
 | Inspect the remote workspace | `info`, `ls`, `cat`, `tail`, `grep`, `find`, `diff` |
 | Move or update work | `sync`, `put`, `get`, `edit` |
 | Run work through Slurm | `submit`, `pack`, `sweep`, `run --compute` |
@@ -434,7 +460,9 @@ APIs.
 `remoteslurm-mcp` is a stdio MCP server. Its default `core` tool set covers cluster information,
 bounded file reading and editing, login-node and compute execution, detached processes,
 submission, `adopt`, `ensure`, `pack`, job listing, waiting and watches, diagnosis,
-synchronization, cancellation, connection state, and all campaign tools. Set
+synchronization, cancellation, connection state, and all campaign tools.
+The core set also includes the local readers `workspace`, `activity`, and `monitor_status`,
+plus the queued file-inspection tool `workspace_inspect`. Set
 `REMOTESLURM_MCP_TOOLS=all` to add `glob`, `diff`, `job_output`, `sinfo`, `projects`, `sweep`,
 `queue_info`, `quota`, and `events`.
 
@@ -543,7 +571,7 @@ Set `REMOTESLURM_DEBUG=1` for additional local error detail.
 git clone https://github.com/bbuchsbaum/remoteslurm
 cd remoteslurm
 uv venv
-uv pip install -e '.[dev]'
+uv pip install -e '.[dev,tui]'
 uv run --no-sync pytest -q
 uv run --no-sync ruff check src tests
 uv run --no-sync ruff format --check src tests
@@ -573,6 +601,15 @@ The campaign live test also requires `REMOTESLURM_LIVE_CWD`. It exercises lost-r
 recovery, mixed array outcomes, packed markers, concurrent retry authorization, verified per-unit
 dependency release, and cancellation with isolated campaigns and work directories. Set
 `REMOTESLURM_LIVE_EVIDENCE` to write its machine-readable qualification receipt.
+
+The observation lifecycle specimen, `tests/live/test_activity_observation.py`, requires explicit
+`REMOTESLURM_LIVE_HOST`, `REMOTESLURM_LIVE_CWD`, and `REMOTESLURM_LIVE_TIME`. It submits a small
+array and a mixed-result pack, exits the submitting processes, and restarts an isolated daemon
+to verify passive recovery and exact output receipts. Its remote fixtures are retained as evidence.
+The [qualification report](docs/qualification/activity-observation.md) records 726 passing local
+tests and a separately passing authorized Nibi lifecycle on candidate `8bc5a6a`, with portable
+receipts. Local tests, terminal checks, live qualification, hosted CI, and releases are recorded
+separately.
 
 Design history lives in [docs/plans](docs/plans/).
 
