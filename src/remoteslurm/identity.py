@@ -17,8 +17,8 @@ def source_sha() -> str:
     """Hash the loaded package sources so same-version editable builds remain distinguishable."""
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent
-    for path in sorted(root.glob("*.py")):
-        digest.update(path.name.encode("utf-8") + b"\0")
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()[:16]

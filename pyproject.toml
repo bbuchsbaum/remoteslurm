@@ -19,6 +19,7 @@ Repository = "https://github.com/bbuchsbaum/remoteslurm"
 Issues = "https://github.com/bbuchsbaum/remoteslurm/issues"
 
 [project.optional-dependencies]
+tui = ["textual>=8.2,<9"]
 dev = [
   "pytest>=8",
   "pytest-timeout>=2.3",

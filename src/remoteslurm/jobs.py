@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import slurm
+from .activity.producer import accepted, operation
 from .config import Template, state_dir
 from .errors import (
     ConfirmationRequired,
@@ -539,6 +540,7 @@ class Job:
         self.recorded = recorded
         self.registry_error = registry_error
         self.metadata = metadata or {}
+        self.activity_recorded = True
 
     def submission(self) -> dict[str, Any]:
         """Machine-readable scheduler/local-registry outcome for this handle."""
@@ -552,6 +554,8 @@ class Job:
                 registry_error=self.registry_error,
                 recovery=f"rslurm adopt {self.job_id}",
             )
+        if not self.activity_recorded:
+            out["activity_recorded"] = False
         return out
 
     def __repr__(self) -> str:
@@ -659,6 +663,7 @@ class SlurmOps:
             self._registry_error = f"{e.message}: {cause}" if cause else e.message
 
     # -- submit ---------------------------------------------------------------------------
+    @operation("job.submit")
     def submit(
         self,
         script: str | None = None,
@@ -741,10 +746,12 @@ class SlurmOps:
             # never match the allow-list, so nothing is written for them.
             append_learned_notes(self.host.name, slurm.match_policy_lines(res.get("stderr", "")))
             raise
+        activity_recorded = accepted(self, job_id, cwd=cwd, name=name or opts.get("job_name"))
         rec = JobRecord(
             job_id=job_id,
             name=name or opts.get("job_name"),
             script_path=res.get("script_path"),
+            workdir=cwd,
             submit_time=time.time(),
             last_state="PENDING",
             last_seen=time.time(),
@@ -762,7 +769,7 @@ class SlurmOps:
             sc = self.scontrol_job(job_id)
             rec.stdout_path = sc.get("StdOut") or None
             rec.stderr_path = sc.get("StdErr") or None
-            rec.workdir = sc.get("WorkDir") or None
+            rec.workdir = sc.get("WorkDir") or cwd
             rec.name = rec.name or sc.get("JobName")
         except RemoteSlurmError:
             pass
@@ -778,18 +785,21 @@ class SlurmOps:
             registry_error = self.registry_error
         self.registry.audit("submit", job_id=job_id, script=rec.script_path, args=flags)
         self._invalidate_squeue()
-        return Job(
+        job = Job(
             self,  # type: ignore[arg-type]
             job_id,
             recorded=recorded,
             registry_error=registry_error,
         )
+        job.activity_recorded = activity_recorded
+        return job
 
     # -- raw queries -----------------------------------------------------------------------
     def _invalidate_squeue(self) -> None:
         with self._squeue_lock:
             self._squeue_cache = None
 
+    @operation("job.adopt")
     def adopt(self, job_id: str) -> Job:
         """Reconstruct a local registry record for an existing scheduler job."""
         base, task = slurm.parse_job_id(job_id)
@@ -1515,6 +1525,7 @@ class SlurmOps:
                 )
             time.sleep(poll)
 
+    @operation("job.cancel")
     def cancel(self, job_id: str | list[str], *, confirm: bool = False) -> dict[str, Any]:
         ids = [job_id] if isinstance(job_id, str) else list(job_id)
         for j in ids:
@@ -1604,6 +1615,7 @@ class SlurmOps:
         return re.sub(r"%([AaJjxuN])", lambda m: mapping[m.group(1)], path)
 
     # -- packed jobs / sweeps -----------------------------------------------------------------
+    @operation("job.pack")
     def pack(
         self,
         commands: list[str],
@@ -1712,6 +1724,7 @@ class SlurmOps:
         )
         return job
 
+    @operation("job.sweep")
     def sweep(
         self,
         params: dict[str, list[Any]] | list[dict[str, Any]],

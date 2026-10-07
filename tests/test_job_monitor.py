@@ -18,7 +18,7 @@ def setup_monitor(tmp_path, monkeypatch):
     calls = []
 
     def collect(c, ids):
-        assert c is cluster
+        assert c.cluster is cluster
         calls.append(ids)
         return {jid: snapshots.get(jid, state("UNKNOWN")) for jid in ids}
 

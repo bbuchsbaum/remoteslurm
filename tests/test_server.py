@@ -15,6 +15,10 @@ from remoteslurm.errors import NotFound
 from remoteslurm.slurm import JobStatus
 
 CORE_EXPECTED = {
+    "activity",
+    "monitor_status",
+    "workspace",
+    "workspace_inspect",
     "info",
     "ls",
     "read",

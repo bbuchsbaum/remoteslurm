@@ -73,6 +73,75 @@ def test_campaign_store_compare_and_swap_conflict(cluster) -> None:
         )
 
 
+def test_snapshot_pages_stay_on_original_commit_during_concurrent_update(cluster, monkeypatch):
+    store = CampaignStore(cluster)
+    _put_run(store)
+    first = {"campaign": "study", "run_id": "run-1", "units": [{"unit_id": "old"}]}
+    second = {**first, "units": [{"unit_id": "new"}]}
+    store.commit(
+        "study",
+        "run-1",
+        expected_revision=0,
+        transaction_id="old",
+        events=[],
+        documents=store.snapshot_documents(first),
+    )
+    real_read = store.read_document
+
+    def read(name, run, document="summary.json", **kwargs):
+        result = real_read(name, run, document, **kwargs)
+        if document == "summary.json":
+            store.commit(
+                "study",
+                "run-1",
+                expected_revision=1,
+                transaction_id="new",
+                events=[],
+                documents=store.snapshot_documents(second),
+            )
+        return result
+
+    monkeypatch.setattr(store, "read_document", read)
+    result = store.read_complete_snapshot("study", "run-1")
+    assert result["store"]["transaction_id"] == "old"
+    assert result["units"] == [{"unit_id": "old"}]
+
+
+def test_forward_changes_bounded_and_legacy_cursor_unchanged(cluster):
+    store = CampaignStore(cluster)
+    _put_run(store)
+    for i in range(10):
+        store.commit(
+            "study",
+            "run-1",
+            expected_revision=i,
+            transaction_id=f"tx-{i}",
+            events=[{"type": f"event-{i}"}],
+            documents={"summary.json": {"i": i}},
+        )
+    base = dict(campaign_dir=store.campaign_dir, name="study", run_id="run-1")
+    page = cluster.call("campaign_changes", **base)
+    assert [c["revision"] for c in page["changes"]] == list(range(1, 9))
+    assert page["has_more"] and page["coverage"] == "complete"
+    tail = cluster.call("campaign_changes", **base, after=page["next_after"])
+    assert [c["revision"] for c in tail["changes"]] == [9, 10]
+    assert not tail["has_more"]
+    assert store.events("study", "run-1", limit=1)["events"][0]["type"] == "event-9"
+    gap = cluster.call("campaign_changes", **base, after="missing")
+    assert gap["coverage"] == "gap"
+
+
+def test_absent_canonical_ledger_read_creates_nothing(cluster, sandbox):
+    store = CampaignStore(cluster)
+    _put_run(store)
+    path = sandbox / ".remoteslurm/campaigns/study/runs/run-1/execution"
+    result = cluster.call(
+        "campaign_ledger_read", campaign_dir=store.campaign_dir, name="study", run_id="run-1"
+    )
+    assert not result["available"] and result["groups"] == []
+    assert not path.exists()
+
+
 def test_campaign_events_follow_only_committed_head_history(cluster) -> None:
     store = CampaignStore(cluster)
     _put_run(store)

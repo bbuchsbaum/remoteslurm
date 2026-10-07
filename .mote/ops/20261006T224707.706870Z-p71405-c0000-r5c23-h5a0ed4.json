@@ -1,0 +1,1 @@
+{"actor":"codex-workspace-impl","entity":"bd-01M49EP40GJ70ZXNCA6NG56ZTE","kind":"reserve_open","mode":"exclusive","op":"20261006T224707.706870Z-p71405-c0000-r5c23-h5a0ed4","paths":["src/remoteslurm/tui/app.py","tests/test_workspace_tui.py","docs/terminal-workspace.md"],"reservation_id":"rv-01M49PCD5T7TACCRBA06KQFB3M","ts":"2026-10-06T22:47:07.706870Z","ttl_s":3600,"v":2}

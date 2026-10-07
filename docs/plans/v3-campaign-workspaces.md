@@ -1251,6 +1251,11 @@ layer across ordinary jobs, durable tasks, and campaigns. It proposes splitting 
 WP8a (shared activity and persistent observation) and WP8b (resource interpretation), with explicit
 provenance, recovery, and multi-consumer acceptance gates. That split remains proposed.
 
+The [local terminal workspace plan](terminal-workspace.md) specifies the separate
+user terminal beside Claude Code or Codex, shared workspace snapshots for agents,
+bounded file/log inspection, and `connect --view`. It builds on WP8a and has its
+own Mote epic; it does not require the resource-advice work below.
+
 Extend WP3's current-sample summary with foreground monitoring, telemetry retention/rollups,
 interval calculations, and pure advice rules.
 

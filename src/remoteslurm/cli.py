@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .activity.producer import operation
 from .cluster import Cluster
 from .config import EXAMPLE_CONFIG, Config, config_path, state_dir
 from .errors import InvalidArgument, NotConnected, RemoteSlurmError, SlurmError
@@ -49,6 +50,12 @@ def emit(args: argparse.Namespace, data: Any, human: Callable[[Any], None] | Non
 
 
 def _warn_unrecorded(job: Any) -> None:
+    if not getattr(job, "activity_recorded", True):
+        print(
+            f"WARNING: job {job.job_id} accepted; activity recording unavailable. "
+            "Do not resubmit it.",
+            file=sys.stderr,
+        )
     if job.recorded:
         return
     print(
@@ -143,11 +150,231 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------------- commands
+def cmd_activity(args: argparse.Namespace) -> int:
+    from .activity.reader import event_line, follow, parse_since
+    from .activity.store import ActivityStore
+
+    store = ActivityStore()
+    query = dict(host=args.host, after=args.after, since=parse_since(args.since), limit=args.limit)
+    pages = follow(store, **query) if args.follow else iter([store.query(**query)])
+    try:
+        for page in pages:
+            if args.json:
+                print(json.dumps(page, separators=(",", ":")), flush=True)
+            else:
+                if page["history_gap"]:
+                    print("[history gap: retained observations follow]", flush=True)
+                if page["history_truncated"]:
+                    print("[showing latest activity; use --since for older retained history]")
+                for event in page["events"]:
+                    print(event_line(event), flush=True)
+                if not args.follow:
+                    print(f"resume cursor: {page['next_cursor']}", file=sys.stderr)
+    except (KeyboardInterrupt, BrokenPipeError):
+        return EXIT_OK
+    return EXIT_OK
+
+
+def _view_preflight(args: argparse.Namespace) -> None:
+    if not getattr(args, "plain", False):
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise InvalidArgument(
+                "interactive view requires a terminal; use `view --plain` or `workspace --json`"
+            )
+        try:
+            from .tui.app import WorkspaceApp  # noqa: F401
+        except ImportError as exc:
+            raise InvalidArgument(
+                "terminal UI extra is not installed",
+                action="install this checkout with `uv pip install -e '.[tui]'`",
+            ) from exc
+
+
+def _workspace(args: argparse.Namespace, *, online: bool = False) -> dict:
+    from .workspace.service import select
+
+    cfg = Config.load(Path(args.config) if args.config else None)
+    cluster = get_cluster(args) if online else None
+    return select(
+        cfg, args.host, getattr(args, "project", None), getattr(args, "path", None), cluster=cluster
+    )
+
+
+def cmd_workspace(args: argparse.Namespace) -> int:
+    from .workspace.service import snapshot
+
+    emit(args, snapshot(_workspace(args), after=args.after))
+    return EXIT_OK
+
+
+def cmd_workspace_inspect(args: argparse.Namespace) -> int:
+    from .workspace.service import inspect_request
+
+    workspace = _workspace(args)
+    emit(
+        args,
+        inspect_request(
+            workspace,
+            args.kind,
+            args.file,
+            request_id=args.request_id,
+            offset=args.offset,
+            token=args.token,
+        ),
+    )
+    return EXIT_OK
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    from .activity.monitor import control, enroll, policy, status
+    from .workspace.service import snapshot, subscribe
+
+    if args.action in {"enable", "disable"}:
+        policy(
+            **{
+                k: v
+                for k, v in {
+                    "scheduler_seconds": args.poll,
+                    "max_calls": args.max_calls,
+                    "read_seconds": args.read_timeout,
+                }.items()
+                if v is not None
+            }
+        )
+        control(args.action == "enable")
+        if args.action == "enable":
+            from .daemon import daemon_available, spawn_daemon
+
+            cfg = Config.load(Path(args.config) if args.config else None)
+            if args.project or args.path:
+                subscribe(_workspace(args, online=True))
+            if not daemon_available() and not spawn_daemon(config_path=cfg.path):
+                raise RemoteSlurmError("local observer could not start")
+        emit(args, status(args.host))
+        return EXIT_OK
+    if args.campaign:
+        if args.action in {"watch", "remove"}:
+            cfg = Config.load(Path(args.config) if args.config else None)
+            enroll(
+                cfg.host(args.host),
+                args.campaign,
+                args.run_id or "",
+                enabled=args.action == "watch",
+            )
+            if args.action == "watch":
+                from .daemon import daemon_available, spawn_daemon
+
+                if not daemon_available() and not spawn_daemon(config_path=cfg.path):
+                    raise RemoteSlurmError("local observer could not start")
+        emit(args, status(args.host))
+        return EXIT_OK
+    if args.action == "status" and not args.project and not args.path:
+        emit(args, status(args.host))
+        return EXIT_OK
+    if args.action == "watch":
+        raise InvalidArgument("monitor watch requires --campaign NAME --run-id RUN")
+    workspace = _workspace(args)
+    if args.action == "remove":
+        workspace = subscribe(workspace, False)
+    emit(args, snapshot(workspace))
+    return EXIT_OK
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    from . import daemon
+    from .activity.reader import event_line, safe_text
+    from .workspace import service
+
+    _view_preflight(args)
+    offline = args.offline or args.no_daemon or bool(os.environ.get(daemon.ENV_NO_DAEMON))
+    cfg = Config.load(Path(args.config) if args.config else None)
+    if not args.project and not args.path:
+        from .sync import resolve_project
+
+        try:
+            args.project = resolve_project(cfg.host(args.host), None, Path.cwd()).name
+        except RemoteSlurmError:
+            choices = sorted(cfg.host(args.host).projects)
+            if args.plain or not choices:
+                raise InvalidArgument(
+                    "select a configured project or pass --path REMOTE_ROOT"
+                ) from None
+            for index, name in enumerate(choices, 1):
+                print(f"{index}. {safe_text(name)}")
+            answer = input("Project number: ").strip()
+            if not answer.isdigit() or not 1 <= int(answer) <= len(choices):
+                raise InvalidArgument("no project selected") from None
+            args.project = choices[int(answer) - 1]
+    try:
+        workspace = _workspace(args, online=not offline)
+    except NotConnected as exc:
+        workspace = _workspace(args)
+        offline = True
+        print(safe_text(exc), file=sys.stderr)
+    if not offline:
+        workspace = service.subscribe(workspace)
+        if not daemon.daemon_available() and not daemon.spawn_daemon(config_path=cfg.path):
+            print("Observer unavailable; showing cached state.", file=sys.stderr)
+        print(
+            "Monitoring continues after closing this view. Stop it with: "
+            + shlex.join(
+                [
+                    "rslurm",
+                    "-H",
+                    workspace["host"],
+                    "monitor",
+                    "remove",
+                    *(
+                        ["--project", workspace["project"]]
+                        if workspace["project"]
+                        else ["--path", workspace["source_root"]]
+                    ),
+                ]
+            ),
+            file=sys.stderr,
+        )
+    if args.plain:
+        cursor = None
+        if not args.json:
+            print(f"{workspace['host']}:{safe_text(workspace['remote_root'])}", flush=True)
+        try:
+            while True:
+                page = service.snapshot(workspace, after=cursor)
+                cursor = None if page["resync_required"] else page["next_cursor"]
+                if args.json:
+                    print(json.dumps(page), flush=True)
+                else:
+                    health = page["monitor"]
+                    print(f"[{health['state']} | age {health['age_seconds']}s]", flush=True)
+                    for event in page["events"]:
+                        print(event_line(event), flush=True)
+                if offline:
+                    break
+                time.sleep(5)
+        except (KeyboardInterrupt, BrokenPipeError):
+            pass
+    else:
+        from .tui.app import WorkspaceApp
+
+        WorkspaceApp(workspace, offline=offline).run()
+    return EXIT_OK
+
+
 def cmd_connect(args: argparse.Namespace) -> int:
+    if getattr(args, "view", False):
+        _view_preflight(args)
     cfg = Config.load(Path(args.config) if args.config else None)
     host = cfg.host(args.host_name or args.host)
+    if getattr(args, "view", False) and args.project:
+        from .sync import resolve_project
+
+        resolve_project(host, args.project, Path.cwd())  # Refuse typos before authentication.
     if host.ssh == "local":
         print("local host needs no connection")
+        if getattr(args, "view", False):
+            args.host = host.name
+            args.plain, args.offline, args.path = False, False, None
+            return cmd_view(args)
         return EXIT_OK
     t = SSHTransport(
         alias=host.ssh,
@@ -179,6 +406,10 @@ def cmd_connect(args: argparse.Namespace) -> int:
     print(f"✓ stub running on {info['hostname']} (python {info['python']}, {ms:.0f} ms round-trip)")
     if info.get("slurm_version"):
         print(f"✓ {info['slurm_version']}")
+    if getattr(args, "view", False):
+        args.host = host.name
+        args.plain, args.offline, args.path = False, False, None
+        return cmd_view(args)
     return EXIT_OK
 
 
@@ -569,7 +800,7 @@ def cmd_put(args: argparse.Namespace) -> int:
         return _rsync(c, source, dest, to_remote=True, args=args)
     if dest.endswith("/"):
         dest = dest + src.name
-    r = c.write(dest, src.read_bytes(), force=args.force)
+    r = _transfer_bytes(c, str(src), dest, to_remote=True, force=args.force)
     emit(
         args,
         r,
@@ -587,13 +818,11 @@ def cmd_get(args: argparse.Namespace) -> int:
         return _rsync(c, src, str(dest), to_remote=False, args=args)
     if dest.is_dir():
         dest = dest / Path(st["path"]).name
-    data = c.read_bytes(src, max_bytes=4 * 1024 * 1024 + 1)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(data)
+    result = _transfer_bytes(c, st["path"], str(dest), to_remote=False)
     emit(
         args,
-        {"path": str(dest), "size": len(data)},
-        lambda r: print(f"✓ {c.host.name}:{st['path']} -> {dest} ({fmt_size(len(data))})"),
+        result,
+        lambda r: print(f"✓ {c.host.name}:{st['path']} -> {dest} ({fmt_size(r['size'])})"),
     )
     return EXIT_OK
 
@@ -650,6 +879,20 @@ def cmd_diff(args: argparse.Namespace) -> int:
     return EXIT_OK if r["identical"] else EXIT_ERROR
 
 
+@operation("transfer.bytes")
+def _transfer_bytes(
+    c: Cluster, src: str, dest: str, *, to_remote: bool, force: bool = False
+) -> dict:
+    if to_remote:
+        return c.write(dest, Path(src).read_bytes(), force=force)
+    data = c.read_bytes(src, max_bytes=4 * 1024 * 1024 + 1)
+    destination = Path(dest)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(data)
+    return {"path": str(destination), "size": len(data), "remote": src}
+
+
+@operation("transfer.rsync")
 def _rsync(c: Cluster, src: str, dest: str, *, to_remote: bool, args: argparse.Namespace) -> int:
     from . import sync as sync_mod
 
@@ -2310,9 +2553,53 @@ def build_parser() -> argparse.ArgumentParser:
             help="maximum directory depth scanned for progress files (default: 10)",
         )
 
+    sp = add("activity", cmd_activity, "read the local activity journal (no SSH)")
+    sp.add_argument("--after", help="independent resume cursor")
+    sp.add_argument("--since", help="ingestion time: 30m or ISO timestamp with timezone")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--follow", action="store_true", help="follow local activity; JSON emits JSONL")
+
     sp = add("connect", cmd_connect, "establish the persistent ssh connection (do MFA once)")
     sp.add_argument("host_name", nargs="?")
     sp.add_argument("--force", action="store_true", help="tear down and re-establish the master")
+    sp.add_argument(
+        "--view", action="store_true", help="open the local workspace view after connecting"
+    )
+    sp.add_argument("--project", help="workspace project to view")
+
+    for name, fn, help_text in (
+        ("view", cmd_view, "view remote work in this local terminal"),
+        ("workspace", cmd_workspace, "read a cached workspace snapshot or changes"),
+        ("workspace-inspect", cmd_workspace_inspect, "request bounded workspace inspection"),
+        ("monitor", cmd_monitor, "inspect or stop workspace monitoring"),
+    ):
+        sp = add(name, fn, help_text)
+        if name == "monitor":
+            sp.add_argument("action", choices=["enable", "disable", "status", "watch", "remove"])
+            sp.add_argument("--project")
+            sp.add_argument("--campaign")
+            sp.add_argument("--run-id")
+            sp.add_argument("--poll", type=int, help="scheduler cadence, 30..3600 seconds")
+            sp.add_argument("--max-calls", type=int, help="remote calls per host/30s, 1..8")
+            sp.add_argument("--read-timeout", type=int, help="read deadline, 1..10 seconds")
+        else:
+            sp.add_argument("project", nargs="?")
+        sp.add_argument("--path", help="explicit remote workspace root")
+        if name == "view":
+            sp.add_argument("--offline", action="store_true")
+            sp.add_argument("--plain", action="store_true")
+        elif name == "workspace":
+            sp.add_argument("--after")
+        elif name == "workspace-inspect":
+            sp.add_argument(
+                "--kind", choices=["list", "preview", "tail", "refresh"], default="list"
+            )
+            sp.add_argument(
+                "--file", default=".", help="path relative to the workspace, or absolute"
+            )
+            sp.add_argument("--request-id")
+            sp.add_argument("--offset", type=int, default=0)
+            sp.add_argument("--token")
 
     sp = add("doctor", cmd_doctor, "diagnose ssh config, connection, remote python and Slurm tools")
     sp.add_argument("host_name", nargs="?")
@@ -2906,8 +3193,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .activity.producer import CLIENT
+
     parser = build_parser()
     args = parser.parse_args(argv)
+    token = CLIENT.set("cli")
     try:
         return int(args.func(args))
     except NotConnected as e:
@@ -2923,6 +3213,8 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except BrokenPipeError:
         return EXIT_OK
+    finally:
+        CLIENT.reset(token)
 
 
 def _report_error(args: argparse.Namespace, e: RemoteSlurmError) -> None:

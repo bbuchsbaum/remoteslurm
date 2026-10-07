@@ -325,12 +325,13 @@ def _remember_job(cluster: Cluster, record: Mapping[str, Any], attempt: Mapping[
             "durable_attempt_id": attempt.get("attempt_id"),
             "progress": (record.get("contract") or {}).get("progress"),
         },
+        workdir=(record.get("contract") or {}).get("cwd"),
     )
     try:
         sc = cluster.scontrol_job(str(job_id))
         rec.stdout_path = sc.get("StdOut") or None
         rec.stderr_path = sc.get("StdErr") or None
-        rec.workdir = sc.get("WorkDir") or None
+        rec.workdir = sc.get("WorkDir") or rec.workdir
     except RemoteSlurmError:
         pass
     try:
@@ -355,6 +356,9 @@ def _update(
         _timeout=60,
         **fields,
     )
+    from .activity.recovery import task_record
+
+    task_record(cluster, dict(result["record"]))
     return dict(result["record"])
 
 
@@ -403,6 +407,29 @@ def ensure_task(
         )
     control = submission_control(cluster)
     resolved = _resolve(cluster, parsed)
+    from .activity.model import Subject
+    from .activity.producer import capture, target_id
+    from .activity.semantic import key
+
+    capture(
+        cluster,
+        "submission.intent_recorded",
+        {"task_id": resolved["task_id"], "name": parsed.name, "workdir": resolved["cwd"]},
+        subject=Subject(target_id(cluster.host), cluster.host.name, task_id=resolved["task_id"]),
+        documents=(
+            (
+                "task",
+                key(target_id(cluster.host), resolved["task_id"]),
+                {
+                    "task_id": resolved["task_id"],
+                    "target_id": target_id(cluster.host),
+                    "host": cluster.host.name,
+                    "workdir": resolved["cwd"],
+                    "created_at": time.time(),
+                },
+            ),
+        ),
+    )
     remote = cluster.call(
         "task_ensure",
         task_id=resolved["task_id"],
@@ -419,6 +446,9 @@ def ensure_task(
         _timeout=180,
     )
     record = dict(remote["record"])
+    from .activity.recovery import task_record
+
+    task_record(cluster, record)
     attempt = _current(record)
     base = {
         "task_id": resolved["task_id"],

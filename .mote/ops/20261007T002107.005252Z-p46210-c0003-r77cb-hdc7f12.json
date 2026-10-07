@@ -1,0 +1,1 @@
+{"actor":"codex-workspace-impl","entity":"bd-01M2ZFDAMWRPBSMTBP1AV1VMBE","kind":"note","note_kind":"progress","op":"20261007T002107.005252Z-p46210-c0003-r77cb-hdc7f12","text":"Finish bounded read-only canonical ledger and pinned history recovery; atomic local checkpoints, no remote mutations.","ts":"2026-10-07T00:21:07.005252Z","v":1}

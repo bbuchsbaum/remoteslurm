@@ -9,3 +9,5 @@ build/
 .ruff_cache/
 .coverage
 htmlcov/
+.mote/local/
+.mote/cache/

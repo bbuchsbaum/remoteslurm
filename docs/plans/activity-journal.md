@@ -1,14 +1,24 @@
 # Shared activity journal and local monitor
 
-Status: proposed; implementation has not started. Reviewed on 2026-09-20 against
-`c70e37e6b4323e96c61c7ad9f40793148363cda4`.
+Status updated 2026-10-06: A0 semantics/attention and A1 journal/local readers are implemented.
+Shared producers, commit-pinned semantic cards, passive canonical-ledger/history recovery,
+independent bounded sources and persistent monitor controls are implemented. The terminal
+workspace observer shares their daemon owner and budgets. Automated qualification is being
+completed; exact-candidate live qualification remains a separate gate. See
+[qualification](../qualification/activity-observation.md) for the current evidence.
+
+The original review below was performed on 2026-09-20 against
+`c70e37e6b4323e96c61c7ad9f40793148363cda4` and is historical evidence. See the
+[activity contract](../activity-contract.md) for the implemented boundary and
+the [terminal workspace plan](terminal-workspace.md) for the new user/agent view.
 
 ## Recommendation
 
 Build a shared local activity journal, a daemon-owned observer, and a terminal feed. Campaigns
 are the richest initial consumer; ordinary submissions, arrays, packs, and durable tasks use the
-same event envelope. Put a bounded MCP reader in the first release. Defer the dashboard, resource
-advice, and general filesystem/command auditing.
+same event envelope. Put a bounded MCP reader in the first release. The terminal
+workspace plan adds a consumer of this foundation; its UI is outside A1–A4.
+Resource advice and general filesystem/command auditing remain separate work.
 
 The journal is the source for activity views, not the authority for execution. Remote execution
 ledgers, committed campaign history, scheduler evidence, and validation receipts retain their
@@ -20,7 +30,7 @@ successful outcome.
 It does not mean a synchronized multi-machine activity service. Other machines' committed
 campaign history can be imported; their unrecorded local intentions cannot be reconstructed.
 
-## Review of the current implementation
+## Historical review of the implementation on 2026-09-20
 
 | Existing seam | What the code provides | Consequence for this proposal |
 | --- | --- | --- |
@@ -33,10 +43,11 @@ campaign history can be imported; their unrecorded local intentions cannot be re
 | [`evidence.py`](../../src/remoteslurm/evidence.py), [`reconcile.py`](../../src/remoteslurm/reconcile.py) | Source availability, observation timestamps, identity correlation, and separate state axes. | Reuse these contracts and reconciliation rules; do not create a second interpretation of Slurm state. |
 | [`server.py`](../../src/remoteslurm/server.py) | MCP connects directly through `Cluster.connect`; it does not necessarily use the CLI daemon. Legacy `events` is outside the default core tool set. | Daemon-only interception misses MCP activity. Instrument shared domain operations and expose the new local reader in the core set. |
 
-One existing projection needs correction before it becomes the attention feed. Direct local calls
+The projection needed correction at the time of this review; A0 has since repaired
+it. The historical direct local calls
 to `_next_action` produced:
 
-| Execution / artifacts / freshness | Current result |
+| Execution / artifacts / freshness | Result at review time |
 | --- | --- |
 | `COMPLETED / MISSING / FRESH`, validation `NOT_RUN` | `complete`: “No unresolved work remains.” |
 | `CANCELLED / MISSING / FRESH`, validation `NOT_RUN` | `complete`: “No unresolved work remains.” |
@@ -174,6 +185,12 @@ request-handler threads. Hold one monitor ownership lock per local state namespa
 of socket overrides. A second daemon may serve requests but cannot start a duplicate observer.
 Local activity reads work with no daemon and no SSH connection.
 
+Integration update, 2026-10-06: `job_monitor.py` now provides persistent narrow
+job watches owned by the daemon. Share scheduling and collection with that
+monitor while preserving its conditions and notifications; do not introduce a
+second scheduler loop for the same jobs. The terminal workspace plan adds scoped
+workspace subscriptions and deduplicated bounded inspection requests to A3.
+
 Enable monitoring explicitly per host. Enabling enrolls known active registry jobs, discoverable
 open runs, and closed runs with unresolved retained attempts. Page campaign discovery slowly;
 do not list every Slurm job. New submissions/adoptions on an enabled host persist a subscription
@@ -223,11 +240,14 @@ large scans cannot starve status checks. Partial coverage is expected when these
 publish backlog and age rather than promising every unit was refreshed within 30 seconds. Tune
 these defaults from qualification evidence without removing hard limits.
 
-Extract collection from reconciliation and persistence instead of repeatedly calling today's
-whole-run `_refresh`. Reuse the extracted collector for explicit status refresh as well. Persist
-campaign observation changes coherently at a pinned revision, with bounded CAS retry. Unchanged
-polls update local observation health without rewriting all remote campaign views. Preserve useful
-freshness checkpoints at a slower rate and retain exact references for any committed change.
+Extract collection from reconciliation and persistence instead of repeatedly
+calling the whole-run `_refresh`. Reuse the extracted collector for explicit
+status refresh as well. The observer and passive recovery persist observations
+only in local state; they never update the remote execution ledger or commit
+campaign history. This follows the corrected WP8a Mote decision of 2026-09-20.
+An explicit existing `campaign status --refresh` may reconcile and commit through
+its own API. Until then, show a campaign projection that lags local evidence as
+stale. Unchanged polls update observation health without remote revisions.
 
 On authentication or transport failure, emit one suspended event, back off, retain last evidence
 with its original age, and report the existing structured reconnect action. Never attempt MFA.
@@ -311,5 +331,6 @@ failure grouping, and packing advice. The activity foundation can proceed alongs
 it uses current bounded primitives and does not require deployment or broad filesystem features.
 Existing WP4/WP5 qualification gaps remain independently open.
 
-A dashboard later consumes the same query and projection contract. It introduces no independent
-scheduler polling, authorization logic, or alternative definition of completion.
+The [terminal workspace plan](terminal-workspace.md) consumes the same query and
+projection contract. It introduces no independent scheduler polling,
+authorization logic, or alternative definition of completion.

@@ -211,8 +211,31 @@ def collect(cluster: Cluster, ids: list[str]) -> dict[str, dict[str, Any]]:
                 "terminal": terminal,
                 "failed": terminal and (state != "COMPLETED" or code not in (None, 0)),
                 "exit_code": code,
+                "name": rec.get("name"),
+                "submit_time": rec.get("submit_time"),
+                "observed_at": time.time(),
+                "elapsed": rec.get("elapsed") or rec.get("time_used"),
+                "allocated_cpus": int(rec["alloc_cpus"])
+                if str(rec.get("alloc_cpus", "")).isdigit()
+                else None,
             }
     return out
+
+
+def shared_collect(
+    cluster: Cluster, ids: list[str], *, force: bool = False
+) -> dict[str, dict[str, Any]]:
+    """Reuse this owner's recent sample for overlapping watch/workspace subscriptions."""
+    now = time.time()
+    cached = getattr(cluster, "_monitor_sample", None)
+    if not force and cached is not None and 0 <= now - cached[0] < 30:
+        missing = sorted(set(ids) - cached[1].keys())
+        merged = {**cached[1], **(collect(cluster, missing) if missing else {})}
+        cluster._monitor_sample = (cached[0], merged)  # type: ignore[attr-defined]
+        return {jid: dict(merged[jid]) for jid in ids}
+    result = collect(cluster, ids)
+    cluster._monitor_sample = (now, result)  # type: ignore[attr-defined]
+    return result
 
 
 class JobMonitor:
@@ -222,10 +245,21 @@ class JobMonitor:
         get_cluster: Callable[[str], Cluster],
         get_host: Callable[[str], HostConfig],
     ):
-        self.store, self.get_cluster, self.get_host = store, get_cluster, get_host
+        from .activity.monitor import CampaignObserver, ReadBudget
+        from .activity.store import ActivityStore
+
+        activity = ActivityStore()
+        self.store, self.get_host = store, get_host
+        self.get_cluster: Callable[[str], Any] = lambda name: ReadBudget(
+            get_cluster(name), activity
+        )
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lockfile: Any = None
+        from .workspace.observer import WorkspaceObserver
+
+        self.workspace_observer = WorkspaceObserver(self.get_cluster, get_host)
+        self.campaign_observer = CampaignObserver(self.get_cluster, get_host)
 
     def start(self) -> None:
         self.lockfile = open(self.store.root / "job-monitor.lock", "a")
@@ -254,6 +288,8 @@ class JobMonitor:
                     self.store.heartbeat()
                     heartbeat_at = time.monotonic()
                 self.tick()
+                self.workspace_observer.tick()
+                self.campaign_observer.tick()
             except Exception as exc:
                 try:
                     self.store.heartbeat(type(exc).__name__ + ": " + str(exc)[:512])
@@ -283,7 +319,7 @@ class JobMonitor:
                 cluster = self.get_cluster(host_name)
                 if target_identity(cluster.host) != target_identity(host):
                     raise RemoteSlurmError("cached connection target changed; reconnect the host")
-                observed = collect(cluster, matching_ids)
+                observed = shared_collect(cluster, matching_ids, force=True)
             error = None
         except Exception as exc:
             error = type(exc).__name__ + ": " + str(exc)[:512]

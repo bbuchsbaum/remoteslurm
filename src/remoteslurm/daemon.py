@@ -200,6 +200,7 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
                 "version": ident["version"],
                 "stub_sha": ident["stub_sha"],
                 "socket": str(self.path),
+                "config_path": str((Config.load(self.config_path).path or Path()).resolve()),
                 "uptime": round(time.time() - self.started, 1),
                 "idle_seconds": self.idle_seconds,
                 "calls": self.calls,
@@ -292,6 +293,8 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
             if (
                 time.time() - self.last_activity > self.idle_seconds
                 and not self.monitor.store.active()
+                and not self.monitor.workspace_observer.active()
+                and not self.monitor.campaign_observer.active()
             ):
                 log.info("idle for %ss; exiting", self.idle_seconds)
                 self._stop.set()
@@ -364,11 +367,13 @@ def daemon_available(path: Path | None = None) -> bool:
         return False
 
 
-def spawn_daemon(path: Path | None = None) -> bool:
+def spawn_daemon(path: Path | None = None, *, config_path: Path | None = None) -> bool:
     """Start a detached daemon and wait until its socket answers."""
     path = path or socket_path()
     env = dict(os.environ)
     env[ENV_SOCKET] = str(path)
+    if config_path is not None:
+        env["REMOTESLURM_CONFIG"] = str(config_path.resolve())
     # A source checkout may be running against an installed remoteslurm of the same version.
     # Start the daemon from the exact package tree that made this request so the build-identity
     # handshake is meaningful in editable installs as well as wheels.
@@ -572,7 +577,9 @@ def connect_via_daemon(
     if hc.ssh == "local":
         return None  # nothing to keep warm
     path = socket_path()
-    if not daemon_available(path) and not (autostart and spawn_daemon(path)):
+    if not daemon_available(path) and not (
+        autostart and spawn_daemon(path, config_path=config.path)
+    ):
         return None
     status = daemon_status(path)
     expected = control_identity()
@@ -585,6 +592,15 @@ def connect_via_daemon(
             client_build=expected["build_id"],
             daemon_build=status.get("build_id"),
             daemon_pid=status.get("pid"),
+        )
+    if status.get("config_path") != str((config.path or Path()).resolve()):
+        from .errors import ExecutionMismatch
+
+        raise ExecutionMismatch(
+            "the running daemon uses a different configuration",
+            action="use the same config in both terminals, or use a separate REMOTESLURM_STATE_DIR",
+            client_config=str(config.path),
+            daemon_config=status.get("config_path"),
         )
     from .transport import SSHTransport
 

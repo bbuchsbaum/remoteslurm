@@ -45,6 +45,36 @@ def test_split_target() -> None:
     assert cli.split_target(None, "h") == ("h", "~")
 
 
+def test_offline_plain_workspace_is_json_only(cli_env, capsys, monkeypatch):
+    from remoteslurm import daemon
+    from remoteslurm.config import Config
+    from remoteslurm.workspace import service
+
+    config = Config.load()
+    cluster = cluster_mod.Cluster.connect("local", config=config)
+    service.select(config, "local", path=str(cli_env / "proj"), cluster=cluster)
+    monkeypatch.setattr(daemon, "spawn_daemon", lambda *a, **k: pytest.fail("daemon started"))
+    monkeypatch.setattr(cli, "get_cluster", lambda *a, **k: pytest.fail("remote access"))
+    rc, out, _ = run(
+        capsys, "view", "--path", str(cli_env / "proj"), "--offline", "--plain", "--json"
+    )
+    assert rc == 0 and json.loads(out)["workspace"]["remote_root"] == str(cli_env / "proj")
+
+
+def test_connect_view_refuses_non_tty_before_connect(cli_env, capsys, monkeypatch):
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(cli.Cluster, "connect", lambda *a, **k: pytest.fail("connected"))
+    rc, out, err = run(capsys, "connect", "local", "--view")
+    assert rc != 0 and "terminal" in err
+
+
+def test_connect_view_checks_project_before_auth(cli_env, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_view_preflight", lambda args: None)
+    monkeypatch.setattr(cli, "cmd_view", lambda args: pytest.fail("entered view before validation"))
+    rc, _, err = run(capsys, "connect", "local", "--view", "--project", "misspelled")
+    assert rc != 0 and "project" in err
+
+
 def test_ls_human_and_json(cli_env: Path, capsys: pytest.CaptureFixture[str]) -> None:
     rc, out, _ = run(capsys, "ls", "~/proj")
     assert rc == 0 and "a.txt" in out and "sub/" in out
@@ -157,7 +187,7 @@ def test_not_connected_exit_code(
 
     monkeypatch.setattr(SSHTransport, "master_alive", lambda self: False)
     monkeypatch.setattr(SSHTransport, "master_exit", lambda self: None)
-    monkeypatch.setattr(daemon, "spawn_daemon", lambda path=None: False)
+    monkeypatch.setattr(daemon, "spawn_daemon", lambda path=None, **kwargs: False)
     rc, out, err = run(capsys, "--json", "ls", "someMfaHost:~")
     assert rc == 3, (out, err)
     d = json.loads(out)

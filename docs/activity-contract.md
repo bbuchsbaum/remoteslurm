@@ -2,8 +2,65 @@
 
 A0 freezes the contracts in `remoteslurm.activity.model` and the advisory projection in
 `remoteslurm.activity.attention`. Campaign `next_action` uses that projection, including on
-cached status reads. Storage, producers, passive recovery, and a background observer remain
-subsequent work; importing this module does not enable monitoring.
+cached status reads. The local journal, shared operation producers, and workspace observer are
+implemented; importing this module does not enable monitoring. Enrolled campaigns recover
+canonical attempt records and commit-pinned history into local state. Independent read-only
+sources collect scheduler, output/pack-marker and lifetime resource evidence. Existing validation
+receipts are imported; observers never run validators or write campaign views.
+
+## Local journal and reader
+
+`activity.store.ActivityStore` now implements schema-versioned local SQLite WAL
+storage, atomic event/checkpoint/projection writes, bounded records, signed
+independent cursors, and contiguous-prefix retention. `rslurm activity --json`
+reads it without SSH; `--follow --json` emits one versioned page per JSONL line.
+`--since 30m` selects ingestion time; `--after CURSOR` resumes a reader. Default
+reads show the latest 100 records with `history_truncated` when older records were
+omitted; `--since` plus cursor continuation pages forward through retained history.
+
+Events are limited to 64 KiB each and 256 MiB retained payloads / 30 days by default.
+Current documents have a separate 128 MiB admission budget and 2 MiB record cap;
+exhaustion fails the transaction instead of dropping current facts. `health()`
+reports logical event/document bytes and physical SQLite/WAL allocation separately.
+Freed SQLite pages are reused. Replaying a retained source key is idempotent;
+reusing it for different source facts is a conflict. Producers/importers must keep
+and resume their atomic checkpoints after history pruning. Pruning retains current
+documents/checkpoints and returns an explicit gap for expired reader cursors.
+
+This reader does not collect remote state or enable background monitoring. Work cards resolve
+the event's immutable semantic reference, including exact array/member bindings. Missing context
+is `unavailable`; attachments beyond the response budget increment `work_cards_omitted`.
+CLI, MCP and Python readers use the same resolver and independent cursors.
+
+## Persistent observation
+
+`monitor enable/status/disable` controls the local observer; `monitor watch --campaign NAME
+--run-id RUN` enrolls an explicit campaign. `monitor remove` removes only the named subscription.
+Attaching an online workspace or enrolling a campaign enables observation again. Legacy job
+watches keep their own lifecycle. `monitor_status` is a bounded local-only core MCP health reader.
+
+Default ceilings are eight remote reads per host/30-second window, ten-second reads, 1,000 known
+scheduler IDs, 1,024 output contracts, 64 MiB hashing and three selected excerpts. One daemon owner
+uses one worker, below the two-worker host ceiling. Scheduler cadence is 30 seconds; recovery,
+outputs/markers and usage have independent 60-second cadences with small jitter. `monitor enable
+--poll`, `--max-calls` and `--read-timeout` may tighten budgets or lengthen scheduler cadence.
+Admission, source continuation and freshness survive restart; missed intervals never cause
+catch-up bursts. Timeout/auth/budget gaps retain the last observation time and expose the error.
+
+Canonical ledger reads never migrate group mirrors, lock or create remote directories. They
+read at most 4 MiB and return at most 100 groups/1 MiB with a digest-bound continuation. Campaign
+change reads return up to eight commits/1 MiB, traversing at most 128 commits/8 MiB per call.
+Pinned document reads verify their commit's content digest. Legacy campaign event cursors remain
+unchanged. Truncated/unreachable history is a persistent coverage gap, not invented completeness.
+Recovery checkpoints each read and atomically imports each fact with its own checkpoint. Missing
+acceptance time remains unknown; unique scheduler marker matches normalize array children before
+counting allocations. Superseded attempts remain historical and cannot replace a current retry.
+
+Local scheduler/output facts set `projection_lag`: the remote campaign may still show older
+evidence until an explicit attached refresh reconciles it. Imported validation applies only to
+its output signature and contract. Changed artifacts can make it stale, but observation cannot
+create a passed result or authorize a retry. Attention transitions are derived locally from
+bounded captured axes and cite their digest and projection version.
 
 ## Authority and evidence
 

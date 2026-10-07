@@ -1,1 +1,1 @@
-"""Versioned activity contracts and pure advisory attention (no journal or observer yet)."""
+"""Versioned activity contracts, a local journal, and pure advisory attention."""

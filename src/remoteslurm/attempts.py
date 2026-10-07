@@ -56,7 +56,7 @@ def ensure_campaign_attempt(
 ) -> dict[str, Any]:
     """Recover or create one remotely journaled campaign job-group attempt."""
 
-    return dict(
+    result = dict(
         cluster.call(
             "campaign_attempt_ensure",
             campaign_dir=cluster.host.campaign_dir,
@@ -76,6 +76,11 @@ def ensure_campaign_attempt(
             _timeout=180,
         )
     )
+    from .activity.recovery import acknowledged
+
+    if not acknowledged(cluster, campaign, run_id, result):
+        result["activity_recorded"] = False
+    return result
 
 
 def update_campaign_attempt(

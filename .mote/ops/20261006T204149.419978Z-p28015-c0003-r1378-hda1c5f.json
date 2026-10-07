@@ -1,0 +1,1 @@
+{"actor":"codex-workspace-impl","entity":"bd-01M2ZFC39QNXCZ58GWK2ZQ50WB","kind":"note","note_kind":"progress","op":"20261006T204149.419978Z-p28015-c0003-r1378-hda1c5f","text":"Implement transactional SQLite journal, checkpoint/projection atomicity and bounded storage with independent-reader foundation.","ts":"2026-10-06T20:41:49.419978Z","v":1}

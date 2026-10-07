@@ -167,7 +167,7 @@ class CampaignStore:
         )
 
     def read_document(
-        self, name: str, run_id: str, document: str = "summary.json"
+        self, name: str, run_id: str, document: str = "summary.json", *, commit: str | None = None
     ) -> dict[str, Any]:
         return dict(
             self.cluster.call(
@@ -176,6 +176,7 @@ class CampaignStore:
                 name=name,
                 run_id=run_id,
                 document=document,
+                commit=commit,
             )
         )
 
@@ -261,7 +262,8 @@ class CampaignStore:
             return snapshot
         if offset < 0 or limit < 1 or limit > UNIT_PAGE_SIZE:
             raise InvalidArgument(f"unit page requires offset >= 0 and limit 1..{UNIT_PAGE_SIZE}")
-        index = self.read_document(name, run_id, "index.json")["value"]
+        commit = summary_result["head"]["transaction_id"]
+        index = self.read_document(name, run_id, "index.json", commit=commit)["value"]
         selected: list[dict[str, Any]] = []
         stop = offset + limit
         for page in index.get("pages", []):
@@ -269,7 +271,7 @@ class CampaignStore:
             page_stop = page_start + int(page["count"])
             if page_stop <= offset or page_start >= stop:
                 continue
-            value = self.read_document(name, run_id, str(page["document"]))["value"]
+            value = self.read_document(name, run_id, str(page["document"]), commit=commit)["value"]
             for absolute, unit in enumerate(value.get("units", []), start=page_start):
                 if offset <= absolute < stop:
                     selected.append(unit)
@@ -290,7 +292,8 @@ class CampaignStore:
         summary_result = self.read_document(name, run_id, "summary.json")
         snapshot = dict(summary_result["value"])
         snapshot["store"] = summary_result["head"]
-        index = self.read_document(name, run_id, "index.json")["value"]
+        commit = summary_result["head"]["transaction_id"]
+        index = self.read_document(name, run_id, "index.json", commit=commit)["value"]
         total = int(index.get("unit_count", 0))
         if total > max_units:
             raise InvalidArgument(
@@ -298,7 +301,7 @@ class CampaignStore:
             )
         units: list[dict[str, Any]] = []
         for page in index.get("pages", []):
-            value = self.read_document(name, run_id, str(page["document"]))["value"]
+            value = self.read_document(name, run_id, str(page["document"]), commit=commit)["value"]
             page_units = value.get("units", [])
             if not isinstance(page_units, list):
                 raise InvalidArgument("campaign unit page is malformed")

@@ -18,6 +18,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .activity.producer import operation
 from .config import HostConfig, ProjectConfig
 from .errors import ConfigError, InvalidArgument, RemoteSlurmError, RemoteTimeout, TooLarge
 from .transport import SSHTransport
@@ -286,6 +287,7 @@ def _run_rsync(cmd: list[str], timeout: float) -> tuple[int, str, str]:
     return proc.returncode, out, err
 
 
+@operation("transfer.sync")
 def sync(
     cluster: Cluster,
     project: ProjectConfig,

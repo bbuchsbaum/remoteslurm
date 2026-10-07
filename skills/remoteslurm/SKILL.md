@@ -23,6 +23,22 @@ If neither the MCP tools nor `rslurm` are available, read
   terminal; never attempt it for them.
 - Check `connection` before long or unattended work when the site enforces a session lifetime.
   Act on an expiry warning before starting.
+- For an enrolled project, read `workspace(project=..., host=...)` at the beginning or
+  resumption of work. Keep `next_cursor` and use `after` at meaningful task boundaries;
+  these are local cached reads, not a polling or wakeup mechanism. Treat stale observations,
+  omitted sections, and history gaps explicitly; resnapshot when `resync_required` is true.
+- Report the host/root and the second-terminal attach command:
+  `rslurm -H HOST view PROJECT` (or `view --path REMOTE_ROOT`). Both terminals must share the
+  config/state namespace. If no workspace is enrolled, continue with ordinary structured
+  tools and explain how the user can open the viewer; cached reads do not enroll a workspace.
+- `workspace_inspect` queues bounded `list`, `preview`, or `tail` reads; retain its request ID
+  and read that receipt later. Monitoring must already be enabled. `activity_recorded: false`
+  means local visibility failed, not that an accepted job should be resubmitted.
+- Enroll a campaign with `rslurm -H HOST monitor watch --campaign NAME --run-id RUN`.
+  `monitor_status` and CLI `monitor status --json` read local source freshness, budgets and gaps.
+  Passive recovery never writes the remote ledger or campaign view; `projection_lag` means an
+  explicit attached refresh is needed to reconcile that view. Historical attempts do not
+  replace current retries, and imported validation does not authorize new execution.
 
 ## Load only the relevant reference
 

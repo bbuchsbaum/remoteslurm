@@ -1,0 +1,1 @@
+{"actor":"brad.buchsbaum@gmail.com","entity":"bd-01M3F1VWV2CXG0AYYXJPR2T4RP","kind":"reserve_open","mode":"exclusive","op":"20260926T163227.493015Z-p96190-c0000-r929a-hf277d2","paths":["src/remoteslurm/cli.py","tests/test_cli_transfers.py"],"reservation_id":"rv-01M3F8Z5V5FBPE09R26BGP11WB","ts":"2026-09-26T16:32:27.493015Z","ttl_s":3600,"v":2}

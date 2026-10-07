@@ -41,6 +41,10 @@ ENV_MCP_TOOLS = "REMOTESLURM_MCP_TOOLS"
 # queue_info/quota/events. (`wait` is core — agents want a bounded wait — and so are the
 # proc_* tools, which are the only handle on a `run(detach=True)` process.)
 CORE_TOOLS = {
+    "activity",
+    "monitor_status",
+    "workspace",
+    "workspace_inspect",
     "info",
     "ls",
     "read",
@@ -142,8 +146,14 @@ async def _in_worker(work: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     tracker = InFlight()
 
     def tracked() -> dict[str, Any]:
+        from .activity.producer import CLIENT
+
         CURRENT_INFLIGHT.set(tracker)  # in the thread's copy of the context
-        return work()
+        token = CLIENT.set("mcp")
+        try:
+            return work()
+        finally:
+            CLIENT.reset(token)
 
     try:
         return await asyncio.to_thread(tracked)
@@ -1472,10 +1482,92 @@ def guide_resource() -> str:
     return AGENT_GUIDE
 
 
+async def activity(host: str | None = None, after: str | None = None, limit: int = 100) -> dict:
+    """Read local activity without SSH. Each reader retains its own next_cursor."""
+    from .activity.store import ActivityStore
+
+    try:
+        return await _in_worker(lambda: ActivityStore().query(host=host, after=after, limit=limit))
+    except RemoteSlurmError as exc:
+        return exc.to_dict()
+    except Exception as exc:
+        return {"error": "internal", "message": f"local activity unavailable: {type(exc).__name__}"}
+
+
+async def monitor_status(host: str | None = None) -> dict:
+    """Local persistent subscriptions, source freshness, budgets and observer health; no SSH."""
+    from .activity.monitor import status
+
+    try:
+        return await _in_worker(lambda: status(host))
+    except RemoteSlurmError as exc:
+        return exc.to_dict()
+
+
+async def workspace(
+    project: str | None = None,
+    path: str | None = None,
+    host: str | None = None,
+    after: str | None = None,
+) -> dict:
+    """Read cached workspace state; no SSH or monitor startup. after resumes changes."""
+    from .config import Config
+    from .workspace import service
+
+    try:
+        return await _in_worker(
+            lambda: service.snapshot(
+                service.select(Config.load(), host, project, path), after=after
+            )
+        )
+    except RemoteSlurmError as exc:
+        return exc.to_dict()
+    except Exception as exc:
+        return {
+            "error": "internal",
+            "message": f"local workspace unavailable: {type(exc).__name__}",
+        }
+
+
+async def workspace_inspect(
+    project: str | None = None,
+    root: str | None = None,
+    host: str | None = None,
+    kind: str = "list",
+    path: str = ".",
+    request_id: str | None = None,
+    offset: int = 0,
+    token: str | None = None,
+) -> dict:
+    """Queue a bounded observer read or read its receipt; never authenticate/start a daemon."""
+    from .config import Config
+    from .workspace import service
+
+    try:
+        return await _in_worker(
+            lambda: service.inspect_request(
+                service.select(Config.load(), host, project, root),
+                kind,
+                path,
+                request_id=request_id,
+                offset=offset,
+                token=token,
+            )
+        )
+    except RemoteSlurmError as exc:
+        return exc.to_dict()
+    except Exception as exc:
+        return {"error": "internal", "message": f"inspection unavailable: {type(exc).__name__}"}
+
+
 # -- server assembly ---------------------------------------------------------------------------
 # Every tool, in a stable order. Only the CORE_TOOLS subset is registered unless
 # REMOTESLURM_MCP_TOOLS=all.
 ALL_TOOLS: dict[str, Any] = {
+    "activity": activity,
+    "monitor_status": monitor_status,
+    "workspace": workspace,
+    "workspace_inspect": workspace_inspect,
     "info": info,
     "ls": ls,
     "read": read,

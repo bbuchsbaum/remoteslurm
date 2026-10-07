@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 from . import slurm
+from .activity.producer import operation
 from .config import Config, HostConfig
 from .errors import (
     ConfirmationRequired,
@@ -119,6 +120,7 @@ class Cluster(SlurmOps):
             if _clusters.get(self.host.name) is self:
                 del _clusters[self.host.name]
 
+    @operation("task.ensure")
     def ensure(
         self,
         spec: Any,
@@ -307,6 +309,7 @@ class Cluster(SlurmOps):
             return base64.b64decode(r["content_b64"])
         return str(r["content"]).encode("utf-8")
 
+    @operation("file.write")
     def write(
         self,
         path: str,
@@ -325,6 +328,7 @@ class Cluster(SlurmOps):
             args["content"] = content
         return self.call("write", _timeout=120, **args)
 
+    @operation("file.edit")
     def edit(
         self,
         path: str,
@@ -370,9 +374,11 @@ class Cluster(SlurmOps):
             args["content"] = content
         return self.call("diff", _timeout=120, **args)
 
+    @operation("file.mkdir")
     def mkdir(self, path: str) -> dict[str, Any]:
         return self.call("mkdir", path=path)
 
+    @operation("file.rm")
     def rm(
         self,
         path: str,
@@ -447,6 +453,7 @@ class Cluster(SlurmOps):
         )
 
     # -- commands -------------------------------------------------------------------------------
+    @operation("command.run")
     def run(
         self,
         cmd: str | list[str],

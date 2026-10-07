@@ -36,11 +36,31 @@ remoteslurm --version
 This installs `remoteslurm`, `rslurm`, and `remoteslurm-mcp`. Upgrade later with
 `uv tool upgrade remoteslurm`; from a clone, `uv tool install .` also works.
 
+For the optional terminal workspace viewer, install a checkout with
+`uv tool install '.[tui]'` (or `uv pip install -e '.[dev,tui]'` for development).
+
 Nothing needs to be installed on the cluster. The login node needs Python 3.6 or newer and the
 usual Slurm command-line tools. Project `sync` needs rsync 3.1 or newer locally; `put` and `get`
 use rsync on both ends for directories and files larger than 4 MiB.
 
 ## Connect to a cluster
+
+To watch remote work while Claude Code or Codex stays in its own terminal, use a
+second local terminal:
+
+```bash
+rslurm connect mycluster --view --project analysis
+# Or attach after authentication:
+rslurm -H mycluster view analysis
+```
+
+The viewer shows recorded jobs, files, bounded log previews, and activity. `q`
+closes the view; workspace monitoring continues until
+`rslurm -H mycluster monitor remove --project analysis`. Both terminals use the
+same local configuration and state directory. Agents read the same observations
+with `workspace` and `activity`; the agent itself stays local.
+See the [terminal workspace guide](docs/terminal-workspace.md) for offline/plain
+modes, installation, keyboard controls, and observation limits.
 
 First make sure a normal SSH alias reaches the cluster. For an MFA-protected cluster, configure a
 persistent OpenSSH master so authentication happens in a visible terminal instead of a hidden

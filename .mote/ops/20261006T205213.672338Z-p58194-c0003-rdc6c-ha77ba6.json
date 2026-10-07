@@ -1,0 +1,1 @@
+{"actor":"codex-workspace-impl","entity":"bd-01M49EP3KXK80VTH8PCTK0A9XF","kind":"note","note_kind":"progress","op":"20261006T205213.672338Z-p58194-c0003-rdc6c-ha77ba6","text":"Implement workspace consumer against the now-tested journal API while shared producer integration continues; dependency gates remain open.","ts":"2026-10-06T20:52:13.672338Z","v":1}

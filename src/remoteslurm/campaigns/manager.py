@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import slurm
 from ..activity.attention import project_attention
+from ..activity.producer import operation
 from ..attempts import (
     ensure_campaign_attempt,
     submission_control,
@@ -249,6 +250,7 @@ class CampaignManager:
             }
         return specs
 
+    @operation("campaign.start")
     def start(
         self,
         definition: CampaignDefinition,
@@ -297,6 +299,9 @@ class CampaignManager:
             documents=self.store.snapshot_documents(snapshot),
         )
         snapshot["store"] = result["head"]
+        from ..activity.semantic import committed
+
+        committed(self.cluster, snapshot, [event])
         return self._page(snapshot, include_units=False)
 
     @staticmethod
@@ -324,8 +329,12 @@ class CampaignManager:
             documents=self.store.snapshot_documents(snapshot),
         )
         snapshot["store"] = result["head"]
+        from ..activity.semantic import committed
+
+        committed(self.cluster, snapshot, events)
         return result
 
+    @operation("campaign.adopt")
     def adopt(
         self,
         name: str,
@@ -493,6 +502,7 @@ class CampaignManager:
                     continue
                 group_id = str(group["group_id"])
                 group_new = False
+                bindings: dict[str, Any] | None = None
                 for item in group["mapping"]:
                     unit = by_id.get(item["unit_id"])
                     if unit is None:
@@ -536,6 +546,36 @@ class CampaignManager:
                         None,
                     )
                     is_new_attempt = existing is None
+                    current = execution.get("current_attempt") or {}
+                    historical = bool(
+                        current and current.get("attempt_id") != attempt["attempt_id"] and existing
+                    )
+                    if (
+                        current
+                        and current.get("attempt_id") != attempt["attempt_id"]
+                        and existing is None
+                    ):
+                        if bindings is None:
+                            ledger = self.cluster.call(
+                                "campaign_ledger_read",
+                                campaign_dir=self.cluster.host.campaign_dir,
+                                name=name,
+                                run_id=run_id,
+                                group_ids=[group_id],
+                                _timeout=10,
+                            )
+                            bindings = next(
+                                (
+                                    r["unit_bindings"]
+                                    for r in ledger["groups"]
+                                    if r["group_id"] == group_id
+                                ),
+                                {},
+                            )
+                        historical = bindings.get(item["unit_id"]) != {
+                            "group_id": group_id,
+                            "attempt_id": attempt["attempt_id"],
+                        }
                     group_new = group_new or is_new_attempt
                     if existing is None:
                         history.append(unit_attempt)
@@ -544,6 +584,18 @@ class CampaignManager:
                         existing.update(
                             {key: value for key, value in unit_attempt.items() if value is not None}
                         )
+                    if historical:
+                        events.append(
+                            _event(
+                                snapshot,
+                                "historical_attempt_observed",
+                                unit_id=unit["unit_id"],
+                                group_id=group_id,
+                                attempt_id=attempt["attempt_id"],
+                                state=attempt.get("state"),
+                            )
+                        )
+                        continue
                     execution["current_attempt"] = existing
                     new_state = self._attempt_state(str(record.get("state")))
                     if is_new_attempt:
@@ -592,6 +644,7 @@ class CampaignManager:
                 continue
         raise StoreConflict("campaign changed repeatedly while merging submission outcomes")
 
+    @operation("campaign.apply")
     def apply(
         self,
         name: str,
@@ -777,6 +830,7 @@ class CampaignManager:
             candidate_count=len(prefixes),
         )
 
+    @operation("campaign.retry")
     def retry(
         self,
         name: str,
@@ -912,6 +966,7 @@ class CampaignManager:
             result["applied"] = True
         return result
 
+    @operation("campaign.cancel")
     def cancel(
         self,
         name: str,
@@ -1032,6 +1087,7 @@ class CampaignManager:
         result["applied"] = True
         return result
 
+    @operation("campaign.drive")
     def drive(
         self,
         name: str,
@@ -1189,6 +1245,7 @@ class CampaignManager:
             availability["reason"] = "; ".join(errors[:3])
         return records, availability
 
+    @operation("campaign.refresh")
     def _refresh(self, name: str, run_id: str) -> dict[str, Any]:
         snapshot = self.store.read_complete_snapshot(name, run_id)
         if snapshot.get("lifecycle") == "ARCHIVED":
@@ -1707,6 +1764,7 @@ class CampaignManager:
             )
         return results
 
+    @operation("campaign.verify")
     def verify(
         self,
         name: str,

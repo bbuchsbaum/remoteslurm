@@ -10,6 +10,13 @@ tell the user to run `remoteslurm connect <host>` in a terminal (MFA can't be do
   `templates` (ready-made submit configs), `projects` (configured sync roots), and
   `learned_notes` (policy rejections seen before).
 - Don't guess account/partition/walltime. Use a template or the values from `notes`.
+- For an enrolled project, read `workspace(project=..., host=...)` when starting or resuming.
+  Retain `next_cursor`; request changes with `after` at task boundaries. Reads are local cached
+  observations, not automatic monitoring or wakeups. Resnapshot after a history gap; distinguish
+  stale/unchecked evidence from current verified results.
+- Tell the user the host/root and `rslurm -H HOST view PROJECT` command for a second local terminal.
+  It shares the agent's config/state directory. `workspace_inspect` queues bounded file/log reads
+  and returns a request ID to check later. `activity_recorded: false` never authorizes resubmission.
 
 ## Moving code and files
 - Use `sync` to push a whole project (rsync, respects excludes), not repeated `put`s.

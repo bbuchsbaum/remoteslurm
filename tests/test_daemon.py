@@ -139,6 +139,21 @@ def test_stale_socket_is_cleaned() -> None:
     assert not sock.exists()
 
 
+def test_different_config_is_rejected(daemon_env, monkeypatch):
+    from remoteslurm.identity import control_identity
+
+    monkeypatch.setattr(
+        daemon,
+        "daemon_status",
+        lambda path=None: {
+            "build_id": control_identity()["build_id"],
+            "config_path": "/another/config.toml",
+        },
+    )
+    with pytest.raises(ExecutionMismatch, match="different configuration"):
+        daemon.connect_via_daemon("fake", Config.load(), autostart=False)
+
+
 def test_idle_exit() -> None:
     sock = Path(tempfile.mkdtemp(prefix="rs")) / "idle.sock"
     srv = daemon.DaemonServer(sock, idle_seconds=0.1)

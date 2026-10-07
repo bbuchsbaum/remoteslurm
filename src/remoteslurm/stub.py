@@ -78,6 +78,9 @@ SLOW_OPS = frozenset(
         "progress_count",
         "campaign_attempt_ensure",
         "campaign_markers",
+        "browse",
+        "workspace_anchor",
+        "workspace_read",
     )
 )
 # Ops that can stream multi-frame responses when the request carries ``stream: true``.
@@ -753,6 +756,44 @@ def op_ls(args):
     }
 
 
+def op_browse(args):
+    """A bounded partial directory capture, unlike legacy ls's full name enumeration."""
+    path = _path(args.get("path"), must_exist=True)
+    if not os.path.isdir(path):
+        raise StubError("invalid_arg", "browse requires a directory", path=path)
+    limit = _clamp(args.get("scan_limit"), 4096, 4096)
+    started = time.monotonic()
+    entries, inspected, size = [], 0, 0
+    complete = False
+    with os.scandir(path) as iterator:
+        while inspected < limit and time.monotonic() - started < 2:
+            try:
+                item = next(iterator)
+            except StopIteration:
+                complete = True
+                break
+            inspected += 1
+            try:
+                entry = _stat_entry(item.path, item.name, follow=False)
+            except StubError as exc:
+                entry = {"name": item.name, "type": "unknown", "error": exc.code}
+            length = len(json.dumps(entry).encode("utf-8"))
+            if size + length > 1024 * 1024:
+                break
+            size += length
+            entries.append(entry)
+    entries.sort(key=lambda entry: entry["name"])
+    return {
+        "path": path,
+        "entries": entries,
+        "inspected": inspected,
+        "complete": complete,
+        "partial": not complete,
+        "recursive": False,
+        "observed_at": time.time(),
+    }
+
+
 def op_stat(args):
     p = _path(args.get("path"), must_exist=True)
     e = _stat_entry(p)
@@ -769,8 +810,9 @@ def op_read(args):
     if os.path.isdir(p):
         raise StubError("invalid_arg", "is a directory: %s" % p, path=p)
     try:
-        size = os.path.getsize(p)
         with io.open(p, "rb") as f:
+            metadata = os.fstat(f.fileno())
+            size = metadata.st_size
             probe = f.read(8192)
             binary = _is_binary(probe)
             f.seek(0)
@@ -808,6 +850,8 @@ def op_read(args):
     res = {
         "path": p,
         "size": size,
+        "file_identity": [metadata.st_dev, metadata.st_ino],
+        "mtime": metadata.st_mtime,
         "offset": offset,
         "length": len(data),
         "eof": eof,
@@ -820,6 +864,18 @@ def op_read(args):
         res["content"] = _decode(data)
         res["lines"] = data.count(b"\n")
     return res
+
+
+def op_workspace_read(args):
+    p = _path(args.get("path"), must_exist=True)
+    try:
+        regular = statmod.S_ISREG(os.stat(p).st_mode)
+    except OSError as e:
+        raise _os_error(e, p)
+    if not regular:
+        raise StubError("invalid_arg", "preview requires a regular file", path=p)
+    args = dict(args, max_bytes=min(args.get("max_bytes") or 65536, 65536))
+    return op_read(args)
 
 
 def _atomic_write(p, data, keep_mode=True, mode=None):
@@ -876,6 +932,27 @@ def op_expandpath(args):
     if not os.path.isabs(expanded):
         expanded = os.path.join(os.path.expanduser("~"), expanded)
     return {"input": raw, "path": os.path.normpath(expanded)}
+
+
+def op_workspace_anchor(args):
+    """Identify a workspace root without trusting an SSH alias or path expansion alone."""
+    result = op_expandpath(args)
+    p = _path(result["path"], must_exist=True)
+    try:
+        st = os.stat(p)
+    except OSError as e:
+        raise _os_error(e, p)
+    if not statmod.S_ISDIR(st.st_mode):
+        raise StubError("invalid_arg", "workspace root must be a directory", path=p)
+    result["anchor"] = [
+        socket.gethostname(),
+        getpass.getuser(),
+        os.getuid(),
+        os.path.realpath(p),
+        st.st_dev,
+        st.st_ino,
+    ]
+    return result
 
 
 def op_write(args):
@@ -2661,7 +2738,7 @@ def op_task_fingerprint(args):
     }
 
 
-def _attempt_find_jobs(marker, since):
+def _attempt_find_jobs(marker, since, strict=False):
     """Find an attempt marker in live queue and accounting without relying on client state."""
     found = {}
 
@@ -2672,7 +2749,9 @@ def _attempt_find_jobs(marker, since):
         return match.group(1) if match else value
 
     user = getpass.getuser()
-    sq = _slurm_soft(["squeue", "-h", "-u", user, "-o", "%i|%j|%T"], timeout=30)
+    sq = _slurm_soft(["squeue", "-h", "-u", user, "-o", "%i|%j|%T"], timeout=10 if strict else 30)
+    if strict and (sq.get("rc") or sq.get("stdout_truncated")):
+        raise StubError("error", "attempt identity query unavailable or truncated")
     if sq.get("rc") == 0:
         for line in sq.get("stdout", "").splitlines():
             fields = line.split("|")
@@ -2695,8 +2774,10 @@ def _attempt_find_jobs(marker, since):
             "-o",
             "JobID,JobName,State",
         ],
-        timeout=30,
+        timeout=10 if strict else 30,
     )
+    if strict and (sa.get("rc") or sa.get("stdout_truncated")):
+        raise StubError("error", "attempt accounting unavailable or truncated")
     if sa.get("rc") == 0:
         for line in sa.get("stdout", "").splitlines():
             fields = line.split("|")
@@ -2705,6 +2786,20 @@ def _attempt_find_jobs(marker, since):
                 if jid not in found:
                     found[jid] = {"job_id": jid, "state": fields[2], "source": "sacct"}
     return list(found.values())
+
+
+def op_attempt_matches(args):
+    marker = args.get("marker")
+    if not isinstance(marker, str) or not re.match(r"^rsc-[a-zA-Z0-9-]{1,128}$", marker):
+        raise StubError("invalid_arg", "expected a campaign attempt marker")
+    since = args.get("since")
+    if isinstance(since, bool) or not isinstance(since, (int, float)) or since < 0:
+        raise StubError("invalid_arg", "attempt creation time required")
+    return {
+        "matches": _attempt_find_jobs(marker, since, strict=True),
+        "observed_at": time.time(),
+        "acceptance_time": "unknown",
+    }
 
 
 def _attempt_current(record):
@@ -3550,10 +3645,11 @@ def _campaign_quarantine(run_dir, txid, txdir, view_path=None, journal_path=None
     return orphan
 
 
-def _campaign_reachable(run_dir, head, target_txid):
+def _campaign_reachable(run_dir, head, target_txid, max_commits=100000, max_bytes=None):
     """Return the target's committed pointer only when linked from current HEAD."""
     cursor = dict(head)
-    for _unused in range(100000):
+    read_bytes = 0
+    for _unused in range(max_commits):
         txid = cursor.get("transaction_id")
         revision = cursor.get("revision")
         if txid == target_txid:
@@ -3570,6 +3666,10 @@ def _campaign_reachable(run_dir, head, target_txid):
         journal_rel = cursor.get("journal")
         if not journal_rel:
             journal_rel = "journal/%020d-%s.json" % (revision, txid)
+        if max_bytes is not None:
+            read_bytes += os.stat(os.path.join(run_dir, journal_rel)).st_size
+            if read_bytes > max_bytes:
+                raise StubError("too_large", "campaign reachability read budget exhausted")
         journal = _campaign_read_json(os.path.join(run_dir, journal_rel), required=False)
         if not isinstance(journal, dict):
             return None
@@ -3737,6 +3837,15 @@ def op_campaign_commit(args):
 def op_campaign_read(args):
     run_dir = _campaign_run(args)
     head = _campaign_head(run_dir)
+    commit = args.get("commit")
+    if commit is not None:
+        commit = _campaign_id(commit, "commit")
+        pinned = _campaign_reachable(
+            run_dir, head, commit, max_commits=128, max_bytes=8 * 1024 * 1024
+        )
+        if pinned is None:
+            raise StubError("store_conflict", "requested commit is not reachable from HEAD")
+        head = pinned
     document = _campaign_document_path(args.get("document") or "summary.json")
     if head.get("revision") == 0 or not head.get("view"):
         raise StubError("not_found", "campaign run has no committed snapshot")
@@ -3746,7 +3855,127 @@ def op_campaign_read(args):
         raise StubError("invalid_arg", "max_bytes must be an integer")
     max_bytes = max(1, min(CAMPAIGN_MAX_READ_BYTES, max_bytes))
     value = _campaign_read_json(path, max_bytes=max_bytes)
+    journal = _campaign_read_json(os.path.join(run_dir, head["journal"]))
+    expected = journal.get("documents", {}).get(document.replace(os.sep, "/"))
+    if expected != hashlib.sha256(_campaign_json_bytes(value)).hexdigest():
+        raise StubError("store_conflict", "campaign document digest differs from its commit")
     return {"head": head, "document": document.replace(os.sep, "/"), "value": value}
+
+
+def op_campaign_ledger_read(args):
+    """Canonical ledger only: no mirror migration, locks, directory creation or recovery."""
+    _unused, path = _campaign_execution_paths(args)
+    value = _campaign_read_json(path, required=False)
+    if value is None:
+        return {"available": False, "reason": "canonical ledger absent", "groups": []}
+    if value.get("schema") != 1 or not isinstance(value.get("groups"), dict):
+        raise StubError("store_conflict", "unsupported canonical execution ledger")
+    offset, limit = args.get("offset", 0), args.get("limit", 100)
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+        raise StubError("invalid_arg", "ledger page requires offset >= 0 and limit 1..100")
+    digest = hashlib.sha256(_campaign_json_bytes(value)).hexdigest()
+    if args.get("digest") is not None and args["digest"] != digest:
+        raise StubError("store_conflict", "execution ledger changed; restart pagination")
+    keys = sorted(value["groups"])
+    requested = args.get("group_ids")
+    if requested is not None:
+        if (
+            not isinstance(requested, list)
+            or len(requested) > 100
+            or not all(isinstance(k, str) for k in requested)
+        ):
+            raise StubError("invalid_arg", "at most 100 group IDs may be selected")
+        keys = [k for k in keys if k in requested]
+    groups = []
+    for key in keys[offset : offset + limit]:
+        record = dict(value["groups"][key])
+        record["unit_bindings"] = {
+            unit: binding
+            for unit, binding in value.get("units", {}).items()
+            if binding.get("group_id") == key
+        }
+        groups.append(record)
+    result = {
+        "available": True,
+        "digest": digest,
+        "observed_at": time.time(),
+        "updated_at": value.get("updated_at"),
+        "groups": groups,
+        "offset": offset,
+        "total": len(keys),
+        "next_offset": offset + len(groups) if offset + len(groups) < len(keys) else None,
+    }
+    if len(_campaign_json_bytes(result)) > 1024 * 1024:
+        raise StubError("too_large", "ledger response exceeds 1 MiB; request fewer groups")
+    return result
+
+
+def op_task_read(args):
+    path = os.path.join(_task_location(args, args.get("task_id")), "task.json")
+    value = _campaign_read_json(path, required=False)
+    return {
+        "available": value is not None,
+        "record": value,
+        "digest": hashlib.sha256(_campaign_json_bytes(value)).hexdigest(),
+    }
+
+
+def op_campaign_changes(args):
+    """Forward committed pages; bounded history coverage is explicit, legacy cursors unchanged."""
+    run_dir = _campaign_run(args)
+    head = _campaign_head(run_dir)
+    after = args.get("after")
+    limit = args.get("limit", 8)
+    if type(limit) is not int or not 1 <= limit <= 8:
+        raise StubError("invalid_arg", "change page limit must be 1..8")
+    chain, pointer, reached = [], dict(head), False
+    read_bytes = 0
+    for _unused in range(128):
+        txid, revision = pointer.get("transaction_id"), pointer.get("revision")
+        if txid == after and after is not None:
+            reached = True
+            break
+        if not txid:
+            reached = after is None
+            break
+        basename = "%020d-%s" % (revision, _campaign_id(txid, "transaction_id"))
+        path = os.path.join(run_dir, "journal", basename + ".json")
+        read_bytes += os.stat(path).st_size
+        if read_bytes > 8 * 1024 * 1024:
+            reached = False
+            break
+        journal = _campaign_read_json(path)
+        if journal.get("transaction_id") != txid or journal.get("revision") != revision:
+            raise StubError("store_conflict", "campaign journal pointer mismatch")
+        chain.append(
+            {
+                "commit": txid,
+                "revision": revision,
+                "committed_at": journal.get("committed_at"),
+                "events": journal.get("events", []),
+                "documents": journal.get("documents", {}),
+            }
+        )
+        pointer = journal.get("parent") or {}
+    if not pointer.get("transaction_id") and after is None:
+        reached = True
+    chain.reverse()
+    selected, size = [], 0
+    for item in chain[:limit]:
+        item_size = len(_campaign_json_bytes(item))
+        if size + item_size > 1024 * 1024:
+            if not selected:
+                raise StubError("too_large", "single campaign change exceeds 1 MiB")
+            break
+        selected.append(item)
+        size += item_size
+    return {
+        "head": head,
+        "changes": selected,
+        "coverage": "complete" if reached else "gap",
+        "next_after": selected[-1]["commit"] if selected else after,
+        "has_more": len(selected) < len(chain),
+    }
 
 
 def op_campaign_events(args):
@@ -4032,7 +4261,10 @@ def op_contract_observe(args):
         raise StubError(
             "invalid_arg", "at most %d contract items may be observed" % CONTRACT_MAX_ITEMS
         )
-    hash_budget = [CONTRACT_MAX_TOTAL_HASH_BYTES]
+    max_hash_bytes = args.get("max_hash_bytes", CONTRACT_MAX_TOTAL_HASH_BYTES)
+    if type(max_hash_bytes) is not int or not 0 <= max_hash_bytes <= CONTRACT_MAX_TOTAL_HASH_BYTES:
+        raise StubError("invalid_arg", "invalid contract hash budget")
+    hash_budget = [max_hash_bytes]
     match_budget = [CONTRACT_MAX_TOTAL_MATCHES]
     observations = []
     for item in items:
@@ -4096,7 +4328,7 @@ def op_contract_observe(args):
             "max_matches": CONTRACT_MAX_MATCHES,
             "max_total_matches": CONTRACT_MAX_TOTAL_MATCHES,
             "max_hash_bytes": CONTRACT_MAX_HASH_BYTES,
-            "max_total_hash_bytes": CONTRACT_MAX_TOTAL_HASH_BYTES,
+            "max_total_hash_bytes": max_hash_bytes,
         },
     }
 
@@ -4294,10 +4526,13 @@ OPS = {
     "ping": op_ping,
     "info": op_info,
     "ls": op_ls,
+    "browse": op_browse,
     "stat": op_stat,
     "read": op_read,
     "write": op_write,
     "expandpath": op_expandpath,
+    "workspace_anchor": op_workspace_anchor,
+    "workspace_read": op_workspace_read,
     "edit": op_edit,
     "diff": op_diff,
     "mkdir": op_mkdir,
@@ -4320,6 +4555,10 @@ OPS = {
     "task_update": op_task_update,
     "campaign_attempt_ensure": op_campaign_attempt_ensure,
     "campaign_attempt_update": op_campaign_attempt_update,
+    "campaign_ledger_read": op_campaign_ledger_read,
+    "task_read": op_task_read,
+    "attempt_matches": op_attempt_matches,
+    "campaign_changes": op_campaign_changes,
     "campaign_markers": op_campaign_markers,
     "campaign_put_immutable": op_campaign_put_immutable,
     "campaign_commit": op_campaign_commit,
