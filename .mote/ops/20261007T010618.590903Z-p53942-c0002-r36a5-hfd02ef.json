@@ -1,0 +1,1 @@
+{"actor":"codex-workspace-impl","entity":"bd-01M49EP3KXK80VTH8PCTK0A9XF","kind":"note","note_kind":"progress","op":"20261007T010618.590903Z-p53942-c0002-r36a5-hfd02ef","text":"Fix installed-state offline trailing-slash lookup while retaining strict remote symlink/expansion semantics.","ts":"2026-10-07T01:06:18.590903Z","v":1}

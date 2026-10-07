@@ -1,8 +1,16 @@
 # Activity and terminal observation qualification
 
-The implementation is under local qualification. The immutable implementation candidate and
-full-suite results will be recorded here after verification. Hosted CI has not run for this
-candidate, and no new live jobs have been submitted for this work.
+The immutable implementation candidate is `761b941492eceb06d2cc6300b7165f60f3b9cfe5`.
+Its full suite passed **725 tests, 8 opt-in live tests skipped** in 322.41 seconds.
+Build identity: `1:0.2.0:a1c56768f09d9a66:25019df537b83a72`.
+Ruff, formatting, mypy (44 source files), the helper's static Python 3.6 floor,
+source archive and wheel builds passed. A fresh base-wheel environment imported CLI/MCP
+without Textual and refused UI startup before configuration/authentication. Actual CLI PTYs
+restored alternate screen and cursor on both `q` and Ctrl-C, with exit status zero.
+
+Raw suite evidence: `/private/tmp/remoteslurm-motes-full-03.log` and its `.meta.json` sidecar.
+This report and the checked-in specimens provide a portable reproduction; the raw log is local.
+Hosted CI has not run for this candidate, and no new live jobs have been submitted for this work.
 
 The automated specimens cover early acknowledgements before campaign projection, Python/MCP
 causal equivalence, array and packed member identity, unavailable journal recording, passive

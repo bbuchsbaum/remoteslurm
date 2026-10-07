@@ -16,6 +16,23 @@ def opened(cluster, sandbox):
     return service.subscribe(workspace), config
 
 
+def test_offline_root_lookup_ignores_only_trailing_separators(cluster, sandbox, monkeypatch):
+    config = Config(hosts={"local": cluster.host}, default_host="local")
+    source = str(sandbox / "proj")
+    opened = service.select(config, "local", path=source + "/", cluster=cluster)
+    monkeypatch.setattr(cluster, "call", lambda *a, **kw: pytest.fail("offline lookup connected"))
+    assert service.select(config, "local", path=source)["workspace_id"] == opened["workspace_id"]
+    assert (
+        service.select(config, "local", path=source + "///")["workspace_id"]
+        == opened["workspace_id"]
+    )
+    # Do not normalize .. across unknown remote symlinks or invent an expansion offline.
+    from remoteslurm.errors import NotFound
+
+    with pytest.raises(NotFound):
+        service.select(config, "local", path=source + "/../proj")
+
+
 def test_snapshot_does_not_connect_and_shares_two_independent_readers(
     cluster, sandbox, monkeypatch
 ):

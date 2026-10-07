@@ -3,8 +3,8 @@
 Status updated 2026-10-06: A0 semantics/attention and A1 journal/local readers are implemented.
 Shared producers, commit-pinned semantic cards, passive canonical-ledger/history recovery,
 independent bounded sources and persistent monitor controls are implemented. The terminal
-workspace observer shares their daemon owner and budgets. Automated qualification is being
-completed; exact-candidate live qualification remains a separate gate. See
+workspace observer shares their daemon owner and budgets. The automated candidate matrix
+passes (725 tests); exact-candidate live qualification remains a separate gate. See
 [qualification](../qualification/activity-observation.md) for the current evidence.
 
 The original review below was performed on 2026-09-20 against

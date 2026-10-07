@@ -164,6 +164,12 @@ The source preview has local automated and terminal qualification. Hosted CI and
 an exercise on a real cluster are separate evidence; this guide does not claim
 either has run for the current changes.
 
+The completed observation candidate `761b941` passed 725 tests with 8 opt-in live
+tests skipped, plus static checks, package/base-install and actual PTY exit checks.
+See [current qualification](qualification/activity-observation.md) for exact
+identity, specimens and the pending two-job live gate. The older first-viewer
+receipt below is historical evidence.
+
 Local qualification recorded on 2026-10-06 for build
 `1:0.2.0:785b9ce4da6bf7b0:be065b0b8a2c79c1`: the full suite passed 694 tests with
 7 live tests skipped. After the final project-preflight and failed-navigation

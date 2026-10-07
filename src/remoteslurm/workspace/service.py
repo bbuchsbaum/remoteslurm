@@ -38,7 +38,7 @@ def select(
     for saved in sorted(
         store.documents("workspace", limit=1000), key=lambda w: w["created_at"], reverse=True
     ):
-        if saved["target_id"] == target and saved["source_root"] == source:
+        if saved["target_id"] == target and saved["source_root"].rstrip("/") == source.rstrip("/"):
             if cluster is None:
                 return saved
             previous_mapping = saved
