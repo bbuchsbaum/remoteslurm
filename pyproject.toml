@@ -12,6 +12,9 @@ license = { text = "MIT" }
 authors = [{ name = "Bradley Buchsbaum" }]
 dependencies = [
   "mcp[cli]>=1.8.0,<2",
+  # The web dashboard (`rslurm dash`); both already arrive with mcp, declared explicitly.
+  "starlette>=0.27",
+  "uvicorn>=0.23",
 ]
 
 [project.urls]

@@ -275,7 +275,21 @@ class WorkspaceObserver:
 
     def inspect(self, request: dict) -> None:
         now = time.time()
-        workspace = self.store.get("workspace", request["workspace_id"])
+        if request["workspace_id"] is None:
+            # Job files found by discovery: absolute paths, no workspace anchor to check.
+            lease = self.store.get("discover", request["target_id"]) or {}
+            workspace = (
+                {
+                    "workspace_id": None,
+                    "target_id": request["target_id"],
+                    "host": request["host"],
+                    "enabled": lease.get("lease_until", 0) >= now,
+                }
+                if lease
+                else None
+            )
+        else:
+            workspace = self.store.get("workspace", request["workspace_id"])
         try:
             if not workspace or not workspace["enabled"] or now - request["created_at"] > 30:
                 raise RemoteSlurmError("inspection expired or workspace stopped")
@@ -285,7 +299,8 @@ class WorkspaceObserver:
             cluster = self.get_cluster(workspace["host"])
             if target_id(cluster.host) != request["target_id"]:
                 raise RemoteSlurmError("cached inspection target changed")
-            self.check_anchor(cluster, workspace)
+            if workspace["workspace_id"] is not None:
+                self.check_anchor(cluster, workspace)
             if request["kind"] == "list":
                 result = cluster.call("browse", path=request["path"], _timeout=10)
             elif request["kind"] == "refresh":

@@ -260,6 +260,9 @@ class JobMonitor:
 
         self.workspace_observer = WorkspaceObserver(self.get_cluster, get_host)
         self.campaign_observer = CampaignObserver(self.get_cluster, get_host)
+        from .activity.discovery import DiscoveryObserver
+
+        self.discovery = DiscoveryObserver(self.get_cluster, get_host)
 
     def start(self) -> None:
         self.lockfile = open(self.store.root / "job-monitor.lock", "a")
@@ -290,6 +293,7 @@ class JobMonitor:
                 self.tick()
                 self.workspace_observer.tick()
                 self.campaign_observer.tick()
+                self.discovery.tick()
             except Exception as exc:
                 try:
                     self.store.heartbeat(type(exc).__name__ + ": " + str(exc)[:512])

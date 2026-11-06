@@ -249,9 +249,18 @@ def inspect_request(
         "created_at": time.time(),
     }
     with store.transaction() as db:
-        current = store.get_in(db, "workspace", workspace["workspace_id"])
-        if not current or not current["enabled"]:
-            raise InvalidArgument("workspace monitoring is disabled; attach an online view first")
+        if workspace["workspace_id"] is None:
+            # A job file on a host the dashboard is discovering: no workspace root, so the
+            # path must be absolute and the host must hold a live discovery lease.
+            current = store.get_in(db, "discover", workspace["target_id"])
+            if not current or current.get("lease_until", 0) < time.time():
+                raise InvalidArgument("this host is not being observed; reopen the dashboard")
+        else:
+            current = store.get_in(db, "workspace", workspace["workspace_id"])
+            if not current or not current["enabled"]:
+                raise InvalidArgument(
+                    "workspace monitoring is disabled; attach an online view first"
+                )
         rows = list(db.execute("SELECT data FROM documents WHERE namespace='inspection'"))
         import json
 

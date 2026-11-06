@@ -115,6 +115,21 @@ and enrolled campaigns; it does not discover arbitrary jobs submitted outside re
 See the [terminal workspace guide](docs/terminal-workspace.md) for project selection, observation
 limits, offline behavior, and the shared-state requirements for agents in containers.
 
+## Watch everything in the browser
+
+```bash
+rslurm dash                    # every configured host; opens a page in your browser
+rslurm -H mycluster dash       # one host
+rslurm dash --no-open          # print the link instead (for example, over an SSH tunnel)
+```
+
+The page shows every job you own on each host, whatever submitted it, and labels the ones
+remoteslurm didn't submit as untracked. It shows what is queued, running, and finished in the
+last 7 days, with job and error logs and a one-line alert when a job finishes or fails (desktop
+notifications if you allow them). It is read-only: it never submits, cancels, or adopts work.
+Only `127.0.0.1` can reach it, and only through the link it prints. Closing the page stops the
+extra polling; jobs keep running. See the [dashboard guide](docs/web-dashboard.md).
+
 ## Use it from a coding agent
 
 Two optional add-ons make remoteslurm easier for an agent to use: the MCP server, which gives it

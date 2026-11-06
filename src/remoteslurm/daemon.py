@@ -295,6 +295,7 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
                 and not self.monitor.store.active()
                 and not self.monitor.workspace_observer.active()
                 and not self.monitor.campaign_observer.active()
+                and not self.monitor.discovery.active()
             ):
                 log.info("idle for %ss; exiting", self.idle_seconds)
                 self._stop.set()

@@ -1,6 +1,10 @@
 # Web dashboard plan (`rslurm dash`)
 
-Status: proposal, 2026-11-05. Not started.
+Status: W0–W3 built 2026-11-06, with untracked-job discovery (W1) and the v3b design. `rslurm dash`
+serves `src/remoteslurm/web/`; the HTTP contract is `docs/plans/web-dashboard-api.md`; the user
+guide is `docs/web-dashboard.md`. Not yet done: the live end-to-end gate on a cluster (W5),
+multi-campaign switcher (W4), and the harness's accounting-gap check broadened per carry-forward 6.
+The SSE stream is a plain Starlette `StreamingResponse`, so `sse-starlette` is not a dependency.
 
 ## Goal
 

@@ -280,6 +280,20 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_dash(args: argparse.Namespace) -> int:
+    from .web.launch import run
+
+    cfg = Config.load(Path(args.config) if args.config else None)
+    return run(
+        cfg,
+        args.host,
+        port=args.port,
+        open_browser=not args.no_open,
+        demo=args.demo,
+        restart_daemon=args.restart_daemon,
+    )
+
+
 def cmd_view(args: argparse.Namespace) -> int:
     from . import daemon
     from .activity.reader import event_line, safe_text
@@ -2600,6 +2614,16 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--request-id")
             sp.add_argument("--offset", type=int, default=0)
             sp.add_argument("--token")
+
+    sp = add("dash", cmd_dash, "open the live, read-only web dashboard in your browser")
+    sp.add_argument("--port", type=int, help="local port (default: a free one)")
+    sp.add_argument("--no-open", action="store_true", help="print the URL; don't open a browser")
+    sp.add_argument("--demo", action="store_true", help="show example data instead of your jobs")
+    sp.add_argument(
+        "--restart-daemon",
+        action="store_true",
+        help="restart the background observer if it runs an older build",
+    )
 
     sp = add("doctor", cmd_doctor, "diagnose ssh config, connection, remote python and Slurm tools")
     sp.add_argument("host_name", nargs="?")

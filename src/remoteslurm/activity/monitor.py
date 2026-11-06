@@ -41,6 +41,7 @@ READS = {
     "attempt_matches",
     "contract_observe",
     "campaign_markers",
+    "scontrol",
 }
 
 
