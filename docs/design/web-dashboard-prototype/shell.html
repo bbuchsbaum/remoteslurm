@@ -1,0 +1,74 @@
+<title>remoteslurm dash</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<script>
+  // Non-blocking font stylesheet; the app waits for it (max 1 s) before first render.
+  window.__fontSheet = new Promise(function (res) {
+    var l = document.createElement("link");
+    l.rel = "stylesheet";
+    l.href = "https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
+    l.onload = l.onerror = function () { res(); };
+    document.head.appendChild(l);
+  });
+</script>
+<style>/*CSS*/</style>
+<div id="app">
+  <header class="top">
+    <div class="wrap top-in">
+      <div class="brand">
+        <svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="3" width="16" height="3" rx="1.5"/><rect x="2" y="8.5" width="11" height="3" rx="1.5"/><rect x="2" y="14" width="6" height="3" rx="1.5"/></svg>
+        <span>remoteslurm</span><span class="brand-sub">dash</span>
+      </div>
+      <span class="example" title="This prototype shows example data, not your jobs">Example data</span>
+      <div class="tools">
+        <button class="btn quiet" id="notify" type="button" hidden>Turn on desktop alerts</button>
+        <button class="btn quiet" id="helpbtn" type="button" aria-label="Keyboard help">?</button>
+        <button class="btn quiet" id="theme" type="button" aria-label="Switch between light and dark theme">◐</button>
+      </div>
+    </div>
+  </header>
+  <section id="alerts" class="alerts quiet" aria-label="New since you opened this page"></section>
+  <main class="wrap">
+    <h1 class="sr-only">remoteslurm dash</h1>
+    <section class="hosts" id="hosts" aria-label="Hosts"></section>
+    <div class="grid">
+      <div class="col-main">
+        <section class="panel p-jobs" aria-labelledby="jobs-h">
+          <header class="ph">
+            <h2 id="jobs-h" tabindex="-1">Jobs</h2>
+            <div class="seg" role="tablist" id="tabs" aria-label="Job views"></div>
+            <label class="search"><span class="sr-only">Filter jobs by name, ID or campaign</span><input id="q" type="search" placeholder="Filter jobs" autocomplete="off" spellcheck="false"><kbd aria-hidden="true">/</kbd></label>
+          </header>
+          <div class="tablewrap" id="jobpanel" role="tabpanel">
+            <table class="jobs">
+              <thead><tr><th scope="col">State</th><th scope="col">Job</th><th scope="col">Host</th><th scope="col">Progress</th><th scope="col">When</th><th scope="col">Detail</th></tr></thead>
+              <tbody id="jobrows"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel p-tl" aria-labelledby="tl-h">
+          <header class="ph"><h2 id="tl-h">Timeline</h2><span class="ph-note" id="tl-note">Last 24 hours</span></header>
+          <div class="timeline" id="timeline"></div>
+        </section>
+      </div>
+      <div class="col-side">
+        <section class="panel attn" aria-labelledby="attn-h">
+          <header class="ph"><h2 id="attn-h">Needs attention</h2><span class="count-badge num" id="attn-n" hidden></span></header>
+          <ul class="att" id="attention"></ul>
+        </section>
+        <section class="panel p-act" aria-labelledby="act-h">
+          <header class="ph"><h2 id="act-h">Activity</h2></header>
+          <ul class="feed" id="feed"></ul>
+          <button class="link feed-more" id="feed-more" type="button" hidden>Show all</button>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+<div id="drawer-root"></div>
+<div id="help-root"></div>
+<div id="announcer" class="sr-only" role="status" aria-live="polite"></div>
+<script>window.SPECIMEN = "/*SPEC*/";</script>
+<script>/*FIXTURE*/</script>
+<script>/*APP*/</script>
